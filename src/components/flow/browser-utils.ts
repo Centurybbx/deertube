@@ -6,15 +6,14 @@ import type {
 import type { DeepResearchResolvedReference } from "@/shared/deepresearch";
 
 export const normalizeHttpUrl = (value: string): string | null => {
-  try {
-    const parsed = new URL(value);
-    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
-      return null;
-    }
-    return parsed.toString();
-  } catch {
+  if (!URL.canParse(value)) {
     return null;
   }
+  const parsed = new URL(value);
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+    return null;
+  }
+  return parsed.toString();
 };
 
 export const isHttpUrl = (value: string): boolean =>

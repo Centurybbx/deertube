@@ -5,11 +5,7 @@ const runtimeState: RunningJobsByProject = {};
 
 const notifyListeners = () => {
   listeners.forEach((listener) => {
-    try {
-      listener();
-    } catch {
-      // Ignore subscriber errors.
-    }
+    listener();
   });
 };
 

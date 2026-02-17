@@ -9,6 +9,13 @@ const referenceSchema = z.object({
   endLine: z.number().int().positive().optional(),
 });
 
+const validationStatusSchema = z.enum([
+  "idle",
+  "running",
+  "complete",
+  "failed",
+]);
+
 export const cdpBrowserRouter = createTRPCRouter({
   open: baseProcedure
     .input(
@@ -24,7 +31,34 @@ export const cdpBrowserRouter = createTRPCRouter({
         reference: input.reference,
       });
     }),
+  captureValidationSnapshot: baseProcedure
+    .input(
+      z.object({
+        sessionId: z.string().min(1),
+      }),
+    )
+    .mutation(async ({ input }) => {
+      const controller = getCdpBrowserController();
+      const snapshot = await controller.captureValidationSnapshot(input.sessionId);
+      return { snapshot };
+    }),
+  setValidationState: baseProcedure
+    .input(
+      z.object({
+        sessionId: z.string().min(1),
+        status: validationStatusSchema,
+        message: z.string().optional(),
+      }),
+    )
+    .mutation(async ({ input }) => {
+      const controller = getCdpBrowserController();
+      await controller.setValidationIndicator({
+        sessionId: input.sessionId,
+        status: input.status,
+        message: input.message,
+      });
+      return { ok: true };
+    }),
 });
 
 export type CdpBrowserRouter = typeof cdpBrowserRouter;
-

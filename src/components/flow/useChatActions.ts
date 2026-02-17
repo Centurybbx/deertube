@@ -58,6 +58,18 @@ const CHAT_ACTION_DEBUG_LOGS_ENABLED =
   import.meta.env.DEV &&
   import.meta.env.VITE_CHAT_ACTION_DEBUG_LOGS === "true";
 const CHAT_STREAM_RUNNING_JOB_ID = "chat-stream";
+const CHAT_VALIDATE_LOG_PREFIX = "[validate][chat.manager]";
+
+const logChatValidateManager = (
+  event: string,
+  payload?: Record<string, unknown>,
+) => {
+  if (payload) {
+    console.log(CHAT_VALIDATE_LOG_PREFIX, event, payload);
+    return;
+  }
+  console.log(CHAT_VALIDATE_LOG_PREFIX, event);
+};
 
 export function useChatActions({
   projectPath,
@@ -82,23 +94,82 @@ export function useChatActions({
   const [graphEventMessages, setGraphEventMessages] = useState<ChatMessage[]>(
     () => initialMessages.filter((message) => message.kind === "graph-event"),
   );
-  const [persistedSubagentEvents] = useState<ChatMessage[]>(
-    () => initialMessages.filter((message) => message.kind === "subagent-event"),
+  const persistedSubagentEvents = useMemo(
+    () =>
+      initialMessages.filter((message) => message.kind === "subagent-event"),
+    [initialMessages],
   );
-  const [persistedDeepSearchEvents] = useState<ChatMessage[]>(
-    () => initialMessages.filter((message) => message.kind === "deepsearch-event"),
+  const persistedDeepSearchEvents = useMemo(
+    () =>
+      initialMessages.filter((message) => message.kind === "deepsearch-event"),
+    [initialMessages],
   );
+  const [asyncSubagentEventMessages, setAsyncSubagentEventMessages] =
+    useState<ChatMessage[]>([]);
   const [asyncDeepSearchEventMessages, setAsyncDeepSearchEventMessages] =
     useState<ChatMessage[]>([]);
   const loggedGraphEventsRef = useRef<Map<string, string>>(new Map());
   const loggedStreamPartsRef = useRef<Map<string, string>>(new Map());
   const fallbackCreatedAtByIdRef = useRef<Map<string, string>>(new Map());
+  const asyncValidationAbortControllersRef = useRef<
+    Map<string, AbortController>
+  >(new Map());
   const lastSubmittedPromptRef = useRef("");
   const mountedRef = useRef(true);
+  const [asyncValidationBusy, setAsyncValidationBusy] = useState(false);
+
+  const markAsyncValidationBusy = useCallback(() => {
+    setAsyncValidationBusy(
+      asyncValidationAbortControllersRef.current.size > 0,
+    );
+  }, []);
+
+  const handleValidationRunStart = useCallback(
+    (runJobId: string, abortController: AbortController) => {
+      asyncValidationAbortControllersRef.current.set(runJobId, abortController);
+      logChatValidateManager("run-start", {
+        chatId,
+        runJobId,
+        activeRuns: asyncValidationAbortControllersRef.current.size,
+      });
+      markAsyncValidationBusy();
+    },
+    [chatId, markAsyncValidationBusy],
+  );
+
+  const handleValidationRunFinish = useCallback(
+    (runJobId: string) => {
+      asyncValidationAbortControllersRef.current.delete(runJobId);
+      logChatValidateManager("run-finish", {
+        chatId,
+        runJobId,
+        activeRuns: asyncValidationAbortControllersRef.current.size,
+      });
+      markAsyncValidationBusy();
+    },
+    [chatId, markAsyncValidationBusy],
+  );
+
+  const stopAsyncValidationTasks = useCallback(() => {
+    const activeRuns = asyncValidationAbortControllersRef.current.size;
+    logChatValidateManager("manual-stop-all", {
+      chatId,
+      activeRuns,
+    });
+    asyncValidationAbortControllersRef.current.forEach((controller) => {
+      controller.abort();
+    });
+    asyncValidationAbortControllersRef.current.clear();
+    markAsyncValidationBusy();
+  }, [chatId, markAsyncValidationBusy]);
 
   useEffect(
     () => () => {
       mountedRef.current = false;
+      asyncValidationAbortControllersRef.current.forEach((controller) => {
+        controller.abort();
+      });
+      asyncValidationAbortControllersRef.current.clear();
     },
     [],
   );
@@ -222,7 +293,14 @@ export function useChatActions({
   );
 
   const runPostAnswerValidation = useCallback(
-    async (responseId: string, responseText: string) => {
+    async (
+      responseId: string,
+      responseText: string,
+      options?: {
+        force?: boolean;
+        queryOverride?: string;
+      },
+    ) => {
       await runPostAnswerValidationForResponse({
         responseId,
         responseText,
@@ -230,13 +308,23 @@ export function useChatActions({
         projectPath,
         deepResearchConfig,
         runtimeSettings,
-        queryOverride: lastSubmittedPromptRef.current,
+        queryOverride: options?.queryOverride ?? lastSubmittedPromptRef.current,
+        force: options?.force ?? false,
         isMounted: () => mountedRef.current,
+        setAsyncSubagentEventMessages,
         setAsyncDeepSearchEventMessages,
-        runValidateMutation: (input) => trpc.chat.validate.mutate(input),
+        onValidationRunStart: handleValidationRunStart,
+        onValidationRunFinish: handleValidationRunFinish,
       });
     },
-    [chatId, deepResearchConfig, projectPath, runtimeSettings],
+    [
+      chatId,
+      deepResearchConfig,
+      handleValidationRunFinish,
+      handleValidationRunStart,
+      projectPath,
+      runtimeSettings,
+    ],
   );
 
   const { messages, sendMessage, regenerate, status, error, stop } =
@@ -264,6 +352,70 @@ export function useChatActions({
         void runGraphTools(message.id, text);
       },
     });
+
+  const latestAssistantValidationTarget = useMemo(() => {
+    for (let index = messages.length - 1; index >= 0; index -= 1) {
+      const message = messages[index];
+      if (message.role !== "assistant") {
+        continue;
+      }
+      const responseText = extractUiMessageText(message).trim();
+      if (!responseText) {
+        continue;
+      }
+      return {
+        responseId: message.id,
+        responseText,
+      };
+    }
+    return null;
+  }, [messages]);
+
+  const latestUserValidationQuery = useMemo(() => {
+    for (let index = messages.length - 1; index >= 0; index -= 1) {
+      const message = messages[index];
+      if (message.role !== "user") {
+        continue;
+      }
+      if (!("content" in message) || typeof message.content !== "string") {
+        continue;
+      }
+      const query = message.content.trim();
+      if (query.length > 0) {
+        return query;
+      }
+    }
+    return lastSubmittedPromptRef.current.trim();
+  }, [messages]);
+
+  const canValidateCurrentChat = latestAssistantValidationTarget !== null;
+
+  const validateCurrentChat = useCallback(() => {
+    const target = latestAssistantValidationTarget;
+    if (!target) {
+      logChatValidateManager("manual-skip-no-assistant", {
+        chatId,
+      });
+      return;
+    }
+    const queryOverride =
+      latestUserValidationQuery.trim() || target.responseText.trim();
+    logChatValidateManager("manual-start", {
+      chatId,
+      responseId: target.responseId,
+      queryLength: queryOverride.length,
+      answerLength: target.responseText.length,
+    });
+    void runPostAnswerValidation(target.responseId, target.responseText, {
+      force: true,
+      queryOverride,
+    });
+  }, [
+    chatId,
+    latestAssistantValidationTarget,
+    latestUserValidationQuery,
+    runPostAnswerValidation,
+  ]);
   useEffect(() => {
     if (!chatId) {
       return;
@@ -335,6 +487,7 @@ export function useChatActions({
       error,
       fallbackCreatedAtById: fallbackCreatedAtByIdRef.current,
       graphEventMessages,
+      asyncSubagentEventMessages,
       asyncDeepSearchEventMessages,
       persistedSubagentEvents,
       persistedDeepSearchEvents,
@@ -344,6 +497,7 @@ export function useChatActions({
     status,
     error,
     graphEventMessages,
+    asyncSubagentEventMessages,
     asyncDeepSearchEventMessages,
     persistedSubagentEvents,
     persistedDeepSearchEvents,
@@ -355,11 +509,7 @@ export function useChatActions({
         return;
       }
       const prompt = rawPrompt.trim();
-      try {
-        await onBeforeSendPrompt?.(prompt);
-      } catch {
-        // Keep chat usable even when local persistence fails.
-      }
+      await onBeforeSendPrompt?.(prompt);
       const quotePrefix =
         selectedNodeForQuote && !hasNodeQuote(prompt)
           ? `${buildNodeQuote(selectedNodeForQuote)} `
@@ -408,9 +558,13 @@ export function useChatActions({
     busy,
     chatBusy: busy,
     graphBusy,
+    asyncTaskBusy: asyncValidationBusy,
+    canValidateCurrentChat,
+    validateCurrentChat,
     handleSendFromHistory,
     handleSendFromPanel,
     stopChatGeneration,
+    stopAsyncTasks: stopAsyncValidationTasks,
     retryMessage,
     selectedNode,
     messages: derivedMessages,

@@ -23,11 +23,10 @@ const extractErrorMessage = (err: unknown): string => {
   if (typeof err === "number" || typeof err === "boolean") {
     return String(err);
   }
-  try {
-    return JSON.stringify(err);
-  } catch {
-    return "Unknown error";
+  if (err && typeof err === "object") {
+    return Object.prototype.toString.call(err);
   }
+  return "Unknown error";
 };
 
 const isMalformedFunctionCallError = (err: unknown): boolean => {

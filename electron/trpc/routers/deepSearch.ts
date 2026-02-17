@@ -114,12 +114,15 @@ const resolveModelSettings = (
 }
 
 const parseJson = (raw: string): JsonValue | null => {
-  try {
-    return JSON.parse(raw) as JsonValue
-  }
-  catch {
+  const trimmed = raw.trim()
+  if (
+    !trimmed.startsWith('{')
+    && !trimmed.startsWith('[')
+    && !trimmed.startsWith('"')
+  ) {
     return null
   }
+  return JSON.parse(raw) as JsonValue
 }
 
 async function writeJsonFile(filePath: string, data: JsonValue) {
@@ -326,16 +329,11 @@ export const deepSearchRouter = createTRPCRouter({
           const title = item.title ?? item.description ?? 'Untitled'
           let markdown = item.content ?? item.snippet ?? ''
           if (url) {
-            try {
-              markdown = await fetchJinaReaderMarkdown(
-                url,
-                input.settings?.jinaReaderBaseUrl,
-                input.settings?.jinaReaderApiKey,
-              )
-            }
-            catch {
-              // keep fallback content from search if reader fails
-            }
+            markdown = await fetchJinaReaderMarkdown(
+              url,
+              input.settings?.jinaReaderBaseUrl,
+              input.settings?.jinaReaderApiKey,
+            )
           }
           const metadata = {
             id: pageId,
@@ -376,23 +374,18 @@ export const deepSearchRouter = createTRPCRouter({
           return `Source ${index + 1}: ${source.title}\n${source.snippet}`
         })
         .join('\n\n')
-      try {
-        const provider = createOpenAICompatible({
-          name: resolvedModel.llmProvider,
-          baseURL: resolvedModel.llmBaseUrl,
-          apiKey: resolvedModel.llmApiKey,
-        })
-        const result = await generateText({
-          model: provider(resolvedModel.llmModelId),
-          system:
-            'You are a deep-research assistant. Write a concise answer and cite sources by index like [1].',
-          prompt: `${contextBlock}Question: ${input.query}\n\n${context}`,
-        })
-        answer = result.text
-      }
-      catch {
-        answer = 'LLM request failed. Check your model configuration and network, then retry.'
-      }
+      const provider = createOpenAICompatible({
+        name: resolvedModel.llmProvider,
+        baseURL: resolvedModel.llmBaseUrl,
+        apiKey: resolvedModel.llmApiKey,
+      })
+      const result = await generateText({
+        model: provider(resolvedModel.llmModelId),
+        system:
+          'You are a deep-research assistant. Write a concise answer and cite sources by index like [1].',
+        prompt: `${contextBlock}Question: ${input.query}\n\n${context}`,
+      })
+      answer = result.text
 
       return {
         answer,

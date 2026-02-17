@@ -234,6 +234,7 @@ export const runGraphToolsForResponse = async ({
       errorMessage,
       setGraphEventMessages,
     });
+    throw error instanceof Error ? error : new Error(errorMessage);
   } finally {
     if (chatId) {
       finishRunningChatJob(projectPath, chatId, runningJobId);

@@ -53,6 +53,12 @@ const PAGE_META_FILENAME = "meta.json";
 const EXTRACTION_FILENAME = "extraction.json";
 const SAFE_ID_PATTERN = /^[A-Za-z0-9_-]+$/;
 
+const hasNodeErrorCode = (error: unknown, code: string): boolean =>
+  typeof error === "object" &&
+  error !== null &&
+  "code" in error &&
+  (error as { code?: unknown }).code === code;
+
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null && !Array.isArray(value);
 
@@ -204,8 +210,11 @@ const readJsonFile = async <T>(filePath: string): Promise<T | null> => {
   try {
     const raw = await fs.readFile(filePath, "utf-8");
     return JSON.parse(raw) as T;
-  } catch {
-    return null;
+  } catch (error) {
+    if (hasNodeErrorCode(error, "ENOENT")) {
+      return null;
+    }
+    throw error;
   }
 };
 
@@ -305,8 +314,11 @@ export function createDeepResearchPersistenceAdapter(projectPath: string): DeepR
       let markdown: string;
       try {
         markdown = await fs.readFile(markdownPath, "utf-8");
-      } catch {
-        return null;
+      } catch (error) {
+        if (hasNodeErrorCode(error, "ENOENT")) {
+          return null;
+        }
+        throw error;
       }
       if (!markdown.trim()) {
         return null;

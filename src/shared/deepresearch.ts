@@ -146,11 +146,7 @@ export interface DeepResearchRefUriParts {
 }
 
 const decodePathValue = (value: string): string => {
-  try {
-    return decodeURIComponent(value);
-  } catch {
-    return value;
-  }
+  return decodeURIComponent(value);
 };
 
 const parsePositiveInt = (value: string | null | undefined): number | null => {
@@ -176,12 +172,10 @@ export const parseDeepResearchRefUri = (value: string): DeepResearchRefUriParts 
     return null;
   }
 
-  let parsed: URL;
-  try {
-    parsed = new URL(trimmed);
-  } catch {
+  if (!URL.canParse(trimmed)) {
     return null;
   }
+  const parsed = new URL(trimmed);
 
   if (parsed.protocol !== DEERTUBE_PROTOCOL) {
     return null;

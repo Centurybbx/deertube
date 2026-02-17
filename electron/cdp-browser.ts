@@ -29,7 +29,7 @@ interface CdpSession {
   pending: Map<number, CdpCommandPending>;
   pendingHighlight?: BrowserViewReferenceHighlight;
   referenceHighlight?: BrowserViewReferenceHighlight;
-  referenceUiScriptInstalled: boolean;
+  controlsUiScriptInstalled: boolean;
   lastSelectionSignature: string;
 }
 
@@ -52,6 +52,26 @@ interface SanitizedSelectionPayload {
   };
 }
 
+interface CdpInPageActionPayload {
+  type?: JsonValue;
+  url?: JsonValue;
+  title?: JsonValue;
+}
+
+interface CdpValidationSnapshotPayload {
+  text?: JsonValue;
+  url?: JsonValue;
+  title?: JsonValue;
+}
+
+interface CdpValidationSnapshot {
+  text: string;
+  url: string;
+  title?: string;
+}
+
+type CdpValidationIndicatorState = "idle" | "running" | "complete" | "failed";
+
 type CdpProfileMode = "shared" | "shared-first" | "isolated";
 type CdpEndpointLaunchMode =
   | "attached-existing"
@@ -65,33 +85,57 @@ const CDP_READY_TIMEOUT_MS = 12000;
 const CDP_REQUEST_TIMEOUT_MS = 2500;
 const CDP_COMMAND_TIMEOUT_MS = 12000;
 const CDP_SELECTION_BINDING_NAME = "__deertubeEmitSelection";
+const CDP_ACTION_BINDING_NAME = "__deertubeAction";
 const MAX_SELECTION_LENGTH = 5000;
 const SELECTION_THROTTLE_MS = 180;
 const MAX_HIGHLIGHT_TEXT_LENGTH = 4000;
+const MAX_VALIDATION_TEXT_LENGTH = 18000;
 const MAX_HIGHLIGHT_RETRY_ATTEMPTS = 18;
 const DEFAULT_CDP_PROFILE_MODE: CdpProfileMode = "shared-first";
 const CDP_PROFILE_MODE_ENV_KEY = "DEERTUBE_CDP_PROFILE_MODE";
 const CDP_DEBUG_ENABLED = process.env.DEERTUBE_CDP_DEBUG !== "0";
 const CDP_LOG_PREFIX = "[cdp-browser]";
+const CDP_VALIDATE_LOG_PREFIX = "[validate][cdp]";
 
 const normalizeHttpUrl = (value: string): string | null => {
-  try {
-    const parsed = new URL(value);
-    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
-      return null;
-    }
-    return parsed.toString();
-  } catch {
+  if (!URL.canParse(value)) {
     return null;
   }
+  const parsed = new URL(value);
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+    return null;
+  }
+  return parsed.toString();
 };
+
+const toError = (error: unknown, fallbackMessage: string): Error =>
+  error instanceof Error ? error : new Error(fallbackMessage);
+
+const hasNodeErrorCode = (error: unknown, code: string): boolean =>
+  typeof error === "object" &&
+  error !== null &&
+  "code" in error &&
+  (error as { code?: unknown }).code === code;
 
 const parseJsonString = (value: string): unknown => {
   try {
     return JSON.parse(value) as unknown;
-  } catch {
-    return null;
+  } catch (error) {
+    throw toError(error, "Failed to parse JSON payload.");
   }
+};
+
+const isExpectedEndpointCheckError = (error: unknown): boolean => {
+  if (error instanceof TypeError) {
+    return true;
+  }
+  if (typeof DOMException !== "undefined" && error instanceof DOMException) {
+    return error.name === "AbortError";
+  }
+  if (error instanceof Error) {
+    return error.name === "AbortError";
+  }
+  return false;
 };
 
 const cdpDebugLog = (...parts: unknown[]) => {
@@ -107,6 +151,17 @@ const cdpWarnLog = (...parts: unknown[]) => {
 
 const cdpErrorLog = (...parts: unknown[]) => {
   console.error(CDP_LOG_PREFIX, ...parts);
+};
+
+const cdpValidateLog = (
+  event: string,
+  payload?: Record<string, unknown>,
+) => {
+  if (payload) {
+    console.info(CDP_VALIDATE_LOG_PREFIX, event, payload);
+    return;
+  }
+  console.info(CDP_VALIDATE_LOG_PREFIX, event);
 };
 
 const fetchJson = async (
@@ -263,9 +318,7 @@ const buildSelectionBridgeScript = (): string => `
     if (typeof binding !== "function") {
       return;
     }
-    try {
-      binding(JSON.stringify(payload));
-    } catch {}
+    binding(JSON.stringify(payload));
   };
   const buildPayload = () => {
     const selection = window.getSelection();
@@ -326,28 +379,92 @@ const buildSelectionBridgeScript = (): string => `
 })();
 `;
 
-const buildReferenceLocateButtonScript = (
-  payload: BrowserViewReferenceHighlight,
+const sanitizeValidationSnapshot = (
+  payload: CdpValidationSnapshotPayload,
+  fallbackUrl: string,
+): CdpValidationSnapshot | null => {
+  const url =
+    typeof payload.url === "string" && payload.url.trim().length > 0
+      ? payload.url.trim()
+      : fallbackUrl;
+  const normalizedUrl = normalizeHttpUrl(url);
+  if (!normalizedUrl) {
+    return null;
+  }
+  const textRaw = typeof payload.text === "string" ? payload.text.trim() : "";
+  if (!textRaw) {
+    return null;
+  }
+  const title =
+    typeof payload.title === "string" && payload.title.trim().length > 0
+      ? payload.title.trim()
+      : undefined;
+  return {
+    url: normalizedUrl,
+    title,
+    text:
+      textRaw.length > MAX_VALIDATION_TEXT_LENGTH
+        ? `${textRaw.slice(0, MAX_VALIDATION_TEXT_LENGTH)}...`
+        : textRaw,
+  };
+};
+
+function runValidationSnapshotScript(maxLength: number) {
+  const toCompactMultilineText = (value: string): string =>
+    value
+      .replace(/\u00A0/g, " ")
+      .split(/\r?\n/)
+      .map((line) => line.replace(/\s+/g, " ").trim())
+      .filter((line) => line.length > 0)
+      .join("\n")
+      .trim();
+
+  const articleText = toCompactMultilineText(
+    document.querySelector("article")?.innerText ?? "",
+  );
+  const mainText = toCompactMultilineText(
+    document.querySelector("main")?.innerText ?? "",
+  );
+  const bodyText = toCompactMultilineText(document.body?.innerText ?? "");
+  const preferredText = articleText || mainText || bodyText;
+  const resolvedMaxLength =
+    Number.isFinite(maxLength) && maxLength > 1000 ? Math.floor(maxLength) : 12000;
+  const text =
+    preferredText.length > resolvedMaxLength
+      ? `${preferredText.slice(0, resolvedMaxLength)}...`
+      : preferredText;
+
+  return {
+    url: window.location.href,
+    title: document.title,
+    text,
+  };
+}
+
+const buildInPageControlsScript = (
+  reference?: BrowserViewReferenceHighlight,
 ): string => `
 (() => {
-  const styleId = "deertube-cdp-ref-locate-style";
-  const buttonId = "deertube-cdp-ref-locate-button";
-  const stateKey = "__deertubeCdpLocateState";
-  const log = (...args) => {
-    try {
-      console.info("[cdp-page]", ...args);
-    } catch {}
-  };
-  const refPayload = ${JSON.stringify({
-    refId: payload.refId,
-    text: payload.text,
-  })};
-  log("locate-script:start", {
-    href: window.location.href,
-    refId: refPayload.refId,
-    textLength: typeof refPayload.text === "string" ? refPayload.text.length : 0,
-  });
+  const styleId = "deertube-cdp-controls-style";
+  const rootId = "deertube-cdp-controls-root";
+  const locateButtonId = "deertube-cdp-locate-button";
+  const validateButtonId = "deertube-cdp-validate-button";
+  const stopValidateButtonId = "deertube-cdp-stop-validate-button";
+  const openChatButtonId = "deertube-cdp-open-chat-button";
+  const applyStateFnName = "__deertubeApplyValidationState";
+  const actionBindingName = ${JSON.stringify(CDP_ACTION_BINDING_NAME)};
+  const refPayload = ${JSON.stringify(
+    reference
+      ? {
+          refId: reference.refId,
+          text: reference.text,
+        }
+      : null,
+  )};
   const runHighlight = ${runReferenceHighlightScript.toString()};
+  const log = (...args) => {
+    console.info("[cdp-page]", ...args);
+  };
   const ensureStyle = () => {
     if (document.getElementById(styleId)) {
       return;
@@ -355,97 +472,262 @@ const buildReferenceLocateButtonScript = (
     const style = document.createElement("style");
     style.id = styleId;
     style.textContent = \`
-      #\${buttonId} {
+      #\${rootId} {
         position: fixed;
-        right: 18px;
-        bottom: 22px;
-        z-index: 2147483645;
-        border: 1px solid rgba(15, 23, 42, 0.26);
+        top: 16px;
+        right: 16px;
+        z-index: 2147483646;
+        display: flex;
+        align-items: center;
+        gap: 8px;
+      }
+      #\${rootId} .deertube-cdp-btn {
+        border: 1px solid rgba(15, 23, 42, 0.24);
         border-radius: 999px;
-        padding: 7px 12px;
+        padding: 6px 12px;
         font-size: 12px;
         line-height: 1;
         font-weight: 600;
         color: #0f172a;
-        background: rgba(255, 255, 255, 0.95);
-        box-shadow: 0 8px 24px rgba(2, 6, 23, 0.18);
+        background: rgba(255, 255, 255, 0.96);
+        box-shadow: 0 6px 18px rgba(2, 6, 23, 0.18);
         backdrop-filter: blur(6px);
         cursor: pointer;
-        transition: transform 120ms ease, box-shadow 120ms ease, background 160ms ease;
+        transition: transform 120ms ease, box-shadow 120ms ease, background 140ms ease;
       }
-      #\${buttonId}:hover {
+      #\${rootId} .deertube-cdp-btn:hover {
         transform: translateY(-1px);
-        box-shadow: 0 10px 24px rgba(2, 6, 23, 0.25);
+        box-shadow: 0 9px 20px rgba(2, 6, 23, 0.24);
       }
-      #\${buttonId}[data-state="running"] {
-        background: rgba(14, 165, 233, 0.18);
+      #\${rootId} .deertube-cdp-btn:disabled {
+        opacity: 0.58;
+        cursor: not-allowed;
+        transform: none;
+      }
+      #\${rootId} .deertube-cdp-btn[data-state="running"] {
+        background: rgba(14, 165, 233, 0.2);
         color: #0c4a6e;
       }
-      #\${buttonId}[data-state="ok"] {
+      #\${rootId} .deertube-cdp-btn[data-state="complete"] {
         background: rgba(16, 185, 129, 0.2);
         color: #065f46;
       }
-      #\${buttonId}[data-state="fail"] {
+      #\${rootId} .deertube-cdp-btn[data-state="failed"] {
         background: rgba(239, 68, 68, 0.2);
         color: #7f1d1d;
+      }
+      #\${rootId} .deertube-cdp-btn[data-variant="stop"] {
+        border-color: rgba(220, 38, 38, 0.35);
+        color: #7f1d1d;
+        background: rgba(248, 113, 113, 0.18);
       }
     \`;
     document.head.appendChild(style);
   };
-  const ensureButton = () => {
+  const ensureRoot = () => {
+    const existing = document.getElementById(rootId);
+    if (existing instanceof HTMLDivElement) {
+      return existing;
+    }
+    const root = document.createElement("div");
+    root.id = rootId;
+    const mountTarget = document.body ?? document.documentElement;
+    mountTarget.appendChild(root);
+    return root;
+  };
+  const ensureButton = (root, buttonId, label, title) => {
     const existing = document.getElementById(buttonId);
     if (existing instanceof HTMLButtonElement) {
-      log("locate-button:reuse");
       return existing;
     }
     const button = document.createElement("button");
     button.id = buttonId;
     button.type = "button";
-    button.title = "Scroll and highlight reference";
-    button.textContent = "Locate Ref";
+    button.className = "deertube-cdp-btn";
+    button.textContent = label;
+    button.title = title;
     button.setAttribute("data-state", "idle");
-    const mountTarget = document.body ?? document.documentElement;
-    mountTarget.appendChild(button);
-    log("locate-button:created", {
-      mountTag: mountTarget.tagName?.toLowerCase?.() ?? null,
-    });
+    root.appendChild(button);
     return button;
   };
-  const setButtonState = (button, state, label) => {
+  const setButtonState = (button, state, label, title) => {
     button.setAttribute("data-state", state);
     button.textContent = label;
+    button.title = title;
   };
-  const runLocate = (button) => {
-    log("locate-button:click");
-    setButtonState(button, "running", "Locating...");
-    let ok = false;
-    try {
-      const result = runHighlight(refPayload);
-      ok = Boolean(result && typeof result === "object" && result.ok === true);
-    } catch {
-      ok = false;
+  const emitAction = (payload) => {
+    const binding = window[actionBindingName];
+    if (typeof binding !== "function") {
+      log("action-binding:missing");
+      return;
     }
-    setButtonState(button, ok ? "ok" : "fail", ok ? "Located" : "Not Found");
-    log("locate-button:result", { ok });
-    window.setTimeout(() => {
-      setButtonState(button, "idle", "Locate Ref");
-    }, ok ? 1200 : 1600);
-    return ok;
+    binding(JSON.stringify(payload));
   };
+  const applyValidationState = (input) => {
+    const state = typeof input?.status === "string" ? input.status : "idle";
+    const message = typeof input?.message === "string" ? input.message : "";
+    const validateButton = document.getElementById(validateButtonId);
+    const stopButton = document.getElementById(stopValidateButtonId);
+    if (!(validateButton instanceof HTMLButtonElement)) {
+      return;
+    }
+    if (!(stopButton instanceof HTMLButtonElement)) {
+      return;
+    }
+    if (state === "running") {
+      setButtonState(
+        validateButton,
+        "running",
+        "Validating...",
+        "Validating current page content...",
+      );
+      stopButton.disabled = false;
+      setButtonState(stopButton, "failed", "Stop", "Stop current page validation");
+      return;
+    }
+    if (state === "complete") {
+      setButtonState(
+        validateButton,
+        "complete",
+        "Validated",
+        message || "Validation completed",
+      );
+      stopButton.disabled = true;
+      setButtonState(stopButton, "idle", "Stop", "Stop current page validation");
+      return;
+    }
+    if (state === "failed") {
+      const stoppedByUser = /stopped by user|abort/i.test(message);
+      setButtonState(
+        validateButton,
+        "failed",
+        stoppedByUser ? "Validation Stopped" : "Validate Failed",
+        message || (stoppedByUser ? "Validation stopped by user" : "Validation failed"),
+      );
+      stopButton.disabled = true;
+      setButtonState(stopButton, "idle", "Stop", "Stop current page validation");
+      return;
+    }
+    setButtonState(
+      validateButton,
+      "idle",
+      "Validate",
+      "Validate current page content",
+    );
+    stopButton.disabled = true;
+    setButtonState(stopButton, "idle", "Stop", "Stop current page validation");
+  };
+  window[applyStateFnName] = applyValidationState;
+
   ensureStyle();
-  const button = ensureButton();
-  if (!window[stateKey]) {
-    window[stateKey] = {
-      payload: refPayload,
-    };
+  const root = ensureRoot();
+  const locateButton = ensureButton(
+    root,
+    locateButtonId,
+    "Locate Ref",
+    "Scroll and highlight reference",
+  );
+  const validateButton = ensureButton(
+    root,
+    validateButtonId,
+    "Validate",
+    "Validate current page content",
+  );
+  const stopValidateButton = ensureButton(
+    root,
+    stopValidateButtonId,
+    "Stop",
+    "Stop current page validation",
+  );
+  stopValidateButton.setAttribute("data-variant", "stop");
+  const openChatButton = ensureButton(
+    root,
+    openChatButtonId,
+    "Open Chat",
+    "Open validation chat",
+  );
+
+  if (!refPayload || typeof refPayload.text !== "string" || !refPayload.text.trim()) {
+    locateButton.style.display = "none";
+    locateButton.onclick = null;
   } else {
-    window[stateKey].payload = refPayload;
+    locateButton.style.display = "";
+    locateButton.disabled = false;
+    locateButton.onclick = (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      setButtonState(locateButton, "running", "Locating...", "Locating reference...");
+      const result = runHighlight(refPayload);
+      const ok = Boolean(result && typeof result === "object" && result.ok === true);
+      setButtonState(
+        locateButton,
+        ok ? "complete" : "failed",
+        ok ? "Located" : "Not Found",
+        ok ? "Reference located in page" : "Reference text not found in current page",
+      );
+      window.setTimeout(() => {
+        setButtonState(
+          locateButton,
+          "idle",
+          "Locate Ref",
+          "Scroll and highlight reference",
+        );
+      }, ok ? 1200 : 1600);
+      log("locate-button:result", { ok });
+    };
   }
-  button.onclick = (event) => {
+
+  validateButton.onclick = (event) => {
     event.preventDefault();
     event.stopPropagation();
-    runLocate(button);
+    applyValidationState({ status: "running" });
+    emitAction({
+      type: "validate",
+      url: window.location.href,
+      title: document.title,
+    });
   };
+  stopValidateButton.onclick = (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    emitAction({
+      type: "validate-stop",
+      url: window.location.href,
+      title: document.title,
+    });
+  };
+  openChatButton.onclick = (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    emitAction({
+      type: "open-validation-chat",
+      url: window.location.href,
+      title: document.title,
+    });
+  };
+
+  applyValidationState({ status: "idle" });
+  log("controls-script:ready", {
+    href: window.location.href,
+    hasReference: Boolean(refPayload && typeof refPayload.text === "string" && refPayload.text.trim()),
+  });
+})();
+`;
+
+const buildApplyValidationIndicatorScript = (input: {
+  status: CdpValidationIndicatorState;
+  message?: string;
+}): string => `
+(() => {
+  const applyState = window.__deertubeApplyValidationState;
+  if (typeof applyState !== "function") {
+    return { ok: false, reason: "apply-state-missing" };
+  }
+  applyState(${JSON.stringify({
+    status: input.status,
+    message: input.message,
+  })});
+  return { ok: true };
 })();
 `;
 
@@ -454,8 +736,11 @@ const tryCandidatePaths = async (candidates: string[]): Promise<string | null> =
     try {
       await fs.access(candidate);
       return candidate;
-    } catch {
-      continue;
+    } catch (error) {
+      if (hasNodeErrorCode(error, "ENOENT") || hasNodeErrorCode(error, "ENOTDIR")) {
+        continue;
+      }
+      throw error;
     }
   }
   return null;
@@ -497,8 +782,11 @@ class CdpBrowserController {
     try {
       await fetchJson(`${CDP_ENDPOINT_ORIGIN}${CDP_ENDPOINT_VERSION_PATH}`);
       return true;
-    } catch {
-      return false;
+    } catch (error) {
+      if (isExpectedEndpointCheckError(error)) {
+        return false;
+      }
+      throw error;
     }
   }
 
@@ -634,7 +922,7 @@ class CdpBrowserController {
           return target;
         }
       } catch (error) {
-        lastError = error instanceof Error ? error : new Error(String(error));
+        lastError = toError(error, "Failed to create CDP target.");
         cdpWarnLog("createTarget:attempt-failed", {
           path: attempt.path,
           method: attempt.init.method,
@@ -667,6 +955,7 @@ class CdpBrowserController {
       { method: "PUT" },
       { method: "POST" },
     ];
+    let lastError: Error | null = null;
     for (const init of attempts) {
       try {
         await fetchOk(
@@ -678,11 +967,16 @@ class CdpBrowserController {
           method: init.method,
         });
         return;
-      } catch {
-        continue;
+      } catch (error) {
+        lastError = toError(error, "Failed to activate CDP target.");
+        cdpWarnLog("activateTarget:attempt-failed", {
+          targetId,
+          method: init.method,
+          message: lastError.message,
+        });
       }
     }
-    cdpWarnLog("activateTarget:failed-all-methods", { targetId });
+    throw lastError ?? new Error(`Failed to activate CDP target ${targetId}.`);
   }
 
   private async createSocketConnection(webSocketUrl: string): Promise<WebSocket> {
@@ -764,6 +1058,78 @@ class CdpBrowserController {
     });
   }
 
+  private handleActionBinding(session: CdpSession, params: unknown) {
+    if (!isJsonObject(params)) {
+      return;
+    }
+    const name = typeof params.name === "string" ? params.name : "";
+    const payloadString = typeof params.payload === "string" ? params.payload : "";
+    if (name !== CDP_ACTION_BINDING_NAME || !payloadString) {
+      return;
+    }
+    const parsed = parseJsonString(payloadString);
+    if (!isJsonObject(parsed)) {
+      return;
+    }
+    const actionPayload = parsed as CdpInPageActionPayload;
+    const actionType =
+      typeof actionPayload.type === "string" ? actionPayload.type : "";
+    if (
+      actionType !== "validate" &&
+      actionType !== "validate-stop" &&
+      actionType !== "open-validation-chat"
+    ) {
+      return;
+    }
+    cdpValidateLog("action", {
+      sessionId: session.id,
+      actionType,
+    });
+    if (!this.window) {
+      return;
+    }
+    if (actionType === "validate-stop") {
+      cdpValidateLog("send-stop-request", {
+        sessionId: session.id,
+      });
+      this.window.webContents.send("cdp-browser-validate-stop-request", {
+        sessionId: session.id,
+      });
+      return;
+    }
+    const resolvedUrl =
+      typeof actionPayload.url === "string"
+        ? normalizeHttpUrl(actionPayload.url)
+        : null;
+    const title =
+      typeof actionPayload.title === "string" &&
+      actionPayload.title.trim().length > 0
+        ? actionPayload.title.trim()
+        : undefined;
+    if (actionType === "open-validation-chat") {
+      cdpValidateLog("send-open-chat-request", {
+        sessionId: session.id,
+        url: resolvedUrl,
+      });
+      this.window.webContents.send("cdp-browser-open-validation-chat-request", {
+        sessionId: session.id,
+        url: resolvedUrl ?? "",
+        title,
+      });
+      return;
+    }
+    cdpValidateLog("send-validate-request", {
+      sessionId: session.id,
+      url: resolvedUrl,
+      title,
+    });
+    this.window.webContents.send("cdp-browser-validate-request", {
+      sessionId: session.id,
+      url: resolvedUrl ?? "",
+      title,
+    });
+  }
+
   private handleSocketMessage(session: CdpSession, rawText: string) {
     const message = parseJsonString(rawText);
     if (!isJsonObject(message)) {
@@ -797,6 +1163,7 @@ class CdpBrowserController {
     }
     if (method === "Runtime.bindingCalled") {
       this.handleSelectionBinding(session, message.params);
+      this.handleActionBinding(session, message.params);
       return;
     }
     if (
@@ -805,7 +1172,7 @@ class CdpBrowserController {
       method === "Page.frameStoppedLoading"
     ) {
       cdpDebugLog("page:event", { sessionId: session.id, method });
-      void this.ensureInPageReferenceButton(session.id);
+      void this.ensureInPageControls(session.id);
       void this.applyPendingHighlight(session.id);
       return;
     }
@@ -827,7 +1194,7 @@ class CdpBrowserController {
           sessionId: session.id,
           eventName,
         });
-        void this.ensureInPageReferenceButton(session.id);
+        void this.ensureInPageControls(session.id);
         void this.applyPendingHighlight(session.id);
       }
     }
@@ -877,15 +1244,14 @@ class CdpBrowserController {
     const selectionScript = buildSelectionBridgeScript();
     await this.sendCommand(session, "Runtime.enable");
     await this.sendCommand(session, "Page.enable");
-    try {
-      await this.sendCommand(session, "Page.setLifecycleEventsEnabled", {
-        enabled: true,
-      });
-    } catch {
-      // Keep compatibility with older Chromium implementations.
-    }
+    await this.sendCommand(session, "Page.setLifecycleEventsEnabled", {
+      enabled: true,
+    });
     await this.sendCommand(session, "Runtime.addBinding", {
       name: CDP_SELECTION_BINDING_NAME,
+    });
+    await this.sendCommand(session, "Runtime.addBinding", {
+      name: CDP_ACTION_BINDING_NAME,
     });
     await this.sendCommand(session, "Page.addScriptToEvaluateOnNewDocument", {
       source: selectionScript,
@@ -911,50 +1277,100 @@ class CdpBrowserController {
     return "value" in runtimeResult ? runtimeResult.value : undefined;
   }
 
-  private async ensureInPageReferenceButton(sessionId: string): Promise<void> {
+  async captureValidationSnapshot(
+    sessionId: string,
+  ): Promise<CdpValidationSnapshot | null> {
     const session = this.sessions.get(sessionId);
-    const reference = session?.referenceHighlight;
-    if (!session || !reference) {
-      cdpDebugLog("ensureInPageReferenceButton:skip", {
-        sessionId,
-        reason: !session ? "no-session" : "no-reference",
-      });
-      return;
+    if (!session) {
+      throw new Error(`CDP session not found: ${sessionId}`);
     }
-    const expression = buildReferenceLocateButtonScript(reference);
-    if (!session.referenceUiScriptInstalled) {
-      try {
-        await this.sendCommand(session, "Page.addScriptToEvaluateOnNewDocument", {
-          source: expression,
-        });
-        session.referenceUiScriptInstalled = true;
-        cdpDebugLog("ensureInPageReferenceButton:installed-new-document-script", {
-          sessionId,
-        });
-      } catch {
-        // Best effort; fallback to direct evaluate below.
-        cdpWarnLog("ensureInPageReferenceButton:addScriptToEvaluateOnNewDocument-failed", {
-          sessionId,
-        });
-      }
+    cdpValidateLog("capture-snapshot:start", {
+      sessionId,
+    });
+    const urlResult = await this.sendCommand(session, "Runtime.evaluate", {
+      expression: "window.location.href",
+      returnByValue: true,
+    });
+    const value = this.readRuntimeEvaluateValue(urlResult);
+    const fallbackUrl = typeof value === "string" ? value : "";
+    const normalizedFallbackUrl = normalizeHttpUrl(fallbackUrl);
+    if (!normalizedFallbackUrl) {
+      throw new Error("CDP validation snapshot URL is not a valid http(s) page.");
     }
-    try {
-      await this.sendCommand(session, "Runtime.evaluate", {
-        expression,
-        awaitPromise: true,
-        returnByValue: true,
-      });
-      cdpDebugLog("ensureInPageReferenceButton:evaluate-success", {
-        sessionId,
-        refId: reference.refId,
-        textLength: reference.text.length,
-      });
-    } catch {
-      // The document might be transitioning; events will retry.
-      cdpWarnLog("ensureInPageReferenceButton:evaluate-failed", {
+    const evaluateResult = await this.sendCommand(session, "Runtime.evaluate", {
+      expression: `(${runValidationSnapshotScript.toString()})(${MAX_VALIDATION_TEXT_LENGTH})`,
+      awaitPromise: true,
+      returnByValue: true,
+    });
+    const snapshotValue = this.readRuntimeEvaluateValue(evaluateResult);
+    if (!isJsonObject(snapshotValue)) {
+      cdpValidateLog("capture-snapshot:empty", {
         sessionId,
       });
+      return null;
     }
+    const sanitized = sanitizeValidationSnapshot(
+      snapshotValue as CdpValidationSnapshotPayload,
+      normalizedFallbackUrl,
+    );
+    cdpValidateLog("capture-snapshot:done", {
+      sessionId,
+      url: sanitized?.url ?? normalizedFallbackUrl,
+      textLength: sanitized?.text.length ?? 0,
+    });
+    return sanitized;
+  }
+
+  async setValidationIndicator(input: {
+    sessionId: string;
+    status: CdpValidationIndicatorState;
+    message?: string;
+  }): Promise<void> {
+    const session = this.sessions.get(input.sessionId);
+    if (!session) {
+      throw new Error(`CDP session not found: ${input.sessionId}`);
+    }
+    await this.ensureInPageControls(input.sessionId);
+    await this.sendCommand(session, "Runtime.evaluate", {
+      expression: buildApplyValidationIndicatorScript({
+        status: input.status,
+        message: input.message,
+      }),
+      awaitPromise: true,
+      returnByValue: true,
+    });
+    cdpValidateLog("indicator", {
+      sessionId: input.sessionId,
+      status: input.status,
+      hasMessage: Boolean(input.message && input.message.trim().length > 0),
+      message: input.message,
+    });
+  }
+
+  private async ensureInPageControls(sessionId: string): Promise<void> {
+    const session = this.sessions.get(sessionId);
+    if (!session) {
+      throw new Error(`CDP session not found: ${sessionId}`);
+    }
+    const expression = buildInPageControlsScript(session.referenceHighlight);
+    if (!session.controlsUiScriptInstalled) {
+      await this.sendCommand(session, "Page.addScriptToEvaluateOnNewDocument", {
+        source: expression,
+      });
+      session.controlsUiScriptInstalled = true;
+      cdpDebugLog("ensureInPageControls:installed-new-document-script", {
+        sessionId,
+      });
+    }
+    await this.sendCommand(session, "Runtime.evaluate", {
+      expression,
+      awaitPromise: true,
+      returnByValue: true,
+    });
+    cdpDebugLog("ensureInPageControls:evaluate-success", {
+      sessionId,
+      hasReference: Boolean(session.referenceHighlight),
+    });
   }
 
   private async applyPendingHighlight(
@@ -971,52 +1387,45 @@ class CdpBrowserController {
       refId: payload.refId,
       attempt,
     });
-    try {
-      const evaluateResult = await this.sendCommand(session, "Runtime.evaluate", {
-        expression: `(${runReferenceHighlightScript.toString()})(${JSON.stringify(
-          {
-            refId: payload.refId,
-            text: payload.text,
-          },
-        )})`,
-        awaitPromise: true,
-        returnByValue: true,
-      });
-      const value = this.readRuntimeEvaluateValue(evaluateResult);
-      cdpDebugLog("highlight:result", {
-        sessionId,
-        refId: payload.refId,
-        attempt,
-        ok: isJsonObject(value) ? value.ok === true : false,
-        result:
-          isJsonObject(value) && typeof value.reason === "string"
-            ? value.reason
-            : null,
-      });
-      if (isJsonObject(value) && value.ok === true) {
-        session.pendingHighlight = undefined;
-        cdpDebugLog("highlight:success", {
-          sessionId,
+    const evaluateResult = await this.sendCommand(session, "Runtime.evaluate", {
+      expression: `(${runReferenceHighlightScript.toString()})(${JSON.stringify(
+        {
           refId: payload.refId,
-          attempt,
-        });
-        return;
-      }
-    } catch {
-      // Retry below.
-      cdpWarnLog("highlight:evaluate-error", {
+          text: payload.text,
+        },
+      )})`,
+      awaitPromise: true,
+      returnByValue: true,
+    });
+    const value = this.readRuntimeEvaluateValue(evaluateResult);
+    const reason =
+      isJsonObject(value) && typeof value.reason === "string"
+        ? value.reason
+        : "Reference text not found in current page.";
+    cdpDebugLog("highlight:result", {
+      sessionId,
+      refId: payload.refId,
+      attempt,
+      ok: isJsonObject(value) ? value.ok === true : false,
+      result: reason,
+    });
+    if (isJsonObject(value) && value.ok === true) {
+      session.pendingHighlight = undefined;
+      cdpDebugLog("highlight:success", {
         sessionId,
         refId: payload.refId,
         attempt,
       });
-    }
-    if (attempt >= MAX_HIGHLIGHT_RETRY_ATTEMPTS) {
       return;
     }
+    if (attempt >= MAX_HIGHLIGHT_RETRY_ATTEMPTS) {
+      throw new Error(
+        `CDP highlight failed after ${MAX_HIGHLIGHT_RETRY_ATTEMPTS + 1} attempts: ${reason}`,
+      );
+    }
     const delay = Math.min(1600, 220 * (attempt + 1));
-    setTimeout(() => {
-      void this.applyPendingHighlight(sessionId, attempt + 1);
-    }, delay);
+    await new Promise((resolve) => setTimeout(resolve, delay));
+    await this.applyPendingHighlight(sessionId, attempt + 1);
   }
 
   async open(input: {
@@ -1048,7 +1457,7 @@ class CdpBrowserController {
       pending: new Map(),
       pendingHighlight: reference,
       referenceHighlight: reference,
-      referenceUiScriptInstalled: false,
+      controlsUiScriptInstalled: false,
       lastSelectionSignature: "",
     };
     socket.on("message", (rawData: unknown) => {
@@ -1072,12 +1481,8 @@ class CdpBrowserController {
     this.sessions.set(session.id, session);
     try {
       await this.installSessionScripts(session);
-      await this.ensureInPageReferenceButton(session.id);
-      try {
-        await this.sendCommand(session, "Page.bringToFront");
-      } catch {
-        // Best effort only.
-      }
+      await this.ensureInPageControls(session.id);
+      await this.sendCommand(session, "Page.bringToFront");
       await this.sendCommand(session, "Page.navigate", {
         url: normalizedUrl,
       });
@@ -1094,7 +1499,7 @@ class CdpBrowserController {
       targetId: session.targetId,
       launchMode,
       hasReference: Boolean(reference),
-      referenceUiScriptInstalled: session.referenceUiScriptInstalled,
+      controlsUiScriptInstalled: session.controlsUiScriptInstalled,
       pendingHighlight: Boolean(session.pendingHighlight),
     });
     return { ok: true, sessionId: session.id, launchMode };

@@ -92,11 +92,11 @@ const appendExtractMessagesLog = async ({
     }
     await fs.appendFile(filePath, `${serialized}\n`, "utf-8");
   } catch (error) {
-    console.warn("[subagent.extract.agent.messagesLog.error]", {
-      stage,
-      filePath,
-      error: error instanceof Error ? clampText(error.message, 220) : "unknown",
-    });
+    throw new Error(
+      `[subagent.extract.agent.messagesLog.error] stage=${stage} file=${filePath} message=${
+        error instanceof Error ? clampText(error.message, 220) : "unknown"
+      }`,
+    );
   }
 };
 

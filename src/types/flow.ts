@@ -25,4 +25,10 @@ export type QuestionNode = Node<QuestionNodeData, 'question'>
 export type SourceNode = Node<SourceNodeData, 'source'>
 export type InsightNode = Node<InsightNodeData, 'insight'>
 export type FlowNode = Node<FlowNodeData>
+export type FlowEdgeRelationType = 'support'
+
+export interface FlowEdgeData {
+  relationType?: FlowEdgeRelationType
+}
+
 export type FlowEdge = Edge

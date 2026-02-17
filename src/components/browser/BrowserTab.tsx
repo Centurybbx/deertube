@@ -12,7 +12,9 @@ import {
   ArrowRight,
   ExternalLink,
   Loader2,
+  MessageSquare,
   RotateCw,
+  Square,
   ShieldCheck,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
@@ -22,6 +24,7 @@ import {
   PopoverTrigger,
 } from "@/components/ui/popover";
 import type {
+  BrowserValidationFailureReason,
   BrowserPageValidationRecord,
   BrowserValidationStatus,
   BrowserViewBounds,
@@ -82,6 +85,9 @@ const getValidationButtonToneClass = ({
   if (status === "running") {
     return "border-sky-400/50 bg-sky-500/10 text-sky-700 hover:bg-sky-500/20 dark:text-sky-300";
   }
+  if (status === "complete" && !hasError) {
+    return "border-emerald-400/50 bg-emerald-500/10 text-emerald-700 hover:bg-emerald-500/20 dark:text-emerald-300";
+  }
   if (hasError || status === "failed") {
     return "border-red-400/50 bg-red-500/10 text-red-700 hover:bg-red-500/20 dark:text-red-300";
   }
@@ -109,13 +115,16 @@ interface BrowserTabProps {
   canGoBack?: boolean;
   canGoForward?: boolean;
   validation?: BrowserPageValidationRecord;
+  validationChatId?: string;
   validationStatus?: BrowserValidationStatus;
   validationError?: string;
+  validationFailureReason?: BrowserValidationFailureReason;
   onBoundsChange: (tabId: string, bounds: BrowserViewBounds) => void;
   onRequestBack: (tabId: string) => void;
   onRequestForward: (tabId: string) => void;
   onRequestReload: (tabId: string) => void;
   onRequestValidate: (tabId: string) => void;
+  onRequestOpenValidationChat?: (tabId: string) => void;
   onRequestOpenCdp: (tabId: string, url: string) => void;
   onRequestOpenExternal: (url: string) => void;
   onRequestNavigate: (tabId: string, url: string) => void;
@@ -127,13 +136,16 @@ export function BrowserTab({
   canGoBack,
   canGoForward,
   validation,
+  validationChatId,
   validationStatus,
   validationError,
+  validationFailureReason,
   onBoundsChange,
   onRequestBack,
   onRequestForward,
   onRequestReload,
   onRequestValidate,
+  onRequestOpenValidationChat,
   onRequestOpenCdp,
   onRequestOpenExternal,
   onRequestNavigate,
@@ -143,8 +155,30 @@ export function BrowserTab({
   const [address, setAddress] = useState(url);
   const [isEditing, setIsEditing] = useState(false);
   const [validationPopoverOpen, setValidationPopoverOpen] = useState(false);
+  const validationFailed = validationStatus === "failed" || Boolean(validationError);
+  const validationStopped =
+    validationFailureReason === "stopped" ||
+    /stopped by user|abort/i.test(validationError ?? "");
+  const validationSucceeded = validationStatus === "complete" && Boolean(validation);
+  const canRetryValidation = validationSucceeded;
+  const hasValidationChatButton = Boolean(
+    validationChatId && onRequestOpenValidationChat,
+  );
+  const mainHasTrailingButton = canRetryValidation || hasValidationChatButton;
+  const validationPopoverSide = validationFailed ? "top" : "bottom";
+  const failureTitle = validationStopped
+    ? "Validation Stopped"
+    : "Validation Failed";
+  const failureDescription = validationError
+    ? validationError
+    : validationStopped
+      ? "Validation stopped by user."
+      : "Validation failed. Check logs for details.";
   const hasValidationPopoverContent =
-    validationStatus === "running" || Boolean(validationError) || Boolean(validation);
+    validationStatus === "running" ||
+    validationFailed ||
+    Boolean(validation) ||
+    Boolean(validationChatId);
   const accuracyLabel = formatAccuracyLabel(validation?.accuracy);
   const checkedAtLabel = useMemo(() => {
     if (!validation?.checkedAt) {
@@ -162,7 +196,7 @@ export function BrowserTab({
   const validateButtonToneClass = getValidationButtonToneClass({
     status: validationStatus,
     accuracy: validation?.accuracy,
-    hasError: Boolean(validationError),
+    hasError: validationFailed,
   });
   const clearValidationPopoverTimer = useCallback(() => {
     if (validationPopoverTimerRef.current !== null) {
@@ -217,6 +251,12 @@ export function BrowserTab({
     setValidationPopoverOpen(false);
     clearValidationPopoverTimer();
   }, [clearValidationPopoverTimer, url]);
+
+  useEffect(() => {
+    if (validationFailed && hasValidationPopoverContent) {
+      setValidationPopoverOpen(true);
+    }
+  }, [hasValidationPopoverContent, validationFailed]);
 
   useEffect(() => {
     return () => {
@@ -336,48 +376,66 @@ export function BrowserTab({
           >
             CDP
           </Button>
-          <Popover
-            open={validationPopoverOpen && hasValidationPopoverContent}
-            onOpenChange={setValidationPopoverOpen}
-          >
-            <PopoverTrigger asChild>
-              <Button
-                type="button"
-                variant="outline"
-                size="sm"
-                className={cn(
-                  "h-7 gap-1.5 px-2 text-[11px] font-medium",
-                  validateButtonToneClass,
-                )}
-                onClick={() => {
-                  if (validationStatus === "running") {
-                    return;
+          <div className="flex items-center">
+            <Popover
+              open={validationPopoverOpen && hasValidationPopoverContent}
+              onOpenChange={setValidationPopoverOpen}
+            >
+              <PopoverTrigger asChild>
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  className={cn(
+                    "h-7 gap-1.5 px-2 text-[11px] font-medium",
+                    mainHasTrailingButton
+                      ? "rounded-r-none border-r-0"
+                      : "",
+                    validateButtonToneClass,
+                  )}
+                  onClick={() => {
+                    if (validationStatus === "running") {
+                      onRequestValidate(tabId);
+                      return;
+                    }
+                    if (validationSucceeded) {
+                      return;
+                    }
+                    onRequestValidate(tabId);
+                  }}
+                  disabled={!url}
+                  title={
+                    validationStatus === "running"
+                      ? "Stop page validation"
+                      : validationSucceeded
+                        ? "Validation succeeded"
+                        : "Validate page content"
                   }
-                  onRequestValidate(tabId);
-                }}
-                disabled={!url}
-                title="Validate page content"
-                onMouseEnter={() => {
-                  openValidationPopover();
-                }}
-                onMouseLeave={() => {
-                  scheduleCloseValidationPopover();
-                }}
-              >
-                {validationStatus === "running" ? (
-                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                ) : validationStatus === "failed" || validationError ? (
-                  <AlertCircle className="h-3.5 w-3.5" />
-                ) : (
-                  <ShieldCheck className="h-3.5 w-3.5" />
-                )}
-                Validate
-              </Button>
-            </PopoverTrigger>
+                  onMouseEnter={() => {
+                    openValidationPopover();
+                  }}
+                  onMouseLeave={() => {
+                    scheduleCloseValidationPopover();
+                  }}
+                >
+                  {validationStatus === "running" ? (
+                    <Square className="h-3.5 w-3.5" />
+                  ) : validationFailed ? (
+                    <AlertCircle className="h-3.5 w-3.5" />
+                  ) : (
+                    <ShieldCheck className="h-3.5 w-3.5" />
+                  )}
+                  {validationStatus === "running"
+                    ? "Stop"
+                    : validationSucceeded
+                      ? "Validated"
+                      : "Validate"}
+                </Button>
+              </PopoverTrigger>
             {hasValidationPopoverContent ? (
               <PopoverContent
                 align="end"
-                side="bottom"
+                side={validationPopoverSide}
                 className="w-[360px] p-3"
                 onMouseEnter={() => {
                   openValidationPopover();
@@ -387,13 +445,19 @@ export function BrowserTab({
                 }}
               >
                 {validationStatus === "running" ? (
-                  <div className="flex items-center gap-2 text-xs text-muted-foreground">
-                    <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                    Validating current page...
+                  <div className="space-y-2">
+                    <div className="flex items-center gap-2 text-xs text-muted-foreground">
+                      <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                      Validating current page...
+                    </div>
+                    <div className="text-[11px] text-muted-foreground">
+                      Click Validate again to stop.
+                    </div>
                   </div>
-                ) : validationError ? (
+                ) : validationFailed ? (
                   <div className="rounded border border-red-400/45 bg-red-500/10 px-2 py-1 text-xs text-red-700 dark:text-red-300">
-                    {validationError}
+                    <div className="font-semibold">{failureTitle}</div>
+                    <div className="mt-1 leading-relaxed">{failureDescription}</div>
                   </div>
                 ) : validation ? (
                   <div className="max-h-[260px] space-y-2 overflow-y-auto pr-1">
@@ -449,7 +513,44 @@ export function BrowserTab({
                 )}
               </PopoverContent>
             ) : null}
-          </Popover>
+            </Popover>
+            {canRetryValidation ? (
+              <Button
+                type="button"
+                variant="outline"
+                size="icon"
+                className={cn(
+                  "h-7 w-7 rounded-none border-r-0",
+                  validateButtonToneClass,
+                )}
+                onClick={() => {
+                  onRequestValidate(tabId);
+                }}
+                title="Validate again"
+                aria-label="Validate again"
+              >
+                <RotateCw className="h-3.5 w-3.5" />
+              </Button>
+            ) : null}
+            {hasValidationChatButton ? (
+              <Button
+                type="button"
+                variant="outline"
+                size="icon"
+                className={cn(
+                  "h-7 w-7 rounded-l-none",
+                  validateButtonToneClass,
+                )}
+                onClick={() => {
+                  onRequestOpenValidationChat?.(tabId);
+                }}
+                title="Focus validation chat"
+                aria-label="Focus validation chat"
+              >
+                <MessageSquare className="h-3.5 w-3.5" />
+              </Button>
+            ) : null}
+          </div>
         </div>
       </div>
       <div ref={viewRef} className="relative flex-1 bg-muted/20">

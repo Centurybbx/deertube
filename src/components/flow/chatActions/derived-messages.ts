@@ -17,6 +17,7 @@ interface BuildDerivedMessagesOptions {
   error: Error | undefined;
   fallbackCreatedAtById: Map<string, string>;
   graphEventMessages: ChatMessage[];
+  asyncSubagentEventMessages: ChatMessage[];
   asyncDeepSearchEventMessages: ChatMessage[];
   persistedSubagentEvents: ChatMessage[];
   persistedDeepSearchEvents: ChatMessage[];
@@ -28,6 +29,7 @@ export const buildDerivedMessages = ({
   error,
   fallbackCreatedAtById,
   graphEventMessages,
+  asyncSubagentEventMessages,
   asyncDeepSearchEventMessages,
   persistedSubagentEvents,
   persistedDeepSearchEvents,
@@ -55,7 +57,10 @@ export const buildDerivedMessages = ({
   );
   const subagentEvents = mergePersistedAgentEvents(
     persistedSubagentEvents,
-    buildSubagentEvents(messages, status, deepSearchStatusByToolCall),
+    mergePersistedAgentEvents(
+      asyncSubagentEventMessages,
+      buildSubagentEvents(messages, status, deepSearchStatusByToolCall),
+    ),
   );
   const withSubagentEvents = subagentEvents.length
     ? mergeSubagentEvents(withGraphEvents, subagentEvents)

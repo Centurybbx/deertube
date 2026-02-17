@@ -187,13 +187,8 @@ const applyDelta = (point: Point, delta: Point): Point => ({
   y: point.y + delta.y,
 });
 
-const layoutGraph = async (graph: ElkNode): Promise<ElkNode | null> => {
-  try {
-    return await elk.layout(graph);
-  } catch {
-    return null;
-  }
-};
+const layoutGraph = async (graph: ElkNode): Promise<ElkNode> =>
+  await elk.layout(graph);
 
 interface LayoutRequest {
   nodes: FlowNode[];

@@ -31,32 +31,50 @@ export default function ProjectPicker({ onOpen }: ProjectPickerProps) {
   const [recents, setRecents] = useState<RecentProject[]>([])
   const [loading, setLoading] = useState(false)
   const [projectName, setProjectName] = useState('')
+  const [errorMessage, setErrorMessage] = useState<string | null>(null)
 
   useEffect(() => {
-    trpc.project.listRecent.query().then(setRecents).catch(() => setRecents([]))
+    void trpc.project.listRecent.query()
+      .then(setRecents)
+      .catch((error) => {
+        setErrorMessage(
+          error instanceof Error ? error.message : 'Failed to load recent projects.',
+        )
+      })
   }, [])
 
   const handleOpenPath = async (projectPath: string) => {
+    setErrorMessage(null)
     setLoading(true)
     try {
       const result = await trpc.project.open.mutate({ path: projectPath })
       onOpen(result)
+    } catch (error) {
+      setErrorMessage(
+        error instanceof Error ? error.message : 'Failed to open project.',
+      )
     } finally {
       setLoading(false)
     }
   }
 
   const handleDelete = async (projectPath: string) => {
+    setErrorMessage(null)
     setLoading(true)
     try {
       const result = await trpc.project.deleteRecent.mutate({ path: projectPath })
       setRecents(result.recents)
+    } catch (error) {
+      setErrorMessage(
+        error instanceof Error ? error.message : 'Failed to delete recent project.',
+      )
     } finally {
       setLoading(false)
     }
   }
 
   const handleBrowse = async () => {
+    setErrorMessage(null)
     setLoading(true)
     try {
       const projectPath = await trpc.project.choose.mutate()
@@ -65,6 +83,10 @@ export default function ProjectPicker({ onOpen }: ProjectPickerProps) {
       }
       const result = await trpc.project.open.mutate({ path: projectPath })
       onOpen(result)
+    } catch (error) {
+      setErrorMessage(
+        error instanceof Error ? error.message : 'Failed to browse project folder.',
+      )
     } finally {
       setLoading(false)
     }
@@ -75,10 +97,15 @@ export default function ProjectPicker({ onOpen }: ProjectPickerProps) {
     if (!name) {
       return
     }
+    setErrorMessage(null)
     setLoading(true)
     try {
       const result = await trpc.project.create.mutate({ name })
       onOpen(result)
+    } catch (error) {
+      setErrorMessage(
+        error instanceof Error ? error.message : 'Failed to create project.',
+      )
     } finally {
       setLoading(false)
     }
@@ -126,6 +153,13 @@ export default function ProjectPicker({ onOpen }: ProjectPickerProps) {
           </CardContent>
         </Card>
         <div className="flex flex-col gap-4">
+          {errorMessage ? (
+            <Card className="border-destructive/40 bg-destructive/5 text-destructive">
+              <CardContent className="p-4 text-sm">
+                {errorMessage}
+              </CardContent>
+            </Card>
+          ) : null}
           <div className="text-xs uppercase tracking-[0.3em] text-muted-foreground">
             Recent projects
           </div>

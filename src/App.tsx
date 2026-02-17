@@ -71,7 +71,12 @@ function App() {
         }
         handleOpen(result)
       })
-      .catch(() => undefined)
+      .catch((error) => {
+        if (cancelled) {
+          return
+        }
+        throw error
+      })
       .finally(() => {
         if (cancelled) {
           return

@@ -16,11 +16,7 @@ const readLocalStorageJson = <T,>(key: string, fallback: T): T => {
   if (!raw) {
     return fallback;
   }
-  try {
-    return JSON.parse(raw) as T;
-  } catch {
-    return fallback;
-  }
+  return JSON.parse(raw) as T;
 };
 
 export const loadDeepResearchConfig = (projectPath: string): DeepResearchConfig => {

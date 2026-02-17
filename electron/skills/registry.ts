@@ -10,6 +10,12 @@ import {
 const SKILL_FILENAME = "SKILL.md";
 const WALK_SKIP_DIRECTORIES = new Set(["node_modules", ".git", ".DS_Store"]);
 
+const hasNodeErrorCode = (error: unknown, code: string): boolean =>
+  typeof error === "object" &&
+  error !== null &&
+  "code" in error &&
+  (error as { code?: unknown }).code === code;
+
 export interface LocalAgentSkill extends RuntimeAgentSkill {
   relativePath: string;
   fullPath: string;
@@ -157,8 +163,12 @@ export const ensureBuiltinSearchSkillsSeeded = async (): Promise<{
     try {
       const stat = await fs.stat(skillFilePath);
       skillFileExists = stat.isFile();
-    } catch {
-      skillFileExists = false;
+    } catch (error) {
+      if (hasNodeErrorCode(error, "ENOENT")) {
+        skillFileExists = false;
+      } else {
+        throw error;
+      }
     }
     if (skillFileExists) {
       continue;
@@ -191,8 +201,11 @@ const listSkillDirectories = async (rootDirectory: string): Promise<string[]> =>
     let entries: Dirent[];
     try {
       entries = await fs.readdir(currentDirectory, { withFileTypes: true });
-    } catch {
-      continue;
+    } catch (error) {
+      if (hasNodeErrorCode(error, "ENOENT")) {
+        continue;
+      }
+      throw error;
     }
     const hasSkillFile = entries.some(
       (entry) => entry.isFile() && entry.name === SKILL_FILENAME,
@@ -222,8 +235,11 @@ const parseLocalSkill = async (
   let rawContent: string;
   try {
     rawContent = await fs.readFile(skillFilePath, "utf-8");
-  } catch {
-    return null;
+  } catch (error) {
+    if (hasNodeErrorCode(error, "ENOENT")) {
+      return null;
+    }
+    throw error;
   }
   const relativePath = path
     .relative(rootDirectory, skillDirectory)
@@ -280,8 +296,12 @@ export const scanLocalAgentSkills = async (): Promise<LocalAgentSkillScanResult>
   try {
     const stat = await fs.stat(directory);
     directoryExists = stat.isDirectory();
-  } catch {
-    directoryExists = false;
+  } catch (error) {
+    if (hasNodeErrorCode(error, "ENOENT")) {
+      directoryExists = false;
+    } else {
+      throw error;
+    }
   }
 
   if (!directoryExists) {

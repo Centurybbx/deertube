@@ -8,10 +8,12 @@ import {
 import type { TavilySearchDepth } from "../../../shared/deepresearch-config";
 import { TavilyResponseSchema, type TavilySearchResult } from "./schemas";
 import type {
+  DeepSearchStreamPayload,
   DeepSearchReference,
   DeepSearchSource,
   ExtractedEvidence,
   SearchResult,
+  SubagentStreamPayload,
   SubagentUIMessage,
 } from "./types";
 
@@ -28,12 +30,16 @@ export const writeSubagentStream = (
   toolCallId: string | undefined,
   toolName: string | undefined,
   messages: SubagentUIMessage[],
+  onStream?: (payload: SubagentStreamPayload) => void,
 ) => {
-  if (!writer || !toolCallId) return;
+  if (!toolCallId) return;
+  const payload: SubagentStreamPayload = { toolCallId, toolName, messages };
+  onStream?.(payload);
+  if (!writer) return;
   writer.write({
     type: "data-subagent-stream",
     id: toolCallId,
-    data: { toolCallId, toolName, messages },
+    data: payload,
   });
 };
 
@@ -41,31 +47,23 @@ export const writeDeepSearchStream = (
   writer: UIMessageStreamWriter | undefined,
   toolCallId: string | undefined,
   toolName: string | undefined,
-  payload: {
-    mode?: "search" | "validate";
-    query?: string;
-    projectId?: string;
-    searchId?: string;
-    status?: "running" | "complete" | "failed";
-    sources?: DeepSearchSource[];
-    references?: DeepSearchReference[];
-    prompt?: string;
-    conclusion?: string;
-    error?: string;
-    complete?: boolean;
-  },
+  payload: Omit<DeepSearchStreamPayload, "toolCallId" | "toolName">,
   done = false,
+  onStream?: (payload: DeepSearchStreamPayload, done: boolean) => void,
 ) => {
-  if (!writer || !toolCallId) return;
+  if (!toolCallId) return;
+  const resolvedPayload: DeepSearchStreamPayload = {
+    toolCallId,
+    toolName,
+    ...payload,
+    complete: done || payload.complete,
+  };
+  onStream?.(resolvedPayload, done);
+  if (!writer) return;
   writer.write({
     type: done ? "data-deepsearch-done" : "data-deepsearch-stream",
     id: toolCallId,
-    data: {
-      toolCallId,
-      toolName,
-      ...payload,
-      complete: done || payload.complete,
-    },
+    data: resolvedPayload,
   });
 };
 

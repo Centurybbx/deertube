@@ -14,7 +14,7 @@ export interface DeertubeMessageMetadata {
   error?: string;
 }
 
-interface SubagentStreamPayload {
+export interface SubagentStreamPayload {
   toolCallId: string;
   toolName?: string;
   messages: SubagentUIMessage[];
@@ -46,7 +46,7 @@ export interface DeepSearchReference {
   correctFact?: string;
 }
 
-interface DeepSearchStreamPayload {
+export interface DeepSearchStreamPayload {
   toolCallId: string;
   toolName?: string;
   mode?: "search" | "validate";

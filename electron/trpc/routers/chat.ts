@@ -8,6 +8,10 @@ import {
 import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
 import { baseProcedure, createTRPCRouter } from "../init";
 import type { DeertubeUIMessage } from "../../../src/modules/ai/tools";
+import type {
+  DeepSearchStreamPayload,
+  SubagentStreamPayload,
+} from "../../../src/modules/ai/tools/types";
 import { createTools } from "../../../src/modules/ai/tools";
 import { createDeepResearchPersistenceAdapter } from "../../deepresearch/store";
 import {
@@ -20,6 +24,7 @@ import type { RuntimeAgentSkill } from "../../../src/shared/agent-skills";
 import { runDeepSearchTool } from "../../../src/modules/ai/tools/runners/deepsearch-tool";
 
 const noStepLimit = () => false;
+const VALIDATE_LOG_PREFIX = "[validate][chat.router]";
 
 const loadExternalSkills = async (): Promise<RuntimeAgentSkill[]> => {
   const scanResult = await scanLocalAgentSkills();
@@ -66,6 +71,10 @@ const waitForAbort = (signal: AbortSignal): Promise<{ kind: "abort" }> =>
     };
     signal.addEventListener("abort", handleAbort, { once: true });
   });
+
+const isAbortError = (error: unknown): boolean =>
+  error instanceof Error &&
+  (error.name === "AbortError" || /abort/i.test(error.message));
 
 const HIDDEN_RUNTIME_CONTEXT_MARKER = "[[HIDDEN_RUNTIME_CONTEXT]]";
 
@@ -216,6 +225,159 @@ const buildLanguageModel = (
   };
 };
 
+const ValidateInputSchema = z.object({
+  projectPath: z.string(),
+  query: z.string().min(1),
+  answer: z.string().min(1),
+  toolCallId: z.string().optional(),
+  force: z.boolean().optional(),
+  settings: SettingsSchema.optional(),
+  deepResearch: DeepResearchConfigSchema.optional(),
+});
+
+type ValidateInput = z.infer<typeof ValidateInputSchema>;
+
+interface ValidateResult {
+  status: "complete" | "skipped";
+  mode: "validate";
+  query: string;
+  searchId?: string;
+  projectId?: string;
+  references: Awaited<ReturnType<typeof runDeepSearchTool>>["references"];
+  sources: Awaited<ReturnType<typeof runDeepSearchTool>>["sources"];
+}
+
+type ValidateStreamProgressEvent =
+  | {
+      type: "subagent-stream";
+      payload: SubagentStreamPayload;
+    }
+  | {
+      type: "deepsearch-stream";
+      payload: DeepSearchStreamPayload;
+    }
+  | {
+      type: "deepsearch-done";
+      payload: DeepSearchStreamPayload;
+    };
+
+interface ValidateStreamResultEvent {
+  type: "result";
+  payload: ValidateResult;
+}
+
+type ValidateStreamEvent = ValidateStreamProgressEvent | ValidateStreamResultEvent;
+
+const runValidateForInput = async (
+  input: ValidateInput,
+  abortSignal?: AbortSignal,
+  onStreamEvent?: (event: ValidateStreamProgressEvent) => void,
+): Promise<ValidateResult> => {
+  const deepResearchConfig = resolveDeepResearchConfig(input.deepResearch);
+  const forceValidate = input.force === true;
+  const effectiveDeepResearchConfig = forceValidate
+    ? {
+        ...deepResearchConfig,
+        enabled: true,
+        validate: {
+          ...deepResearchConfig.validate,
+          enabled: true,
+          strictness:
+            deepResearchConfig.validate.strictness === "no-search"
+              ? "all-claims"
+              : deepResearchConfig.validate.strictness,
+        },
+      }
+    : deepResearchConfig;
+  const query = input.query.trim();
+  console.log(VALIDATE_LOG_PREFIX, {
+    query: query.slice(0, 180),
+    validateEnabled:
+      deepResearchConfig.enabled && deepResearchConfig.validate.enabled,
+    forced: forceValidate,
+    aborted: Boolean(abortSignal?.aborted),
+  });
+  if (
+    !forceValidate &&
+    (!deepResearchConfig.enabled || !deepResearchConfig.validate.enabled)
+  ) {
+    return {
+      status: "skipped",
+      mode: "validate",
+      query,
+      searchId: undefined,
+      projectId: undefined,
+      references: [],
+      sources: [],
+    };
+  }
+  const externalSkills = filterExternalSkillsBySelection(
+    await loadExternalSkills(),
+    effectiveDeepResearchConfig.selectedSkillNames,
+  );
+  const legacyModel = buildLegacyModelSettings(input.settings);
+  const validateModelConfig = buildLanguageModel(
+    input.settings?.models?.validate,
+    input.settings?.models?.search ??
+      input.settings?.models?.chat ??
+      legacyModel,
+  );
+  const extractModelConfig = buildLanguageModel(
+    input.settings?.models?.extract,
+    input.settings?.models?.validate ??
+      input.settings?.models?.search ??
+      input.settings?.models?.chat ??
+      legacyModel,
+  );
+  const deepResearchStore = createDeepResearchPersistenceAdapter(input.projectPath);
+  const tavilyApiKey = trimOrUndefined(input.settings?.tavilyApiKey);
+  const jinaReaderBaseUrl = trimOrUndefined(input.settings?.jinaReaderBaseUrl);
+  const jinaReaderApiKey = trimOrUndefined(input.settings?.jinaReaderApiKey);
+  const result = await runDeepSearchTool({
+    query,
+    searchModel: validateModelConfig.model,
+    extractModel: extractModelConfig.model,
+    toolCallId: trimOrUndefined(input.toolCallId),
+    toolName: "validate.run",
+    abortSignal,
+    tavilyApiKey,
+    jinaReaderBaseUrl,
+    jinaReaderApiKey,
+    deepResearchStore,
+    deepResearchConfig: effectiveDeepResearchConfig,
+    externalSkills,
+    mode: "validate",
+    validateTargetAnswer: input.answer,
+    onSubagentStream: (payload) => {
+      onStreamEvent?.({
+        type: "subagent-stream",
+        payload,
+      });
+    },
+    onDeepSearchStream: (payload, done) => {
+      onStreamEvent?.({
+        type: done ? "deepsearch-done" : "deepsearch-stream",
+        payload,
+      });
+    },
+  });
+  console.log(VALIDATE_LOG_PREFIX, {
+    query: query.slice(0, 180),
+    status: "complete",
+    sources: result.sources.length,
+    references: result.references.length,
+  });
+  return {
+    status: "complete",
+    mode: "validate",
+    query,
+    searchId: result.searchId,
+    projectId: result.projectId,
+    references: result.references,
+    sources: result.sources,
+  };
+};
+
 export const chatRouter = createTRPCRouter({
   send: baseProcedure
     .input(
@@ -294,69 +456,101 @@ export const chatRouter = createTRPCRouter({
       return { text: result.text };
     }),
   validate: baseProcedure
-    .input(
-      z.object({
-        projectPath: z.string(),
-        query: z.string().min(1),
-        answer: z.string().min(1),
-        settings: SettingsSchema.optional(),
-        deepResearch: DeepResearchConfigSchema.optional(),
-      }),
-    )
-    .mutation(async ({ input }) => {
-      const deepResearchConfig = resolveDeepResearchConfig(input.deepResearch);
-      if (!deepResearchConfig.enabled || !deepResearchConfig.validate.enabled) {
-        return {
-          status: "skipped" as const,
-          mode: "validate" as const,
-          query: input.query.trim(),
-          searchId: undefined,
-          projectId: undefined,
-          references: [],
-          sources: [],
-        };
-      }
-      const externalSkills = filterExternalSkillsBySelection(
-        await loadExternalSkills(),
-        deepResearchConfig.selectedSkillNames,
-      );
-      const legacyModel = buildLegacyModelSettings(input.settings);
-      const validateModelConfig = buildLanguageModel(
-        input.settings?.models?.validate,
-        input.settings?.models?.search ??
-          input.settings?.models?.chat ??
-          legacyModel,
-      );
-      const extractModelConfig = buildLanguageModel(
-        input.settings?.models?.extract,
-        input.settings?.models?.validate ??
-          input.settings?.models?.search ??
-          input.settings?.models?.chat ??
-          legacyModel,
-      );
-      const deepResearchStore = createDeepResearchPersistenceAdapter(
-        input.projectPath,
-      );
-      const query = input.query.trim();
-      const result = await runDeepSearchTool({
-        query,
-        searchModel: validateModelConfig.model,
-        extractModel: extractModelConfig.model,
-        deepResearchStore,
-        deepResearchConfig,
-        externalSkills,
-        mode: "validate",
-        validateTargetAnswer: input.answer,
-      });
-      return {
-        status: "complete" as const,
-        mode: "validate" as const,
-        query,
-        searchId: result.searchId,
-        projectId: result.projectId,
-        references: result.references,
-        sources: result.sources,
+    .input(ValidateInputSchema)
+    .mutation(async ({ input }) => runValidateForInput(input)),
+  validateStream: baseProcedure
+    .input(ValidateInputSchema)
+    .subscription(async function* ({ input, signal }) {
+      const abortController = new AbortController();
+      const handleAbort = () => {
+        abortController.abort();
       };
+      if (signal) {
+        signal.addEventListener("abort", handleAbort, { once: true });
+      }
+      const queuedEvents: ValidateStreamEvent[] = [];
+      const waitingResolvers = new Set<() => void>();
+      let queueClosed = false;
+      const notifyWaitingReaders = () => {
+        waitingResolvers.forEach((resolve) => resolve());
+        waitingResolvers.clear();
+      };
+      const pushEvent = (event: ValidateStreamEvent) => {
+        if (queueClosed) {
+          return;
+        }
+        queuedEvents.push(event);
+        notifyWaitingReaders();
+      };
+      const waitForEventOrClose = async () => {
+        if (queuedEvents.length > 0 || queueClosed) {
+          return;
+        }
+        await new Promise<void>((resolve) => {
+          waitingResolvers.add(resolve);
+        });
+      };
+      try {
+        let runnerError: unknown;
+        const runner = runValidateForInput(
+          input,
+          abortController.signal,
+          (event) => {
+            pushEvent(event);
+          },
+        )
+          .then((result) => {
+            pushEvent({
+              type: "result",
+              payload: result,
+            });
+          })
+          .catch((error) => {
+            runnerError = error;
+          })
+          .finally(() => {
+            queueClosed = true;
+            notifyWaitingReaders();
+          });
+        while (true) {
+          await waitForEventOrClose();
+          while (queuedEvents.length > 0) {
+            const next = queuedEvents.shift();
+            if (!next) {
+              continue;
+            }
+            if ((signal?.aborted ?? false) || abortController.signal.aborted) {
+              return;
+            }
+            yield next;
+          }
+          if (queueClosed) {
+            break;
+          }
+        }
+        await runner;
+        if (runnerError) {
+          if (isAbortError(runnerError) || (signal?.aborted ?? false)) {
+            return;
+          }
+          throw runnerError;
+        }
+      } catch (error) {
+        if (
+          abortController.signal.aborted ||
+          (signal?.aborted ?? false) ||
+          isAbortError(error)
+        ) {
+          return;
+        }
+        throw error;
+      } finally {
+        queueClosed = true;
+        notifyWaitingReaders();
+        if (signal) {
+          signal.removeEventListener("abort", handleAbort);
+        }
+      }
     }),
   stream: baseProcedure
     .input(

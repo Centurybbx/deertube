@@ -301,7 +301,7 @@ export const MarkdownRenderer = memo(
           top,
         });
 
-        const resolved = await resolveReferencePreview(uri).catch(() => null);
+        const resolved = await resolveReferencePreview(uri);
         referencePreviewCacheRef.current.set(uri, resolved);
         if (referencePreviewTokenRef.current !== token) {
           return;
@@ -392,24 +392,19 @@ export const MarkdownRenderer = memo(
         if (href === null || href === undefined) {
           return null;
         }
-        try {
-          const casted = String(href).trim();
-          return casted.length > 0 ? casted : null;
-        } catch {
-          return null;
-        }
+        const casted = String(href).trim();
+        return casted.length > 0 ? casted : null;
       };
 
       const isHttpUrl = (href?: string | null) => {
         if (!href) {
           return false;
         }
-        try {
-          const parsed = new URL(href);
-          return parsed.protocol === "http:" || parsed.protocol === "https:";
-        } catch {
+        if (!URL.canParse(href)) {
           return false;
         }
+        const parsed = new URL(href);
+        return parsed.protocol === "http:" || parsed.protocol === "https:";
       };
 
       const isDeertubeUrl = (href?: string | null) => {
@@ -419,12 +414,11 @@ export const MarkdownRenderer = memo(
         if (href.toLowerCase().startsWith("deertube://")) {
           return true;
         }
-        try {
-          const parsed = new URL(href);
-          return parsed.protocol === "deertube:";
-        } catch {
+        if (!URL.canParse(href)) {
           return false;
         }
+        const parsed = new URL(href);
+        return parsed.protocol === "deertube:";
       };
 
       const flattenText = (children: ReactNode): string => {

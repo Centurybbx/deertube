@@ -140,11 +140,12 @@ export function useQuestionActions({
         requestAnimationFrame(() => {
           flowInstance?.fitView({ padding: 0.2, duration: 400 });
         });
-      } catch {
+      } catch (error) {
         updateQuestionNode(questionId, {
           answer: "Request failed. Please try again.",
           status: "failed",
         });
+        throw error;
       } finally {
         setBusy(false);
       }

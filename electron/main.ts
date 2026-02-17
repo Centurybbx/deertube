@@ -151,12 +151,7 @@ app.on('activate', () => {
 })
 
 void app.whenReady().then(async () => {
-  try {
-    await ensureBuiltinSearchSkillsSeeded();
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    console.error("[skills.seed.error]", message);
-  }
+  await ensureBuiltinSearchSkillsSeeded();
   registerDevDockMenu()
   createWindow()
 })

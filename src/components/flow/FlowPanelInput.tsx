@@ -12,9 +12,11 @@ interface FlowPanelInputProps {
   zoom?: number;
   prompt: string;
   busy: boolean;
+  asyncBusy?: boolean;
   onPromptChange: (value: string) => void;
   onSend: () => void;
   onStop?: () => void;
+  onStopAsync?: () => void;
   onRetry?: (messageId: string) => void;
   retryMessageId?: string | null;
   onFocusZoom?: (focusInput: () => void) => void;
@@ -28,9 +30,11 @@ export default function FlowPanelInput({
   zoom = 1,
   prompt,
   busy,
+  asyncBusy = false,
   onPromptChange,
   onSend,
   onStop,
+  onStopAsync,
   onRetry,
   retryMessageId = null,
   onFocusZoom,
@@ -50,11 +54,13 @@ export default function FlowPanelInput({
   const hasPrompt = prompt.trim().length > 0;
   const retryOnly = canRetry && !hasPrompt;
   const canStop = busy && Boolean(onStop);
+  const canStopAsync = asyncBusy && Boolean(onStopAsync);
   const actionLabel = canStop
     ? "Stop generation"
     : retryOnly
       ? "Retry request"
       : "Send message";
+  const asyncActionLabel = "Stop async tasks";
   const buttonSizeClass = isMicro
     ? "h-6 w-6"
     : isCompact
@@ -156,6 +162,26 @@ export default function FlowPanelInput({
             }`}
           />
         )}
+        {canStopAsync ? (
+          <Button
+            size="icon"
+            variant="outline"
+            className={`group relative rounded-md ${buttonSizeClass} ${iconSizeClass} hover:border-destructive hover:text-destructive`}
+            onClick={() => {
+              onStopAsync?.();
+            }}
+            aria-label={asyncActionLabel}
+            title={asyncActionLabel}
+          >
+            <>
+              <Loader2
+                className="animate-spin transition-opacity duration-150 group-hover:opacity-0"
+                style={{ animationDuration: "2.8s" }}
+              />
+              <Square className="absolute opacity-0 transition-opacity duration-150 group-hover:opacity-100" />
+            </>
+          </Button>
+        ) : null}
         <Button
           size="icon"
           variant={retryOnly ? "destructive" : "default"}

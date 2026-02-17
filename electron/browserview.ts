@@ -48,12 +48,11 @@ const MAX_HIGHLIGHT_TEXT_LENGTH = 4000;
 const MAX_VALIDATION_TEXT_LENGTH = 18000;
 
 const isAllowedUrl = (value: string) => {
-  try {
-    const parsed = new URL(value);
-    return ALLOWED_PROTOCOLS.has(parsed.protocol);
-  } catch {
+  if (!URL.canParse(value)) {
     return false;
   }
+  const parsed = new URL(value);
+  return ALLOWED_PROTOCOLS.has(parsed.protocol);
 };
 
 const sanitizeSelection = (payload: BrowserViewSelectionPayload) => {
@@ -766,22 +765,18 @@ class BrowserViewController {
     if (view.webContents.isLoadingMainFrame()) {
       return false;
     }
-    try {
-      const result: unknown = await view.webContents.executeJavaScript(
-        `(${runReferenceHighlightScript.toString()})(${JSON.stringify({
-          refId: payload.refId,
-          text: payload.text,
-        })})`,
-        true,
-      );
-      const ok = isJsonObject(result) && result.ok === true;
-      if (ok) {
-        this.pendingHighlights.delete(tabId);
-      }
-      return ok;
-    } catch {
-      return false;
+    const result: unknown = await view.webContents.executeJavaScript(
+      `(${runReferenceHighlightScript.toString()})(${JSON.stringify({
+        refId: payload.refId,
+        text: payload.text,
+      })})`,
+      true,
+    );
+    const ok = isJsonObject(result) && result.ok === true;
+    if (ok) {
+      this.pendingHighlights.delete(tabId);
     }
+    return ok;
   }
 
   async captureValidationSnapshot(
@@ -795,21 +790,17 @@ class BrowserViewController {
     if (!isAllowedUrl(fallbackUrl)) {
       return null;
     }
-    try {
-      const result: unknown = await view.webContents.executeJavaScript(
-        `(${runValidationSnapshotScript.toString()})(${MAX_VALIDATION_TEXT_LENGTH})`,
-        true,
-      );
-      if (!isJsonObject(result)) {
-        return null;
-      }
-      return sanitizeValidationSnapshot(
-        result as BrowserViewValidationSnapshotPayload,
-        fallbackUrl,
-      );
-    } catch {
+    const result: unknown = await view.webContents.executeJavaScript(
+      `(${runValidationSnapshotScript.toString()})(${MAX_VALIDATION_TEXT_LENGTH})`,
+      true,
+    );
+    if (!isJsonObject(result)) {
       return null;
     }
+    return sanitizeValidationSnapshot(
+      result as BrowserViewValidationSnapshotPayload,
+      fallbackUrl,
+    );
   }
 
   async open(tabId: string, url: string, bounds: BrowserViewBounds) {
