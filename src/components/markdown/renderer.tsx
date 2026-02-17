@@ -51,6 +51,9 @@ const TOOLTIP_MARGIN = 12;
 const TOOLTIP_GAP = 10;
 const TOOLTIP_HIDE_DELAY_MS = 160;
 
+const escapeSelectorAttribute = (value: string): string =>
+  value.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+
 const resolveReferenceTitle = (reference: MarkdownReferencePreview): string => {
   const trimmed = reference.title?.trim();
   return trimmed && trimmed.length > 0 ? trimmed : "Reference";
@@ -121,6 +124,7 @@ export const MarkdownRenderer = memo(
     );
     const referencePreviewTokenRef = useRef(0);
     const tooltipScrollRef = useRef<HTMLDivElement | null>(null);
+    const tooltipContainerRef = useRef<HTMLDivElement | null>(null);
     const tooltipScrollTargetRef = useRef<number | null>(null);
     const tooltipScrollRafRef = useRef<number | null>(null);
     const tooltipHideTimerRef = useRef<number | null>(null);
@@ -162,20 +166,24 @@ export const MarkdownRenderer = memo(
         stopTooltipScrollAnimation();
         return;
       }
+      const escapedUri = escapeSelectorAttribute(referenceTooltip.uri);
+      const referenceSelector = `[data-reference-uri="${escapedUri}"]`;
 
       const handleWheel = (event: WheelEvent) => {
         const scrollContainer = tooltipScrollRef.current;
         if (!scrollContainer) {
           return;
         }
+        const target = event.target;
+        const overReference =
+          target instanceof Element ? Boolean(target.closest(referenceSelector)) : false;
 
-        const hoveringReference = hoveredReferenceUriRef.current === referenceTooltip.uri;
         const insideTooltip =
           event.clientX >= referenceTooltip.left &&
           event.clientX <= referenceTooltip.left + TOOLTIP_WIDTH &&
           event.clientY >= referenceTooltip.top &&
           event.clientY <= referenceTooltip.top + TOOLTIP_HEIGHT;
-        if (!insideTooltip && !hoveringReference) {
+        if (!insideTooltip && !overReference) {
           return;
         }
 
@@ -266,6 +274,39 @@ export const MarkdownRenderer = memo(
         setReferenceTooltip(null);
       }, TOOLTIP_HIDE_DELAY_MS);
     }, [clearTooltipHideTimer]);
+
+    useEffect(() => {
+      if (!referenceTooltip) {
+        return;
+      }
+      const escapedUri = escapeSelectorAttribute(referenceTooltip.uri);
+      const referenceSelector = `[data-reference-uri="${escapedUri}"]`;
+      const handlePointerMove = (event: PointerEvent) => {
+        const target = event.target;
+        if (!(target instanceof Element)) {
+          hoveredReferenceUriRef.current = null;
+          scheduleHideReferenceTooltip();
+          return;
+        }
+        const overTooltip = tooltipContainerRef.current?.contains(target) ?? false;
+        const overReference = Boolean(target.closest(referenceSelector));
+        if (overTooltip || overReference) {
+          clearTooltipHideTimer();
+          if (overReference) {
+            hoveredReferenceUriRef.current = referenceTooltip.uri;
+          }
+          return;
+        }
+        hoveredReferenceUriRef.current = null;
+        scheduleHideReferenceTooltip();
+      };
+      window.addEventListener("pointermove", handlePointerMove, {
+        capture: true,
+      });
+      return () => {
+        window.removeEventListener("pointermove", handlePointerMove, true);
+      };
+    }, [clearTooltipHideTimer, referenceTooltip, scheduleHideReferenceTooltip]);
 
     useEffect(() => {
       return () => {
@@ -540,6 +581,7 @@ export const MarkdownRenderer = memo(
                   if (!normalizedHref) {
                     return;
                   }
+                  event.currentTarget.blur();
                   activateReference(normalizedHref, labelText);
                 }}
                 onDoubleClick={(event) => {
@@ -548,6 +590,7 @@ export const MarkdownRenderer = memo(
                   if (!normalizedHref) {
                     return;
                   }
+                  event.currentTarget.blur();
                   activateReference(normalizedHref, labelText);
                 }}
                 onMouseEnter={(event) => {
@@ -572,6 +615,7 @@ export const MarkdownRenderer = memo(
                 }}
                 className={markdownLinkClassName}
                 data-ref-accuracy={referenceAccuracy ?? undefined}
+                data-reference-uri={isDeertubeReference ? normalizedHref ?? undefined : undefined}
               >
                 {children}
               </a>
@@ -693,11 +737,14 @@ export const MarkdownRenderer = memo(
         {referenceTooltip && typeof document !== "undefined"
           ? createPortal(
               <div
+                ref={tooltipContainerRef}
                 className="fixed z-[2147483000] h-[184px] w-[320px] overflow-hidden rounded-lg border border-border/80 bg-popover/95 p-3 shadow-2xl backdrop-blur"
                 style={{
                   left: `${referenceTooltip.left}px`,
                   top: `${referenceTooltip.top}px`,
                 }}
+                onMouseEnter={clearTooltipHideTimer}
+                onMouseLeave={scheduleHideReferenceTooltip}
               >
                 {referenceTooltip.status === "loading" ? (
                   <div className="flex h-full items-center justify-center text-xs text-muted-foreground">
