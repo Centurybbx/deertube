@@ -1,3 +1,8 @@
+import type {
+  DeepResearchReferenceAccuracy,
+  DeepResearchSourceAuthority,
+} from "./deepresearch-config";
+
 const DEERTUBE_PROTOCOL = "deertube:";
 const SAFE_ID_PATTERN = /^[A-Za-z0-9_-]+$/;
 
@@ -18,7 +23,8 @@ export interface DeepResearchReferenceRecord {
   text: string;
   uri: string;
   validationRefContent?: string;
-  accuracy?: "high" | "medium" | "low" | "conflicting" | "insufficient";
+  accuracy?: DeepResearchReferenceAccuracy;
+  sourceAuthority?: DeepResearchSourceAuthority;
   issueReason?: string;
   correctFact?: string;
 }
@@ -50,7 +56,8 @@ export interface DeepResearchResolvedReference {
   endLine: number;
   text: string;
   validationRefContent?: string;
-  accuracy?: "high" | "medium" | "low" | "conflicting" | "insufficient";
+  accuracy?: DeepResearchReferenceAccuracy;
+  sourceAuthority?: DeepResearchSourceAuthority;
   issueReason?: string;
   correctFact?: string;
 }

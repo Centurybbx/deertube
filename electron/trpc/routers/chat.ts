@@ -232,13 +232,23 @@ const resolveReferencedContextForValidation = async (
       const excerptLine = excerpt
         ? clampText(excerpt, VALIDATE_CONTEXT_EXCERPT_MAX)
         : "No excerpt.";
+      const accuracyLine = reference.accuracy
+        ? `Accuracy: ${reference.accuracy}`
+        : null;
+      const sourceAuthorityLine = reference.sourceAuthority
+        ? `Source authority: ${reference.sourceAuthority}`
+        : null;
       return [
         `[${index + 1}] ${title}`,
         `URI: ${reference.uri}`,
         `URL: ${reference.url}`,
         `Viewpoint: ${clampText(reference.viewpoint, VALIDATE_CONTEXT_VIEWPOINT_MAX)}`,
+        accuracyLine,
+        sourceAuthorityLine,
         `Excerpt: ${excerptLine}`,
-      ].join("\n");
+      ]
+        .filter((line): line is string => Boolean(line))
+        .join("\n");
     }),
   ];
   return {
@@ -362,6 +372,10 @@ const runValidateForInput = async (
 ): Promise<ValidateResult> => {
   const deepResearchConfig = resolveDeepResearchConfig(input.deepResearch);
   const forceValidate = input.force === true;
+  const forcedValidateStrictness: "all-claims" | "uncertain-claims" =
+    deepResearchConfig.validate.strictness === "all-claims"
+      ? "all-claims"
+      : "uncertain-claims";
   const effectiveDeepResearchConfig = forceValidate
     ? {
         ...deepResearchConfig,
@@ -369,10 +383,7 @@ const runValidateForInput = async (
         validate: {
           ...deepResearchConfig.validate,
           enabled: true,
-          strictness:
-            deepResearchConfig.validate.strictness === "no-search"
-              ? "all-claims"
-              : deepResearchConfig.validate.strictness,
+          strictness: forcedValidateStrictness,
         },
       }
     : deepResearchConfig;

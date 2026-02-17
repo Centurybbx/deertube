@@ -73,6 +73,42 @@ const getAccuracyTextClass = (
   return "text-muted-foreground";
 };
 
+const formatSourceAuthorityLabel = (
+  sourceAuthority: BrowserPageValidationRecord["sourceAuthority"],
+): string | null => {
+  if (!sourceAuthority) {
+    return null;
+  }
+  if (sourceAuthority === "high") {
+    return "High";
+  }
+  if (sourceAuthority === "medium") {
+    return "Medium";
+  }
+  if (sourceAuthority === "low") {
+    return "Low";
+  }
+  return "Unknown";
+};
+
+const getSourceAuthorityTextClass = (
+  sourceAuthority: BrowserPageValidationRecord["sourceAuthority"],
+): string => {
+  if (sourceAuthority === "high") {
+    return "text-emerald-700 dark:text-emerald-300";
+  }
+  if (sourceAuthority === "medium") {
+    return "text-amber-700 dark:text-amber-300";
+  }
+  if (sourceAuthority === "low") {
+    return "text-red-700 dark:text-red-300";
+  }
+  if (sourceAuthority === "unknown") {
+    return "text-slate-700 dark:text-slate-300";
+  }
+  return "text-muted-foreground";
+};
+
 const getValidationButtonToneClass = ({
   status,
   accuracy,
@@ -180,6 +216,9 @@ export function BrowserTab({
     Boolean(validation) ||
     Boolean(validationChatId);
   const accuracyLabel = formatAccuracyLabel(validation?.accuracy);
+  const sourceAuthorityLabel = formatSourceAuthorityLabel(
+    validation?.sourceAuthority,
+  );
   const checkedAtLabel = useMemo(() => {
     if (!validation?.checkedAt) {
       return null;
@@ -485,6 +524,18 @@ export function BrowserTab({
                         )}
                       >
                         Accuracy {accuracyLabel}
+                      </div>
+                    ) : null}
+                    {sourceAuthorityLabel ? (
+                      <div
+                        className={cn(
+                          "text-[10px] uppercase tracking-[0.12em]",
+                          getSourceAuthorityTextClass(
+                            validation.sourceAuthority,
+                          ),
+                        )}
+                      >
+                        Source Authority {sourceAuthorityLabel}
                       </div>
                     ) : null}
                     {validation.issueReason ? (

@@ -63,6 +63,9 @@ const buildValidationExcerpt = (validation: BrowserPageValidationRecord): string
   if (validation.accuracy) {
     parts.push(`Accuracy: ${validation.accuracy}`);
   }
+  if (validation.sourceAuthority) {
+    parts.push(`Source authority: ${validation.sourceAuthority}`);
+  }
   if (validation.issueReason) {
     parts.push(`Issue: ${validation.issueReason}`);
   }

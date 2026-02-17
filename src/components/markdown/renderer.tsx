@@ -24,6 +24,7 @@ export interface MarkdownReferencePreview {
   endLine: number;
   validationRefContent?: string;
   accuracy?: "high" | "medium" | "low" | "conflicting" | "insufficient";
+  sourceAuthority?: "high" | "medium" | "low" | "unknown";
   issueReason?: string;
   correctFact?: string;
 }
@@ -93,11 +94,45 @@ const getAccuracyToneClass = (
   return "text-muted-foreground";
 };
 
+const formatSourceAuthorityLabel = (
+  sourceAuthority: MarkdownReferencePreview["sourceAuthority"],
+): string | null => {
+  if (!sourceAuthority) {
+    return null;
+  }
+  if (sourceAuthority === "high") return "High";
+  if (sourceAuthority === "medium") return "Medium";
+  if (sourceAuthority === "low") return "Low";
+  return "Unknown";
+};
+
+const getSourceAuthorityToneClass = (
+  sourceAuthority: MarkdownReferencePreview["sourceAuthority"],
+): string => {
+  if (sourceAuthority === "high") {
+    return "text-emerald-700 dark:text-emerald-300";
+  }
+  if (sourceAuthority === "medium") {
+    return "text-amber-700 dark:text-amber-300";
+  }
+  if (sourceAuthority === "low") {
+    return "text-red-700 dark:text-red-300";
+  }
+  if (sourceAuthority === "unknown") {
+    return "text-slate-700 dark:text-slate-300";
+  }
+  return "text-muted-foreground";
+};
+
 interface MarkdownRendererProps {
   source: string;
   className?: string;
   highlightExcerpt?: string;
   referenceAccuracyHints?: Record<string, MarkdownReferencePreview["accuracy"]>;
+  referenceSourceAuthorityHints?: Record<
+    string,
+    MarkdownReferencePreview["sourceAuthority"]
+  >;
   onNodeLinkClick?: (nodeId: string) => void;
   onReferenceClick?: (url: string, label?: string) => void;
   resolveReferencePreview?: (
@@ -113,6 +148,7 @@ export const MarkdownRenderer = memo(
     className,
     highlightExcerpt,
     referenceAccuracyHints,
+    referenceSourceAuthorityHints,
     onNodeLinkClick,
     onReferenceClick,
     resolveReferencePreview,
@@ -138,12 +174,21 @@ export const MarkdownRenderer = memo(
     const [referenceAccuracyByUri, setReferenceAccuracyByUri] = useState<
       Record<string, MarkdownReferencePreview["accuracy"]>
     >({});
+    const [referenceSourceAuthorityByUri, setReferenceSourceAuthorityByUri] =
+      useState<Record<string, MarkdownReferencePreview["sourceAuthority"]>>({});
     const mergedReferenceAccuracyByUri = useMemo(
       () => ({
         ...(referenceAccuracyHints ?? {}),
         ...referenceAccuracyByUri,
       }),
       [referenceAccuracyByUri, referenceAccuracyHints],
+    );
+    const mergedReferenceSourceAuthorityByUri = useMemo(
+      () => ({
+        ...(referenceSourceAuthorityHints ?? {}),
+        ...referenceSourceAuthorityByUri,
+      }),
+      [referenceSourceAuthorityByUri, referenceSourceAuthorityHints],
     );
 
     const clearTooltipHideTimer = useCallback(() => {
@@ -334,6 +379,12 @@ export const MarkdownRenderer = memo(
               [uri]: cached.accuracy,
             }));
           }
+          if (cached.sourceAuthority) {
+            setReferenceSourceAuthorityByUri((previous) => ({
+              ...previous,
+              [uri]: cached.sourceAuthority,
+            }));
+          }
           setReferenceTooltip({
             status: "ready",
             uri,
@@ -366,6 +417,12 @@ export const MarkdownRenderer = memo(
           setReferenceAccuracyByUri((previous) => ({
             ...previous,
             [uri]: resolved.accuracy,
+          }));
+        }
+        if (resolved.sourceAuthority) {
+          setReferenceSourceAuthorityByUri((previous) => ({
+            ...previous,
+            [uri]: resolved.sourceAuthority,
           }));
         }
         setReferenceTooltip({
@@ -571,6 +628,10 @@ export const MarkdownRenderer = memo(
               normalizedHref && isDeertubeReference
                 ? mergedReferenceAccuracyByUri[normalizedHref]
                 : undefined;
+            const referenceSourceAuthority =
+              normalizedHref && isDeertubeReference
+                ? mergedReferenceSourceAuthorityByUri[normalizedHref]
+                : undefined;
             return (
               <a
                 {...restProps}
@@ -615,6 +676,7 @@ export const MarkdownRenderer = memo(
                 }}
                 className={markdownLinkClassName}
                 data-ref-accuracy={referenceAccuracy ?? undefined}
+                data-ref-source-authority={referenceSourceAuthority ?? undefined}
                 data-reference-uri={isDeertubeReference ? normalizedHref ?? undefined : undefined}
               >
                 {children}
@@ -645,6 +707,7 @@ export const MarkdownRenderer = memo(
       resolveNodeLabel,
       resolveReferencePreview,
       mergedReferenceAccuracyByUri,
+      mergedReferenceSourceAuthorityByUri,
       scheduleHideReferenceTooltip,
       showReferenceTooltip,
     ]);
@@ -769,6 +832,21 @@ export const MarkdownRenderer = memo(
                         )}
                       >
                         Accuracy {formatAccuracyLabel(referenceTooltip.reference.accuracy)}
+                      </div>
+                    ) : null}
+                    {referenceTooltip.reference.sourceAuthority ? (
+                      <div
+                        className={cn(
+                          "mt-1 text-[10px] uppercase tracking-[0.12em]",
+                          getSourceAuthorityToneClass(
+                            referenceTooltip.reference.sourceAuthority,
+                          ),
+                        )}
+                      >
+                        Source Authority{" "}
+                        {formatSourceAuthorityLabel(
+                          referenceTooltip.reference.sourceAuthority,
+                        )}
                       </div>
                     ) : null}
                     <div

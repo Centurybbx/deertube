@@ -189,6 +189,7 @@ export async function runDeepSearchTool({
           text: reference.text,
           validationRefContent: reference.validationRefContent,
           accuracy: reference.accuracy,
+          sourceAuthority: reference.sourceAuthority,
           issueReason: reference.issueReason,
           correctFact: reference.correctFact,
         }),

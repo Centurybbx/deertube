@@ -6,6 +6,7 @@ import type {
 import type {
   DeepResearchConfig,
   DeepResearchReferenceAccuracy,
+  DeepResearchSourceAuthority,
 } from "../../../shared/deepresearch-config";
 import type { RuntimeAgentSkill } from "../../../shared/agent-skills";
 
@@ -42,6 +43,7 @@ export interface DeepSearchReference {
   text: string;
   validationRefContent?: string;
   accuracy?: DeepResearchReferenceAccuracy;
+  sourceAuthority?: DeepResearchSourceAuthority;
   issueReason?: string;
   correctFact?: string;
 }
@@ -101,6 +103,7 @@ export interface SearchResult {
   content?: string;
   validationRefContent?: string;
   accuracy?: DeepResearchReferenceAccuracy;
+  sourceAuthority?: DeepResearchSourceAuthority;
   issueReason?: string;
   correctFact?: string;
   pageId?: string;

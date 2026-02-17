@@ -35,6 +35,19 @@ const formatAccuracy = (
   return undefined;
 };
 
+const formatSourceAuthority = (
+  sourceAuthority: DeepSearchReferencePayload["sourceAuthority"],
+): string | undefined => {
+  if (!sourceAuthority) {
+    return undefined;
+  }
+  if (sourceAuthority === "high") return "High";
+  if (sourceAuthority === "medium") return "Medium";
+  if (sourceAuthority === "low") return "Low";
+  if (sourceAuthority === "unknown") return "Unknown";
+  return undefined;
+};
+
 const buildValidationPrompt = ({
   pageUrl,
   pageTitle,
@@ -214,10 +227,21 @@ export const buildPageValidationSummaryMessage = ({
       normalizeInline(reference.title) ??
       `Claim ${index + 1}`;
     const accuracy = formatAccuracy(reference.accuracy);
+    const sourceAuthority = formatSourceAuthority(reference.sourceAuthority);
+    const scoreLabel =
+      accuracy && sourceAuthority
+        ? `(Accuracy: ${accuracy}, Source: ${sourceAuthority})`
+        : accuracy
+          ? `(Accuracy: ${accuracy})`
+          : sourceAuthority
+            ? `(Source: ${sourceAuthority})`
+            : undefined;
     if (!marker) {
-      return accuracy ? `- ${viewpoint} (${accuracy})` : `- ${viewpoint}`;
+      return scoreLabel ? `- ${viewpoint} ${scoreLabel}` : `- ${viewpoint}`;
     }
-    return accuracy ? `- ${viewpoint} ${marker} (${accuracy})` : `- ${viewpoint} ${marker}`;
+    return scoreLabel
+      ? `- ${viewpoint} ${marker} ${scoreLabel}`
+      : `- ${viewpoint} ${marker}`;
   });
   const content =
     claimLines.length > 0

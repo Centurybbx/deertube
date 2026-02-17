@@ -497,6 +497,13 @@ export async function resolveDeepResearchReference(
       reference.accuracy === "insufficient"
         ? reference.accuracy
         : undefined,
+    sourceAuthority:
+      reference.sourceAuthority === "high" ||
+      reference.sourceAuthority === "medium" ||
+      reference.sourceAuthority === "low" ||
+      reference.sourceAuthority === "unknown"
+        ? reference.sourceAuthority
+        : undefined,
     issueReason:
       typeof reference.issueReason === "string"
         ? reference.issueReason

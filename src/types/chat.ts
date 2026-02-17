@@ -55,6 +55,7 @@ export interface DeepSearchReferencePayload {
   text: string
   validationRefContent?: string
   accuracy?: 'high' | 'medium' | 'low' | 'conflicting' | 'insufficient'
+  sourceAuthority?: 'high' | 'medium' | 'low' | 'unknown'
   issueReason?: string
   correctFact?: string
 }

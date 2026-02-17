@@ -103,6 +103,7 @@ const PRESET_AGENT_SKILLS: AgentSkillPreset[] = [
       "- Mark time-sensitive data explicitly with date and timezone.",
       "- When guidance could imply financial action, surface uncertainty and key downside scenarios.",
       "- For token/protocol claims, cross-check at least two independent high-authority sources when possible.",
+      "- When validating claims, score both dimensions explicitly: claim accuracy and source authority (high/medium/low/unknown).",
     ].join("\n"),
   },
   {
@@ -155,6 +156,7 @@ const PRESET_AGENT_SKILLS: AgentSkillPreset[] = [
       "- Prefer recent high-quality review papers when the field is large.",
       "- Explicitly call out limitations (sample size, confounders, external validity).",
       "- Distinguish correlation from causation and highlight uncertainty intervals when available.",
+      "- When validating claims, score both dimensions explicitly: claim accuracy and source authority (high/medium/low/unknown).",
     ].join("\n"),
   },
   {
@@ -205,6 +207,7 @@ const PRESET_AGENT_SKILLS: AgentSkillPreset[] = [
       "- Cross-check key facts across independent sources before presenting as confirmed.",
       "- Separate confirmed facts from developing reports and rumors.",
       "- If facts conflict, report disagreement explicitly instead of forcing a single narrative.",
+      "- When validating claims, score both dimensions explicitly: claim accuracy and source authority (high/medium/low/unknown).",
     ].join("\n"),
   },
 ];
@@ -417,6 +420,9 @@ export const buildSkillRegistryPromptBlock = ({
   lines.push("Skill registry:");
   lines.push(
     "You can load domain-specific guidance by calling the skill tool when relevant.",
+  );
+  lines.push(
+    "When validating factual claims, evaluate both claim accuracy and source authority using skill guidance.",
   );
   skills.forEach((skill) => {
     lines.push(

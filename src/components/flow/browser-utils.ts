@@ -74,6 +74,24 @@ const getValidationAccuracyPriority = (
   return 0;
 };
 
+const getValidationSourceAuthorityPriority = (
+  sourceAuthority: BrowserPageValidationRecord["sourceAuthority"],
+): number => {
+  if (sourceAuthority === "high") {
+    return 4;
+  }
+  if (sourceAuthority === "medium") {
+    return 3;
+  }
+  if (sourceAuthority === "low") {
+    return 2;
+  }
+  if (sourceAuthority === "unknown") {
+    return 1;
+  }
+  return 0;
+};
+
 const pickPrimaryValidationReference = (
   references: DeepSearchReferencePayload[],
 ): DeepSearchReferencePayload | null => {
@@ -90,6 +108,19 @@ const pickPrimaryValidationReference = (
       return;
     }
     if (candidateScore !== selectedScore) {
+      return;
+    }
+    const selectedAuthorityScore = getValidationSourceAuthorityPriority(
+      selected.sourceAuthority,
+    );
+    const candidateAuthorityScore = getValidationSourceAuthorityPriority(
+      candidate.sourceAuthority,
+    );
+    if (candidateAuthorityScore > selectedAuthorityScore) {
+      selected = candidate;
+      return;
+    }
+    if (candidateAuthorityScore < selectedAuthorityScore) {
       return;
     }
     if (candidate.validationRefContent && !selected.validationRefContent) {
@@ -128,6 +159,7 @@ export const buildBrowserValidationRecord = ({
       startLine: 1,
       endLine: 1,
       accuracy: "insufficient",
+      sourceAuthority: "unknown",
       sourceCount,
       referenceCount: 0,
     };
@@ -148,6 +180,7 @@ export const buildBrowserValidationRecord = ({
     referenceTitle: selected.title,
     referenceUrl: selected.url,
     accuracy: selected.accuracy,
+    sourceAuthority: selected.sourceAuthority,
     validationRefContent: selected.validationRefContent,
     issueReason: selected.issueReason,
     correctFact: selected.correctFact,

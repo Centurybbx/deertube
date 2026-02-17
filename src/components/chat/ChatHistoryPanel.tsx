@@ -300,6 +300,13 @@ const indexToSearchPolicy = (index: number): DeepResearchStrictness =>
   SEARCH_POLICY_OPTIONS[Math.min(2, Math.max(0, index))]?.value ??
   "uncertain-claims";
 
+type ValidateStrictness = Exclude<DeepResearchStrictness, "no-search">;
+
+const normalizeValidateStrictness = (
+  strictness: DeepResearchStrictness,
+): ValidateStrictness =>
+  strictness === "all-claims" ? "all-claims" : "uncertain-claims";
+
 const MARKDOWN_DEERTUBE_REF_LINK_PATTERN = /\[[^\]]+\]\((deertube:\/\/[^)\s]+)\)/gi;
 const VALIDATE_REFERENCE_INLINE_LIMIT = 16;
 const VALIDATE_LINE_TOKEN_MIN_LENGTH = 3;
@@ -401,6 +408,18 @@ const formatAccuracyLabel = (
   return null;
 };
 
+const formatSourceAuthorityLabel = (
+  sourceAuthority: DeepSearchReferencePayload["sourceAuthority"],
+): string | null => {
+  if (!sourceAuthority) {
+    return null;
+  }
+  if (sourceAuthority === "high") return "High";
+  if (sourceAuthority === "medium") return "Medium";
+  if (sourceAuthority === "low") return "Low";
+  return "Unknown";
+};
+
 const mergeValidateReferencesInline = ({
   source,
   references,
@@ -410,23 +429,36 @@ const mergeValidateReferencesInline = ({
 }): {
   content: string;
   accuracyHints: Record<string, DeepSearchReferencePayload["accuracy"]>;
+  sourceAuthorityHints: Record<
+    string,
+    DeepSearchReferencePayload["sourceAuthority"]
+  >;
 } => {
   const accuracyHints: Record<
     string,
     DeepSearchReferencePayload["accuracy"]
+  > = {};
+  const sourceAuthorityHints: Record<
+    string,
+    DeepSearchReferencePayload["sourceAuthority"]
   > = {};
   references.forEach((reference) => {
     const uri =
       typeof reference.uri === "string" && reference.uri.trim().length > 0
         ? reference.uri.trim()
         : "";
-    if (!uri || !reference.accuracy) {
+    if (!uri) {
       return;
     }
-    accuracyHints[uri] = reference.accuracy;
+    if (reference.accuracy) {
+      accuracyHints[uri] = reference.accuracy;
+    }
+    if (reference.sourceAuthority) {
+      sourceAuthorityHints[uri] = reference.sourceAuthority;
+    }
   });
   if (references.length === 0) {
-    return { content: source, accuracyHints };
+    return { content: source, accuracyHints, sourceAuthorityHints };
   }
   const existingUris = extractReferencedUrisFromMarkdown(source);
   const dedupe = new Set<string>();
@@ -463,7 +495,7 @@ const mergeValidateReferencesInline = ({
     )
     .slice(0, VALIDATE_REFERENCE_INLINE_LIMIT);
   if (inlineReferences.length === 0) {
-    return { content: source, accuracyHints };
+    return { content: source, accuracyHints, sourceAuthorityHints };
   }
 
   const lines = source.split("\n");
@@ -487,7 +519,7 @@ const mergeValidateReferencesInline = ({
     .filter(({ line, index }) => line.trim().length > 0 && !isInCodeFence(index))
     .map(({ index }) => index);
   if (candidateLineIndexes.length === 0) {
-    return { content: source, accuracyHints };
+    return { content: source, accuracyHints, sourceAuthorityHints };
   }
 
   const lineTokenMap = new Map<number, Set<string>>();
@@ -535,7 +567,7 @@ const mergeValidateReferencesInline = ({
   });
 
   if (markersByLine.size === 0) {
-    return { content: source, accuracyHints };
+    return { content: source, accuracyHints, sourceAuthorityHints };
   }
   const nextLines = lines.map((line, index) => {
     const markers = markersByLine.get(index);
@@ -548,6 +580,7 @@ const mergeValidateReferencesInline = ({
   return {
     content: nextLines.join("\n"),
     accuracyHints,
+    sourceAuthorityHints,
   };
 };
 
@@ -1001,9 +1034,10 @@ export default function ChatHistoryPanel({
   const searchPolicyIndex = searchPolicyToIndex(searchPolicy);
   const searchEnabled = searchPolicy !== "no-search";
   const searchAllClaimsEnabled = searchPolicy === "all-claims";
-  const validatePolicy = resolvedDeepResearchConfig.validate.strictness;
-  const validatePolicyIndex = searchPolicyToIndex(validatePolicy);
-  const validateEnabled = validatePolicy !== "no-search";
+  const validatePolicy = normalizeValidateStrictness(
+    resolvedDeepResearchConfig.validate.strictness,
+  );
+  const validateEnabled = resolvedDeepResearchConfig.validate.enabled;
   const validateAllClaimsEnabled = validatePolicy === "all-claims";
   const deepResearchSwitchEnabled = resolvedDeepResearchConfig.enabled;
   const deepResearchActive =
@@ -2091,21 +2125,30 @@ export default function ChatHistoryPanel({
     },
     [patchDeepResearchConfig, resolvedDeepResearchConfig.enabled],
   );
-  const setValidatePolicy = useCallback(
-    (strictness: DeepResearchStrictness) => {
+  const setValidateStrictness = useCallback(
+    (strictness: ValidateStrictness) => {
       patchDeepResearchConfig({
-        enabled:
-          strictness === "no-search"
-            ? resolvedDeepResearchConfig.enabled
-            : true,
         validate: {
           ...resolvedDeepResearchConfig.validate,
           strictness,
-          enabled: strictness !== "no-search",
         },
       });
     },
-    [patchDeepResearchConfig, resolvedDeepResearchConfig],
+    [patchDeepResearchConfig, resolvedDeepResearchConfig.validate],
+  );
+  const setValidateAutoEnabled = useCallback(
+    (enabled: boolean) => {
+      patchDeepResearchConfig({
+        validate: {
+          ...resolvedDeepResearchConfig.validate,
+          enabled,
+          strictness: normalizeValidateStrictness(
+            resolvedDeepResearchConfig.validate.strictness,
+          ),
+        },
+      });
+    },
+    [patchDeepResearchConfig, resolvedDeepResearchConfig.validate],
   );
   const handleSearchEnabledSwitchChange = useCallback(
     (checked: boolean) => {
@@ -2127,21 +2170,15 @@ export default function ChatHistoryPanel({
   );
   const handleValidateEnabledSwitchChange = useCallback(
     (checked: boolean) => {
-      if (!checked) {
-        setValidatePolicy("no-search");
-        return;
-      }
-      setValidatePolicy(
-        validatePolicy === "all-claims" ? "all-claims" : "uncertain-claims",
-      );
+      setValidateAutoEnabled(checked);
     },
-    [setValidatePolicy, validatePolicy],
+    [setValidateAutoEnabled],
   );
   const handleValidateAllClaimsSwitchChange = useCallback(
     (checked: boolean) => {
-      setValidatePolicy(checked ? "all-claims" : "uncertain-claims");
+      setValidateStrictness(checked ? "all-claims" : "uncertain-claims");
     },
-    [setValidatePolicy],
+    [setValidateStrictness],
   );
   const handleToggleDeepResearchMaster = useCallback(() => {
     patchDeepResearchConfig({
@@ -3445,6 +3482,10 @@ export default function ChatHistoryPanel({
                                         typeof reference.accuracy === "string"
                                           ? reference.accuracy
                                           : undefined;
+                                      const sourceAuthorityLabel =
+                                        formatSourceAuthorityLabel(
+                                          reference.sourceAuthority,
+                                        );
                                       const issueReason =
                                         typeof reference.issueReason === "string" &&
                                         reference.issueReason.trim().length > 0
@@ -3497,6 +3538,11 @@ export default function ChatHistoryPanel({
                                               )}
                                             >
                                               Accuracy: {accuracyLabel}
+                                            </div>
+                                          ) : null}
+                                          {sourceAuthorityLabel ? (
+                                            <div className="mt-1 text-[11px] text-muted-foreground">
+                                              Source authority: {sourceAuthorityLabel}
                                             </div>
                                           ) : null}
                                           {startLine && endLine ? (
@@ -3670,10 +3716,13 @@ export default function ChatHistoryPanel({
                   : {
                       content: resolvedContent ?? "",
                       accuracyHints: {},
+                      sourceAuthorityHints: {},
                     };
               const assistantRenderedContent = validateInlineMerge.content;
               const assistantReferenceAccuracyHints =
                 validateInlineMerge.accuracyHints;
+              const assistantReferenceSourceAuthorityHints =
+                validateInlineMerge.sourceAuthorityHints;
               const validationRunning = validateStatus === "running";
               const validationPopoverVisible = Boolean(
                 latestValidateRun && validateStatus,
@@ -3972,6 +4021,9 @@ export default function ChatHistoryPanel({
                       <MarkdownRenderer
                         source={assistantRenderedContent}
                         referenceAccuracyHints={assistantReferenceAccuracyHints}
+                        referenceSourceAuthorityHints={
+                          assistantReferenceSourceAuthorityHints
+                        }
                         highlightExcerpt={
                           shouldHighlightExcerpt ? selectedExcerpt : undefined
                         }
@@ -4245,17 +4297,13 @@ export default function ChatHistoryPanel({
                       <TabsTrigger value="search" className="text-[11px]">
                         Search
                         <span className="ml-1 text-[10px] opacity-70">
-                          {deepResearchSwitchEnabled && searchEnabled
-                            ? "On"
-                            : "Off"}
+                          {searchEnabled ? "On" : "Off"}
                         </span>
                       </TabsTrigger>
                       <TabsTrigger value="validate" className="text-[11px]">
                         Validate
                         <span className="ml-1 text-[10px] opacity-70">
-                          {deepResearchSwitchEnabled && validateEnabled
-                            ? "On"
-                            : "Off"}
+                          {validateEnabled ? "On" : "Off"}
                         </span>
                       </TabsTrigger>
                     </TabsList>
@@ -4283,7 +4331,6 @@ export default function ChatHistoryPanel({
                         <div
                           className={cn(
                             "flex items-center justify-between gap-3",
-                            !searchEnabled && "opacity-45",
                           )}
                         >
                           <div className="text-xs text-foreground/90">
@@ -4293,8 +4340,7 @@ export default function ChatHistoryPanel({
                             checked={searchAllClaimsEnabled}
                             disabled={
                               fullPromptOverrideEnabled ||
-                              !deepResearchSwitchEnabled ||
-                              !searchEnabled
+                              !deepResearchSwitchEnabled
                             }
                             onCheckedChange={handleSearchAllClaimsSwitchChange}
                           />
@@ -4304,8 +4350,7 @@ export default function ChatHistoryPanel({
                         className={cn(
                           "flex items-center justify-between gap-3",
                           (fullPromptOverrideEnabled ||
-                            !deepResearchSwitchEnabled ||
-                            !searchEnabled) &&
+                            !deepResearchSwitchEnabled) &&
                             "opacity-45",
                         )}
                       >
@@ -4323,8 +4368,7 @@ export default function ChatHistoryPanel({
                           checked={highSearchComplexity}
                           disabled={
                             fullPromptOverrideEnabled ||
-                            !deepResearchSwitchEnabled ||
-                            !searchEnabled
+                            !deepResearchSwitchEnabled
                           }
                           onCheckedChange={(checked) =>
                             patchSubagentConfig({
@@ -4358,7 +4402,6 @@ export default function ChatHistoryPanel({
                         <div
                           className={cn(
                             "flex items-center justify-between gap-3",
-                            !validateEnabled && "opacity-45",
                           )}
                         >
                           <div className="text-xs text-foreground/90">
@@ -4368,8 +4411,7 @@ export default function ChatHistoryPanel({
                             checked={validateAllClaimsEnabled}
                             disabled={
                               fullPromptOverrideEnabled ||
-                              !deepResearchSwitchEnabled ||
-                              !validateEnabled
+                              !deepResearchSwitchEnabled
                             }
                             onCheckedChange={handleValidateAllClaimsSwitchChange}
                           />
@@ -4379,8 +4421,7 @@ export default function ChatHistoryPanel({
                         className={cn(
                           "flex items-center justify-between gap-3",
                           (fullPromptOverrideEnabled ||
-                            !deepResearchSwitchEnabled ||
-                            !validateEnabled) &&
+                            !deepResearchSwitchEnabled) &&
                             "opacity-45",
                         )}
                       >
@@ -4398,8 +4439,7 @@ export default function ChatHistoryPanel({
                           checked={highValidateSearchComplexity}
                           disabled={
                             fullPromptOverrideEnabled ||
-                            !deepResearchSwitchEnabled ||
-                            !validateEnabled
+                            !deepResearchSwitchEnabled
                           }
                           onCheckedChange={(checked) =>
                             patchValidateSubagentConfig({
@@ -4624,15 +4664,13 @@ export default function ChatHistoryPanel({
                   <TabsTrigger value="search">
                     Search
                     <span className="ml-1 text-[10px] opacity-70">
-                      {deepResearchSwitchEnabled && searchEnabled ? "On" : "Off"}
+                      {searchEnabled ? "On" : "Off"}
                     </span>
                   </TabsTrigger>
                   <TabsTrigger value="validate">
                     Validate
                     <span className="ml-1 text-[10px] opacity-70">
-                      {deepResearchSwitchEnabled && validateEnabled
-                        ? "On"
-                        : "Off"}
+                      {validateEnabled ? "On" : "Off"}
                     </span>
                   </TabsTrigger>
                 </TabsList>
@@ -4685,8 +4723,7 @@ export default function ChatHistoryPanel({
                   <div
                     className={cn(
                       "grid gap-3 sm:grid-cols-2",
-                      (!deepResearchSwitchEnabled || !searchEnabled) &&
-                        "opacity-45",
+                      !deepResearchSwitchEnabled && "opacity-45",
                     )}
                   >
                     <div className="space-y-1.5">
@@ -4695,8 +4732,7 @@ export default function ChatHistoryPanel({
                         value={resolvedDeepResearchConfig.subagent.searchComplexity}
                         disabled={
                           fullPromptOverrideEnabled ||
-                          !deepResearchSwitchEnabled ||
-                          !searchEnabled
+                          !deepResearchSwitchEnabled
                         }
                         onValueChange={(value) =>
                           patchSubagentConfig({
@@ -4720,7 +4756,7 @@ export default function ChatHistoryPanel({
                       <Label htmlFor="dr-search-depth">Tavily Search Depth</Label>
                       <Select
                         value={resolvedDeepResearchConfig.subagent.tavilySearchDepth}
-                        disabled={!deepResearchSwitchEnabled || !searchEnabled}
+                        disabled={!deepResearchSwitchEnabled}
                         onValueChange={(value) =>
                           patchSubagentConfig({
                             tavilySearchDepth: value as TavilySearchDepth,
@@ -4743,8 +4779,7 @@ export default function ChatHistoryPanel({
                   <div
                     className={cn(
                       "grid gap-3 sm:grid-cols-2",
-                      (!deepResearchSwitchEnabled || !searchEnabled) &&
-                        "opacity-45",
+                      !deepResearchSwitchEnabled && "opacity-45",
                     )}
                   >
                     <div className="space-y-1.5">
@@ -4785,8 +4820,7 @@ export default function ChatHistoryPanel({
                   <div
                     className={cn(
                       "grid gap-3 sm:grid-cols-2",
-                      (!deepResearchSwitchEnabled || !searchEnabled) &&
-                        "opacity-45",
+                      !deepResearchSwitchEnabled && "opacity-45",
                     )}
                   >
                     <div className="space-y-1.5">
@@ -4876,53 +4910,49 @@ export default function ChatHistoryPanel({
                 <TabsContent value="validate" className="space-y-3">
                   <div
                     className={cn(
-                      "space-y-1.5 rounded-md border border-border bg-muted/30 px-3 py-2",
+                      "space-y-2 rounded-md border border-border bg-muted/30 px-3 py-2",
                       (fullPromptOverrideEnabled || !deepResearchSwitchEnabled) &&
                         "opacity-45",
                     )}
                   >
-                    <Label>Search strategy</Label>
+                    <Label>Validate behavior</Label>
                     <div className="text-xs text-foreground/90">
-                      Choose when to validate claims after the answer.
+                      Auto-run and strictness are configured independently. These settings are also used by manual validate.
                     </div>
-                    <input
-                      type="range"
-                      min={0}
-                      max={2}
-                      step={1}
-                      value={validatePolicyIndex}
-                      disabled={
-                        fullPromptOverrideEnabled || !deepResearchSwitchEnabled
-                      }
-                      onChange={(event) =>
-                        setValidatePolicy(
-                          indexToSearchPolicy(
-                            Number.parseInt(event.target.value, 10),
-                          ),
-                        )
-                      }
-                      className="h-1.5 w-full cursor-pointer accent-primary"
-                    />
-                    <div className="grid grid-cols-3 gap-1 text-[11px] text-muted-foreground">
-                      {SEARCH_POLICY_OPTIONS.map((option) => (
-                        <div
-                          key={option.value}
-                          className={cn(
-                            "truncate text-center",
-                            option.value === validatePolicy && "text-foreground",
-                          )}
-                          title={option.description}
-                        >
-                          {option.label}
-                        </div>
-                      ))}
+                    <div className="flex items-center justify-between gap-3">
+                      <div className="text-xs text-foreground/90">
+                        Auto validate after answer
+                      </div>
+                      <Switch
+                        checked={validateEnabled}
+                        disabled={
+                          fullPromptOverrideEnabled || !deepResearchSwitchEnabled
+                        }
+                        onCheckedChange={handleValidateEnabledSwitchChange}
+                      />
+                    </div>
+                    <div className="flex items-center justify-between gap-3">
+                      <div className="text-xs text-foreground/90">
+                        Validate all claims
+                      </div>
+                      <Switch
+                        checked={validateAllClaimsEnabled}
+                        disabled={
+                          fullPromptOverrideEnabled || !deepResearchSwitchEnabled
+                        }
+                        onCheckedChange={handleValidateAllClaimsSwitchChange}
+                      />
+                    </div>
+                    <div className="text-[11px] text-muted-foreground">
+                      {validateAllClaimsEnabled
+                        ? "Strictness: Every claim"
+                        : "Strictness: Uncertain claims"}
                     </div>
                   </div>
                   <div
                     className={cn(
                       "grid gap-3 sm:grid-cols-2",
-                      (!deepResearchSwitchEnabled || !validateEnabled) &&
-                        "opacity-45",
+                      !deepResearchSwitchEnabled && "opacity-45",
                     )}
                   >
                     <div className="space-y-1.5">
@@ -4934,7 +4964,9 @@ export default function ChatHistoryPanel({
                           resolvedDeepResearchConfig.validate.subagent
                             .searchComplexity
                         }
-                        disabled={!deepResearchSwitchEnabled || !validateEnabled}
+                        disabled={
+                          !deepResearchSwitchEnabled
+                        }
                         onValueChange={(value) =>
                           patchValidateSubagentConfig({
                             searchComplexity: value as SubagentSearchComplexity,
@@ -4962,7 +4994,7 @@ export default function ChatHistoryPanel({
                           resolvedDeepResearchConfig.validate.subagent
                             .tavilySearchDepth
                         }
-                        disabled={!deepResearchSwitchEnabled || !validateEnabled}
+                        disabled={!deepResearchSwitchEnabled}
                         onValueChange={(value) =>
                           patchValidateSubagentConfig({
                             tavilySearchDepth: value as TavilySearchDepth,
@@ -4985,8 +5017,7 @@ export default function ChatHistoryPanel({
                   <div
                     className={cn(
                       "grid gap-3 sm:grid-cols-2",
-                      (!deepResearchSwitchEnabled || !validateEnabled) &&
-                        "opacity-45",
+                      !deepResearchSwitchEnabled && "opacity-45",
                     )}
                   >
                     <div className="space-y-1.5">
@@ -5035,8 +5066,7 @@ export default function ChatHistoryPanel({
                   <div
                     className={cn(
                       "grid gap-3 sm:grid-cols-2",
-                      (!deepResearchSwitchEnabled || !validateEnabled) &&
-                        "opacity-45",
+                      !deepResearchSwitchEnabled && "opacity-45",
                     )}
                   >
                     <div className="space-y-1.5">

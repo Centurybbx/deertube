@@ -98,6 +98,7 @@ interface ExtractedUrlMeta {
   viewpoint?: string;
   validationRefContent?: string;
   accuracy?: SearchResult["accuracy"];
+  sourceAuthority?: SearchResult["sourceAuthority"];
   broken?: boolean;
   inrelavate?: boolean;
   error?: string;
@@ -701,8 +702,8 @@ export async function runSearchSubagent({
         const key = `${url}|${item.viewpoint}|${item.content}|${item.selections
           .map((selection) => `${selection.start}:${selection.end}:${selection.text}`)
           .join(",")}|${item.validationRefContent ?? ""}|${item.accuracy ?? ""}|${
-          item.issueReason ?? ""
-        }|${item.correctFact ?? ""}|${String(item.broken)}|${String(
+          item.sourceAuthority ?? ""
+        }|${item.issueReason ?? ""}|${item.correctFact ?? ""}|${String(item.broken)}|${String(
           item.inrelavate,
         )}|${item.error ?? ""}`;
         dedupeByKey.set(key, item);

@@ -14,6 +14,7 @@ import type {
   BrowserValidationFailureReason,
   BrowserValidationStatus,
   ReferenceAccuracy,
+  ReferenceSourceAuthority,
 } from '../../../src/types/browserview'
 
 interface ChatSessionState {
@@ -297,6 +298,14 @@ const isReferenceAccuracy = (value: unknown): value is ReferenceAccuracy =>
   || value === 'conflicting'
   || value === 'insufficient'
 
+const isReferenceSourceAuthority = (
+  value: unknown,
+): value is ReferenceSourceAuthority =>
+  value === 'high'
+  || value === 'medium'
+  || value === 'low'
+  || value === 'unknown'
+
 const isBrowserValidationStatus = (
   value: unknown,
 ): value is BrowserValidationStatus =>
@@ -356,6 +365,9 @@ const normalizeBrowserValidationRecord = (
   const accuracy = isReferenceAccuracy(value.accuracy)
     ? value.accuracy
     : undefined
+  const sourceAuthority = isReferenceSourceAuthority(value.sourceAuthority)
+    ? value.sourceAuthority
+    : undefined
   return {
     url,
     title: normalizeOptionalText(value.title),
@@ -367,6 +379,7 @@ const normalizeBrowserValidationRecord = (
     referenceTitle: normalizeOptionalText(value.referenceTitle),
     referenceUrl: normalizeOptionalText(value.referenceUrl),
     accuracy,
+    sourceAuthority,
     validationRefContent: normalizeOptionalText(value.validationRefContent),
     issueReason: normalizeOptionalText(value.issueReason),
     correctFact: normalizeOptionalText(value.correctFact),

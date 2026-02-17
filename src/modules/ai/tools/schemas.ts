@@ -138,6 +138,12 @@ export const SearchSubagentFinalItemSchema = z
       .describe(
         "Validate-mode only: evidence accuracy grade for this reference item.",
       ),
+    sourceAuthority: z
+      .enum(["high", "medium", "low", "unknown"])
+      .optional()
+      .describe(
+        "Validate-mode only: source-authority grade for this reference item.",
+      ),
     issueReason: z
       .string()
       .optional()

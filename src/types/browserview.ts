@@ -11,6 +11,7 @@ export type ReferenceAccuracy =
   | "low"
   | "conflicting"
   | "insufficient";
+export type ReferenceSourceAuthority = "high" | "medium" | "low" | "unknown";
 
 export type BrowserValidationStatus = "running" | "complete" | "failed";
 export type BrowserValidationFailureReason = "failed" | "stopped";
@@ -44,6 +45,7 @@ export interface BrowserPageValidationRecord {
   referenceTitle?: string;
   referenceUrl?: string;
   accuracy?: ReferenceAccuracy;
+  sourceAuthority?: ReferenceSourceAuthority;
   validationRefContent?: string;
   issueReason?: string;
   correctFact?: string;

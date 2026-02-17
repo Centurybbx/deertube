@@ -25,6 +25,13 @@ export const DeepResearchReferenceAccuracySchema = z.enum([
   "insufficient",
 ]);
 
+export const DeepResearchSourceAuthoritySchema = z.enum([
+  "high",
+  "medium",
+  "low",
+  "unknown",
+]);
+
 export const SubagentSearchComplexitySchema = z.enum([
   "standard",
   "balanced",
@@ -36,6 +43,9 @@ export const TavilySearchDepthSchema = z.enum(["basic", "advanced"]);
 export type DeepResearchStrictness = z.infer<typeof DeepResearchStrictnessSchema>;
 export type DeepResearchReferenceAccuracy = z.infer<
   typeof DeepResearchReferenceAccuracySchema
+>;
+export type DeepResearchSourceAuthority = z.infer<
+  typeof DeepResearchSourceAuthoritySchema
 >;
 export type SubagentSearchComplexity = z.infer<
   typeof SubagentSearchComplexitySchema
@@ -198,7 +208,7 @@ export const DEFAULT_DEEP_RESEARCH_SUBAGENT_CONFIG: DeepResearchSubagentConfig =
 
 export const DEFAULT_DEEP_RESEARCH_VALIDATE_CONFIG: DeepResearchValidateConfig =
   {
-    strictness: "no-search",
+    strictness: "uncertain-claims",
     enabled: false,
     subagent: DEFAULT_DEEP_RESEARCH_SUBAGENT_CONFIG,
   };
@@ -272,15 +282,19 @@ export const resolveDeepResearchValidateConfig = (
   const parsed = DeepResearchValidateConfigSchema.safeParse(input ?? {});
   const normalized = parsed.success ? parsed.data : undefined;
   const strictness =
-    normalized?.strictness ??
-    (typeof normalized?.enabled === "boolean"
+    normalized?.strictness === "all-claims" ||
+    normalized?.strictness === "uncertain-claims"
+      ? normalized.strictness
+      : DEFAULT_DEEP_RESEARCH_VALIDATE_CONFIG.strictness;
+  const enabled =
+    typeof normalized?.enabled === "boolean"
       ? normalized.enabled
-        ? "all-claims"
-        : "no-search"
-      : DEFAULT_DEEP_RESEARCH_VALIDATE_CONFIG.strictness);
+      : typeof normalized?.strictness === "string"
+        ? normalized.strictness !== "no-search"
+      : DEFAULT_DEEP_RESEARCH_VALIDATE_CONFIG.enabled;
   return {
     strictness,
-    enabled: strictness !== "no-search",
+    enabled,
     subagent: resolveDeepResearchSubagentConfig(normalized?.subagent),
   };
 };
@@ -288,21 +302,16 @@ export const resolveDeepResearchValidateConfig = (
 const buildValidateStrictnessLines = (
   strictness: DeepResearchStrictness,
 ): string[] => {
-  if (strictness === "uncertain-claims") {
+  if (strictness !== "all-claims") {
     return [
       "Validate uncertain, contested, time-sensitive, and high-impact factual claims first.",
       "Skip purely subjective/preference claims unless the answer presents them as objective facts.",
       "For clearly deterministic claims, validate only when uncertainty remains.",
     ];
   }
-  if (strictness === "all-claims") {
-    return [
-      "Validate every material factual claim in the assistant answer.",
-      "When one sentence has multiple factual sub-claims, check each sub-claim.",
-    ];
-  }
   return [
-    "Validation search is disabled. Do not continue search/extract and finalize with empty evidence.",
+    "Validate every material factual claim in the assistant answer.",
+    "When one sentence has multiple factual sub-claims, check each sub-claim.",
   ];
 };
 
@@ -360,17 +369,6 @@ export const buildMainAgentSystemPrompt = (
   options?: { query?: string; availableSkills?: RuntimeAgentSkill[] },
 ): string => {
   const config = resolveDeepResearchConfig(input);
-  const promptOverride =
-    config.fullPromptOverrideEnabled
-      ? normalizeOptionalPrompt(config.mainPromptOverride)
-      : undefined;
-  if (config.fullPromptOverrideEnabled && promptOverride) {
-    const renderedOverride = applyPromptTemplate(
-      promptOverride,
-      buildMainPromptTemplateVariables(config, options?.query),
-    );
-    return [renderedOverride, ...contextLines].filter(Boolean).join("\n\n");
-  }
   const skillRegistryPrompt = buildSkillRegistryPromptBlock({
     query: options?.query ?? "",
     profile: config.skillProfile,
@@ -380,6 +378,19 @@ export const buildMainAgentSystemPrompt = (
     loadToolName: "loadSkill",
     executeToolName: "executeSkill",
   });
+  const promptOverride =
+    config.fullPromptOverrideEnabled
+      ? normalizeOptionalPrompt(config.mainPromptOverride)
+      : undefined;
+  if (config.fullPromptOverrideEnabled && promptOverride) {
+    const renderedOverride = applyPromptTemplate(
+      promptOverride,
+      buildMainPromptTemplateVariables(config, options?.query),
+    );
+    return [renderedOverride, skillRegistryPrompt, ...contextLines]
+      .filter(Boolean)
+      .join("\n\n");
+  }
 
   const baseLines = [
     "You are a concise assistant. Answer clearly and directly. Use short paragraphs when helpful.",
@@ -388,13 +399,16 @@ export const buildMainAgentSystemPrompt = (
   ];
 
   if (!config.enabled) {
-    return [...baseLines, ...contextLines].filter(Boolean).join("\n\n");
+    return [...baseLines, skillRegistryPrompt, ...contextLines]
+      .filter(Boolean)
+      .join("\n\n");
   }
 
   if (config.strictness === "no-search") {
     return [
       ...baseLines,
       ...buildStrictnessLines(config.strictness),
+      skillRegistryPrompt,
       ...contextLines,
     ]
       .filter(Boolean)
@@ -479,7 +493,7 @@ const buildMainPromptTemplateVariables = (
     selectedSkillNames: config.selectedSkillNames,
   }),
   searchEnabled: String(config.strictness !== "no-search"),
-  validateEnabled: String(config.validate.strictness !== "no-search"),
+  validateEnabled: String(config.validate.enabled),
 });
 
 const applyPromptTemplate = (
@@ -543,7 +557,7 @@ export const buildSearchSubagentSystemPrompt = (
     options?.fullPromptOverrideEnabled &&
     config.systemPromptOverride
   ) {
-    return applyPromptTemplate(
+    const renderedOverride = applyPromptTemplate(
       config.systemPromptOverride,
       buildSubagentPromptTemplateVariables(config, {
         query: options?.query,
@@ -555,6 +569,9 @@ export const buildSearchSubagentSystemPrompt = (
         answerToValidate,
       }),
     );
+    return [renderedOverride, skillRegistryPrompt]
+      .filter(Boolean)
+      .join("\n\n");
   }
   const modeSpecificLines = isValidateMode
     ? [
@@ -603,7 +620,7 @@ export const buildSearchSubagentSystemPrompt = (
       : "4) First decide your answer claims; then choose only the smallest sufficient evidence for each claim.",
     "5) Finalization is mandatory: call writeResults exactly once with { results, errors }.",
     isValidateMode
-      ? "6) In writeResults input, each result item should include: url, viewpoint, content, selections, validationRefContent, accuracy, issueReason, correctFact."
+      ? "6) In writeResults input, each result item should include: url, viewpoint, content, selections, validationRefContent, accuracy, sourceAuthority, issueReason, correctFact."
       : "6) In writeResults input, each result item should include: url, viewpoint, content, selections.",
     "7) `extract` returns line-numbered selections. All chosen selections must map to those numbered lines.",
     "8) Prefer small precise spans (typically 2-12 lines). Avoid broad/full-page spans unless strictly necessary.",
@@ -616,7 +633,7 @@ export const buildSearchSubagentSystemPrompt = (
     "15) Strict final-step rule: your very last action must be exactly one writeResults call.",
     "16) If writeResults is omitted at the end, the run is treated as failed.",
     isValidateMode
-      ? "17) In validate mode, set `accuracy` per item to one of: high, medium, low, conflicting, insufficient. For low/conflicting/insufficient items, include `issueReason` and `correctFact` when the evidence allows."
+      ? "17) In validate mode, score each item on two axes: `accuracy` (high|medium|low|conflicting|insufficient) and `sourceAuthority` (high|medium|low|unknown). For low/conflicting/insufficient accuracy, include `issueReason` and `correctFact` when evidence allows."
       : "",
     "Output rule: finalize via writeResults only. Do not output final JSON in plain text.",
     skillRegistryPrompt,
@@ -669,7 +686,7 @@ export const buildSearchSubagentRuntimePrompt = ({
     "Prefer serial search: run one search call, inspect its results, then decide the next query.",
     "Language fallback strategy: start in the user-question language; only try English/other languages when results are empty, weak, or off-topic.",
     isValidateMode
-      ? "Each result item must include: url, viewpoint, content, selections, validationRefContent, accuracy, issueReason, correctFact."
+      ? "Each result item must include: url, viewpoint, content, selections, validationRefContent, accuracy, sourceAuthority, issueReason, correctFact."
       : "Each result item must include: url, viewpoint, content, selections.",
     "Selections must be precise and minimal. Avoid broad/full-page spans unless strictly necessary.",
     "When one source supports multiple points, keep multiple small selections under the same URL.",
@@ -686,7 +703,7 @@ export const buildSearchSubagentRuntimePrompt = ({
     "Finalization rule (strict): your very last step must be exactly one `writeResults` call.",
     "If `writeResults` is not called at the end, the run is treated as failed.",
     isValidateMode
-      ? "Validation accuracy rubric: high (directly and strongly supported), medium (mostly supported with minor gaps), low (weakly supported), conflicting (evidence conflicts), insufficient (not enough evidence). For low/conflicting/insufficient outcomes, provide `issueReason` and `correctFact` whenever the evidence is sufficient to state them."
+      ? "Validation accuracy rubric: high (directly and strongly supported), medium (mostly supported with minor gaps), low (weakly supported), conflicting (evidence conflicts), insufficient (not enough evidence). Source authority rubric: high (primary official/peer-reviewed/high editorial accountability), medium (credible but secondary or partially indirect), low (weak provenance, rumor-prone, unverified), unknown (authority cannot be confidently determined). For low/conflicting/insufficient outcomes, provide `issueReason` and `correctFact` whenever the evidence is sufficient to state them."
       : "",
     "When evidence is sufficient, call `writeResults` exactly once with { results, errors }.",
   ].join("\n");

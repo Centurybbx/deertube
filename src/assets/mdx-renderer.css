@@ -150,6 +150,52 @@
   color: rgb(148 163 184);
 }
 
+.markdown-body a.markdown-link[data-reference-uri][data-ref-source-authority] {
+  border-radius: 9999px;
+  margin: 0 0.04em;
+  padding: 0 0.22em;
+}
+
+.markdown-body
+  a.markdown-link[data-reference-uri][data-ref-source-authority="high"] {
+  background-color: rgb(16 185 129 / 0.18);
+}
+
+.markdown-body
+  a.markdown-link[data-reference-uri][data-ref-source-authority="medium"] {
+  background-color: rgb(245 158 11 / 0.2);
+}
+
+.markdown-body
+  a.markdown-link[data-reference-uri][data-ref-source-authority="low"] {
+  background-color: rgb(239 68 68 / 0.2);
+}
+
+.markdown-body
+  a.markdown-link[data-reference-uri][data-ref-source-authority="unknown"] {
+  background-color: rgb(100 116 139 / 0.2);
+}
+
+.dark .markdown-body
+  a.markdown-link[data-reference-uri][data-ref-source-authority="high"] {
+  background-color: rgb(16 185 129 / 0.3);
+}
+
+.dark .markdown-body
+  a.markdown-link[data-reference-uri][data-ref-source-authority="medium"] {
+  background-color: rgb(245 158 11 / 0.3);
+}
+
+.dark .markdown-body
+  a.markdown-link[data-reference-uri][data-ref-source-authority="low"] {
+  background-color: rgb(239 68 68 / 0.3);
+}
+
+.dark .markdown-body
+  a.markdown-link[data-reference-uri][data-ref-source-authority="unknown"] {
+  background-color: rgb(148 163 184 / 0.28);
+}
+
 .markdown-body a.markdown-link[data-footnote-backref] {
   font-weight: 700;
 }

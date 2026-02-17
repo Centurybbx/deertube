@@ -186,6 +186,12 @@ export function createTools(
               .enum(["high", "medium", "low", "conflicting", "insufficient"])
               .optional()
               .describe("Validate-mode only: evidence accuracy grade."),
+            sourceAuthority: z
+              .enum(["high", "medium", "low", "unknown"])
+              .optional()
+              .describe(
+                "Validate-mode only: source-authority grade for this reference.",
+              ),
             issueReason: z
               .string()
               .optional()

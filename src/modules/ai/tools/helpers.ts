@@ -430,6 +430,13 @@ export const normalizeSearchResults = (raw: JsonValue): SearchResult[] => {
       item.accuracy === "insufficient"
         ? item.accuracy
         : undefined;
+    const sourceAuthority =
+      item.sourceAuthority === "high" ||
+      item.sourceAuthority === "medium" ||
+      item.sourceAuthority === "low" ||
+      item.sourceAuthority === "unknown"
+        ? item.sourceAuthority
+        : undefined;
     const selections = parseLineSelections(item.selections);
     const broken = typeof item.broken === "boolean" ? item.broken : undefined;
     const inrelavate =
@@ -457,6 +464,7 @@ export const normalizeSearchResults = (raw: JsonValue): SearchResult[] => {
       content,
       validationRefContent,
       accuracy,
+      sourceAuthority,
       issueReason,
       correctFact,
       selections,
@@ -530,6 +538,7 @@ export const dedupeSearchResults = (
             ? preferred.validationRefContent
             : secondary.validationRefContent,
         accuracy: preferred.accuracy ?? secondary.accuracy,
+        sourceAuthority: preferred.sourceAuthority ?? secondary.sourceAuthority,
         issueReason:
           preferred.issueReason && preferred.issueReason.length > 0
             ? preferred.issueReason
@@ -822,6 +831,9 @@ export const buildDeepSearchReferences = (
           ? result.validationRefContent
           : undefined,
         accuracy: includeValidationFields ? result.accuracy : undefined,
+        sourceAuthority: includeValidationFields
+          ? result.sourceAuthority
+          : undefined,
         issueReason: includeValidationFields ? result.issueReason : undefined,
         correctFact: includeValidationFields ? result.correctFact : undefined,
       });
