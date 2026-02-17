@@ -1,5 +1,5 @@
 import { useMemo, useState, type KeyboardEvent, type SyntheticEvent } from "react";
-import { ArrowLeftRight, Loader2, PencilLine, Plus, Trash2 } from "lucide-react";
+import { ArrowLeftRight, Check, Loader2, PencilLine, Plus, Trash2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import {
   AlertDialog,
@@ -26,6 +26,7 @@ import {
   SelectItem,
   SelectTrigger,
 } from "@/components/ui/select";
+import { cn } from "@/lib/utils";
 import type { ProjectChatSummary } from "./types";
 
 interface ChatTabActionsProps {
@@ -85,11 +86,18 @@ export function ChatTabActions({
   const [deleteCandidate, setDeleteCandidate] = useState<ProjectChatSummary | null>(
     null,
   );
+  const hasItemActions = (onRenameChat ?? onDeleteChat) !== undefined;
   const sortedChats = useMemo(
     () =>
       [...chats].sort(
-        (left, right) =>
-          toTimestamp(right.updatedAt) - toTimestamp(left.updatedAt),
+        (left, right) => {
+          const leftValidation = left.isValidation === true ? 1 : 0;
+          const rightValidation = right.isValidation === true ? 1 : 0;
+          if (leftValidation !== rightValidation) {
+            return rightValidation - leftValidation;
+          }
+          return toTimestamp(right.updatedAt) - toTimestamp(left.updatedAt);
+        },
       ),
     [chats],
   );
@@ -127,7 +135,7 @@ export function ChatTabActions({
       return;
     }
     setDeleteCandidate(null);
-    void Promise.resolve(onDeleteChat(target.id)).catch(() => undefined);
+    void Promise.resolve(onDeleteChat(target.id));
   };
   const canSubmitRename =
     renameCandidate !== null &&
@@ -149,7 +157,7 @@ export function ChatTabActions({
     }
     const chatId = renameCandidate.id;
     closeRenameDialog();
-    void Promise.resolve(onRenameChat(chatId, nextTitle)).catch(() => undefined);
+    void Promise.resolve(onRenameChat(chatId, nextTitle));
   };
   const handleRenameInputKeyDown = (event: KeyboardEvent<HTMLInputElement>) => {
     if (event.key !== "Enter") {
@@ -196,57 +204,78 @@ export function ChatTabActions({
                 <div key={chat.id} className="group/chat-row relative">
                   <SelectItem
                     value={chat.id}
-                    className="pr-[3.5rem] group-hover/chat-row:[&_.select-item-indicator]:opacity-0 group-focus-within/chat-row:[&_.select-item-indicator]:opacity-0"
+                    className={cn(
+                      "pr-2 [&_.select-item-indicator]:hidden [&[data-state=checked]_.chat-updated-time]:hidden [&[data-state=checked]_.chat-current-indicator]:inline-flex",
+                    )}
                     title={chat.title}
                   >
                     <div className="flex w-full min-w-0 items-center gap-2">
                       <span className="min-w-0 flex-1 truncate text-sm text-foreground">
                         {chat.title}
                       </span>
-                      {chat.isRunning ? (
-                        <Loader2
-                          className="h-3.5 w-3.5 shrink-0 animate-spin text-primary"
-                          aria-label="Running"
-                        />
-                      ) : (
-                        <span className="shrink-0 text-[11px] font-medium uppercase tracking-[0.1em] text-muted-foreground">
-                          {formatUpdatedLabel(chat.updatedAt)}
-                        </span>
-                      )}
+                      <div className="ml-auto flex h-5 shrink-0 items-center gap-1">
+                        {hasItemActions ? (
+                          <div className="chat-actions flex items-center gap-0.5 opacity-0 transition-opacity pointer-events-none group-hover/chat-row:opacity-100 group-hover/chat-row:pointer-events-auto group-focus-within/chat-row:opacity-100 group-focus-within/chat-row:pointer-events-auto">
+                            {onRenameChat ? (
+                              <button
+                                type="button"
+                                className="inline-flex h-4 w-4 items-center justify-center rounded bg-transparent text-muted-foreground transition hover:text-foreground"
+                                aria-label={`Rename ${chat.title}`}
+                                title={`Rename ${chat.title}`}
+                                onPointerDown={(event) => {
+                                  runItemAction(event, () => handleRenameClick(chat));
+                                }}
+                                onClick={stopItemActionEvent}
+                              >
+                                <PencilLine className="h-3 w-3" />
+                              </button>
+                            ) : null}
+                            {onDeleteChat ? (
+                              <button
+                                type="button"
+                                className="inline-flex h-4 w-4 items-center justify-center rounded bg-transparent text-muted-foreground transition hover:text-destructive"
+                                aria-label={`Delete ${chat.title}`}
+                                title={`Delete ${chat.title}`}
+                                onPointerDown={(event) => {
+                                  runItemAction(event, () => handleDeleteClick(chat));
+                                }}
+                                onClick={stopItemActionEvent}
+                              >
+                                <Trash2 className="h-3 w-3" />
+                              </button>
+                            ) : null}
+                          </div>
+                        ) : null}
+                        <div className="chat-meta flex items-center justify-end gap-1">
+                          {chat.isValidation ? (
+                            <span
+                              className="shrink-0 rounded-sm border border-slate-400/40 bg-slate-500/10 px-1 py-0 text-[9px] font-semibold uppercase leading-4 tracking-[0.04em] text-slate-600 dark:text-slate-300"
+                              title="Validate"
+                              aria-label="Validate"
+                            >
+                              Val
+                            </span>
+                          ) : null}
+                          {chat.isRunning ? (
+                            <Loader2
+                              className="h-3.5 w-3.5 shrink-0 animate-spin text-primary"
+                              aria-label="Running"
+                            />
+                          ) : (
+                            <>
+                              <Check
+                                className="chat-current-indicator hidden h-3.5 w-3.5 shrink-0 text-muted-foreground"
+                                aria-label="Current chat"
+                              />
+                              <span className="chat-updated-time shrink-0 text-[11px] font-medium uppercase tracking-[0.1em] text-muted-foreground">
+                                {formatUpdatedLabel(chat.updatedAt)}
+                              </span>
+                            </>
+                          )}
+                        </div>
+                      </div>
                     </div>
                   </SelectItem>
-                  {(onRenameChat ?? onDeleteChat) && (
-                    <div className="pointer-events-none absolute inset-y-0 right-2 z-10 flex items-center justify-end gap-0.5 opacity-0 transition-opacity group-hover/chat-row:pointer-events-auto group-hover/chat-row:opacity-100 group-focus-within/chat-row:pointer-events-auto group-focus-within/chat-row:opacity-100">
-                      {onRenameChat ? (
-                        <button
-                          type="button"
-                          className="inline-flex h-5 w-5 items-center justify-center rounded bg-transparent text-muted-foreground transition hover:text-foreground"
-                          aria-label={`Rename ${chat.title}`}
-                          title={`Rename ${chat.title}`}
-                          onPointerDown={(event) => {
-                            runItemAction(event, () => handleRenameClick(chat));
-                          }}
-                          onClick={stopItemActionEvent}
-                        >
-                          <PencilLine className="h-3.5 w-3.5" />
-                        </button>
-                      ) : null}
-                      {onDeleteChat ? (
-                        <button
-                          type="button"
-                          className="inline-flex h-5 w-5 items-center justify-center rounded bg-transparent text-muted-foreground transition hover:text-destructive"
-                          aria-label={`Delete ${chat.title}`}
-                          title={`Delete ${chat.title}`}
-                          onPointerDown={(event) => {
-                            runItemAction(event, () => handleDeleteClick(chat));
-                          }}
-                          onClick={stopItemActionEvent}
-                        >
-                          <Trash2 className="h-3.5 w-3.5" />
-                        </button>
-                      ) : null}
-                    </div>
-                  )}
                 </div>
               ))
             )}
