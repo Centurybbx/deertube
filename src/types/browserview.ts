@@ -13,6 +13,25 @@ export type ReferenceAccuracy =
   | "insufficient";
 
 export type BrowserValidationStatus = "running" | "complete" | "failed";
+export type BrowserValidationFailureReason = "failed" | "stopped";
+export type CdpValidationStatus = "idle" | "running" | "complete" | "failed";
+
+export interface BrowserPageValidationStatusRecord {
+  status: BrowserValidationStatus;
+  error?: string;
+  failureReason?: BrowserValidationFailureReason;
+  updatedAt: string;
+}
+
+export interface CdpBrowserValidateRequestPayload {
+  sessionId: string;
+  url: string;
+  title?: string;
+}
+
+export interface CdpBrowserValidateStopRequestPayload {
+  sessionId: string;
+}
 
 export interface BrowserPageValidationRecord {
   url: string;
@@ -42,6 +61,7 @@ export interface BrowserViewTabState {
   referenceHighlight?: BrowserViewReferenceHighlight;
   validationStatus?: BrowserValidationStatus;
   validationError?: string;
+  validationFailureReason?: BrowserValidationFailureReason;
 }
 
 export interface BrowserViewSelection {

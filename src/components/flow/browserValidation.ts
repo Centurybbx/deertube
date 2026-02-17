@@ -1,6 +1,10 @@
 import type { RuntimeSettingsPayload } from "@/lib/settings";
-import type { DeepSearchReferencePayload } from "@/types/chat";
 import type {
+  DeepSearchReferencePayload,
+  DeepSearchSourcePayload,
+} from "@/types/chat";
+import type {
+  BrowserValidationFailureReason,
   BrowserPageValidationRecord,
   BrowserValidationStatus,
   BrowserViewTabState,
@@ -22,10 +26,12 @@ interface CaptureValidationSnapshotResult {
 }
 
 interface ChatValidateResult {
-  status: string;
+  status: "complete" | "failed" | "skipped";
   query?: string;
+  searchId?: string;
+  projectId?: string;
   references?: DeepSearchReferencePayload[];
-  sources?: unknown[];
+  sources?: DeepSearchSourcePayload[];
 }
 
 interface ExecuteBrowserValidationOptions {
@@ -39,14 +45,21 @@ interface ExecuteBrowserValidationOptions {
     projectPath: string;
     query: string;
     answer: string;
+    force?: boolean;
     settings: RuntimeSettingsPayload | undefined;
     deepResearch: DeepResearchConfig;
-  }) => Promise<ChatValidateResult>;
+  }, signal?: AbortSignal) => Promise<ChatValidateResult>;
+  signal?: AbortSignal;
 }
 
 interface BrowserValidationResult {
   resolvedPageUrl: string;
   record: BrowserPageValidationRecord;
+  query: string;
+  searchId?: string;
+  projectId?: string;
+  references: DeepSearchReferencePayload[];
+  sources: DeepSearchSourcePayload[];
 }
 
 const trimOrUndefined = (value: string | undefined): string | undefined => {
@@ -72,11 +85,13 @@ export const updateBrowserTabValidationState = ({
   tabId,
   status,
   error,
+  failureReason,
 }: {
   tabs: BrowserViewTabState[];
   tabId: string;
   status: BrowserValidationStatus;
   error?: string;
+  failureReason?: BrowserValidationFailureReason;
 }): BrowserViewTabState[] =>
   tabs.map((item) =>
     item.id === tabId
@@ -84,6 +99,8 @@ export const updateBrowserTabValidationState = ({
           ...item,
           validationStatus: status,
           validationError: error,
+          validationFailureReason:
+            status === "failed" ? failureReason ?? "failed" : undefined,
         }
       : item,
   );
@@ -96,6 +113,7 @@ export const executeBrowserValidation = async ({
   deepResearchConfig,
   captureValidationSnapshot,
   validateAnswer,
+  signal,
 }: ExecuteBrowserValidationOptions): Promise<BrowserValidationResult> => {
   const snapshotResult = await captureValidationSnapshot();
   const snapshot = snapshotResult.snapshot;
@@ -121,9 +139,10 @@ export const executeBrowserValidation = async ({
     projectPath,
     query,
     answer: pageText,
+    force: true,
     settings: runtimeSettings,
     deepResearch: deepResearchConfig,
-  });
+  }, signal);
   if (validateResult.status !== "complete") {
     throw new Error("Validation skipped. Enable validate in deep research settings.");
   }
@@ -144,5 +163,10 @@ export const executeBrowserValidation = async ({
       references,
       sourceCount: sources.length,
     }),
+    query: validateResult.query ?? query,
+    searchId: validateResult.searchId,
+    projectId: validateResult.projectId,
+    references,
+    sources,
   };
 };

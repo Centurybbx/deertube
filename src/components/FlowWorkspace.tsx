@@ -23,7 +23,7 @@ import type {
   IJsonTabNode,
 } from "@massbug/flexlayout-react";
 import { Actions, DockLocation, Model } from "@massbug/flexlayout-react";
-import { trpc } from "../lib/trpc";
+import { trpc, trpcClient } from "../lib/trpc";
 import type { IpcRendererEvent } from "electron";
 import QuestionNode from "./nodes/QuestionNode";
 import SourceNode from "./nodes/SourceNode";
@@ -31,6 +31,7 @@ import InsightNode from "./nodes/InsightNode";
 import SettingsPanel from "./SettingsPanel";
 import { Button } from "@/components/ui/button";
 import {
+  GitBranch,
   Globe,
   LayoutGrid,
   LoaderCircle,
@@ -66,6 +67,13 @@ import {
   executeBrowserValidation,
   updateBrowserTabValidationState,
 } from "./flow/browserValidation";
+import { buildValidationGraphInsertion } from "./flow/validate-graph";
+import {
+  buildCompletedValidationEvent,
+  buildFailedValidationEvent,
+  createPageValidationChatSeed,
+  upsertChatMessage,
+} from "./flow/page-validation-chat";
 import {
   isHttpUrl,
   normalizeBrowserLabel,
@@ -75,13 +83,23 @@ import {
   truncateLabel,
 } from "./flow/browser-utils";
 import ChatHistoryPanel from "./chat/ChatHistoryPanel";
-import type { InsightNodeData } from "../types/flow";
-import type { ChatMessage } from "../types/chat";
+import type { FlowEdge, FlowNode, InsightNodeData } from "../types/flow";
+import type {
+  ChatMessage,
+  DeepSearchStreamPayload,
+  DeepSearchReferencePayload,
+  DeepSearchSourcePayload,
+  SubagentStreamPayload,
+} from "../types/chat";
 import { FlowFlexLayout } from "./flow/FlowFlexLayout";
 import { BrowserTab } from "./browser/BrowserTab";
 import { ChatTabActions } from "./flow/ChatTabActions";
 import type {
+  BrowserValidationFailureReason,
+  BrowserPageValidationStatusRecord,
   BrowserPageValidationRecord,
+  CdpBrowserValidateRequestPayload,
+  CdpBrowserValidateStopRequestPayload,
   BrowserViewBounds,
   BrowserViewReferenceHighlight,
   BrowserViewSelection,
@@ -93,7 +111,9 @@ import {
   type DeepResearchResolvedReference,
 } from "@/shared/deepresearch";
 import {
+  finishRunningChatJob,
   listRunningChatIds,
+  startRunningChatJob,
   subscribeRunningChatJobs,
 } from "@/lib/running-chat-jobs";
 import {
@@ -125,6 +145,221 @@ const DEFAULT_EDGE_OPTIONS = {
 
 type ProjectStateInput = Omit<ProjectState, "chat"> & { chat?: ChatMessage[] };
 
+interface ValidateExecutionResult {
+  status: "complete" | "failed" | "skipped";
+  query?: string;
+  projectId?: string;
+  searchId?: string;
+  sources?: DeepSearchSourcePayload[];
+  references?: DeepSearchReferencePayload[];
+}
+
+type ValidateStreamProgressEvent =
+  | {
+      type: "subagent-stream";
+      payload: SubagentStreamPayload;
+    }
+  | {
+      type: "deepsearch-stream";
+      payload: DeepSearchStreamPayload;
+    }
+  | {
+      type: "deepsearch-done";
+      payload: DeepSearchStreamPayload;
+    };
+
+type ValidateStreamEvent =
+  | ValidateStreamProgressEvent
+  | {
+      type: "result";
+      payload: ValidateExecutionResult;
+    };
+
+interface BrowserValidationRunSession {
+  runId: string;
+  tabRuntimeId: string;
+  chatId: string;
+  pageUrl: string;
+  querySeed: string;
+  eventId: string;
+  toolCallId: string;
+  abortController: AbortController;
+}
+
+const createAbortError = (): Error => {
+  const error = new Error("Validation stopped by user.");
+  error.name = "AbortError";
+  return error;
+};
+
+const isAbortError = (error: unknown): boolean => {
+  if (!error) {
+    return false;
+  }
+  if (error instanceof DOMException) {
+    return error.name === "AbortError";
+  }
+  if (!(error instanceof Error)) {
+    return false;
+  }
+  return error.name === "AbortError" || /abort/i.test(error.message);
+};
+
+const VALIDATE_LOG_ROOT_PREFIX = "[validate]";
+const BROWSER_VALIDATE_LOG_PREFIX = `${VALIDATE_LOG_ROOT_PREFIX}[browser]`;
+const CDP_OPEN_LOG_PREFIX = `${VALIDATE_LOG_ROOT_PREFIX}[cdp.open]`;
+
+const logBrowserValidate = (
+  event: string,
+  payload?: Record<string, unknown>,
+) => {
+  if (payload) {
+    console.log(BROWSER_VALIDATE_LOG_PREFIX, event, payload);
+    return;
+  }
+  console.log(BROWSER_VALIDATE_LOG_PREFIX, event);
+};
+
+const resolveBrowserValidationFailureReason = (
+  errorMessage: string,
+): BrowserValidationFailureReason =>
+  /stopped by user|abort/i.test(errorMessage) ? "stopped" : "failed";
+
+const buildBrowserValidationStatusRecord = ({
+  status,
+  error,
+  failureReason,
+}: {
+  status: "running" | "complete" | "failed";
+  error?: string;
+  failureReason?: BrowserValidationFailureReason;
+}): BrowserPageValidationStatusRecord => ({
+  status,
+  error: status === "failed" ? error : undefined,
+  failureReason: status === "failed" ? failureReason : undefined,
+  updatedAt: new Date().toISOString(),
+});
+
+const mergeBrowserValidationStatusByUrls = ({
+  previous,
+  urls,
+  record,
+}: {
+  previous: Record<string, BrowserPageValidationStatusRecord>;
+  urls: (string | null | undefined)[];
+  record: BrowserPageValidationStatusRecord;
+}): Record<string, BrowserPageValidationStatusRecord> => {
+  const next = { ...previous };
+  const seen = new Set<string>();
+  urls.forEach((url) => {
+    if (!url || seen.has(url)) {
+      return;
+    }
+    seen.add(url);
+    next[url] = { ...record };
+  });
+  return next;
+};
+
+interface BrowserTabTransferPayload {
+  url: string;
+  title?: string;
+  referenceHighlight?: BrowserViewReferenceHighlight;
+}
+
+interface BrowserTabTransferRequest extends BrowserTabTransferPayload {
+  requestId: string;
+}
+
+interface ValidationChatMessagesUpdatedEventDetail {
+  chatId: string;
+  messages: ChatMessage[];
+  validationByUrl?: Record<string, BrowserPageValidationRecord>;
+  validationChatByUrl?: Record<string, string>;
+  validationStatusByUrl?: Record<string, BrowserPageValidationStatusRecord>;
+}
+
+const VALIDATION_CHAT_MESSAGES_UPDATED_EVENT =
+  "deertube:validation-chat-messages-updated";
+
+const dispatchValidationChatMessagesUpdated = (
+  detail: ValidationChatMessagesUpdatedEventDetail,
+) => {
+  window.dispatchEvent(
+    new CustomEvent<ValidationChatMessagesUpdatedEventDetail>(
+      VALIDATION_CHAT_MESSAGES_UPDATED_EVENT,
+      {
+        detail,
+      },
+    ),
+  );
+};
+
+const runValidateStream = (
+  input: {
+    projectPath: string;
+    query: string;
+    answer: string;
+    toolCallId?: string;
+    force?: boolean;
+    settings: RuntimeSettingsPayload | undefined;
+    deepResearch: import("@/shared/deepresearch-config").DeepResearchConfig;
+  },
+  signal: AbortSignal,
+  onProgressEvent?: (event: ValidateStreamProgressEvent) => void,
+): Promise<ValidateExecutionResult> =>
+  new Promise((resolve, reject) => {
+    let settled = false;
+    let handleAbort: (() => void) | null = null;
+    const cleanup = () => {
+      if (handleAbort) {
+        signal.removeEventListener("abort", handleAbort);
+        handleAbort = null;
+      }
+    };
+    const finalize = (callback: () => void) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      cleanup();
+      callback();
+    };
+    const subscription = trpcClient.chat.validateStream.subscribe(input, {
+      onData: (event: ValidateStreamEvent) => {
+        if (event.type === "result") {
+          finalize(() => {
+            resolve(event.payload);
+            subscription.unsubscribe();
+          });
+          return;
+        }
+        onProgressEvent?.(event);
+      },
+      onError: (error) => {
+        finalize(() => {
+          reject(error);
+        });
+      },
+      onComplete: () => {
+        finalize(() => {
+          reject(new Error("Validation stream ended without a result."));
+        });
+      },
+    });
+    handleAbort = () => {
+      subscription.unsubscribe();
+      finalize(() => {
+        reject(createAbortError());
+      });
+    };
+    if (signal.aborted) {
+      handleAbort();
+      return;
+    }
+    signal.addEventListener("abort", handleAbort, { once: true });
+  });
+
 const coerceProjectState = (state: ProjectStateInput): ProjectState => ({
   nodes: state.nodes,
   edges: state.edges,
@@ -132,6 +367,8 @@ const coerceProjectState = (state: ProjectStateInput): ProjectState => ({
   autoLayoutLocked:
     typeof state.autoLayoutLocked === "boolean" ? state.autoLayoutLocked : true,
   browserValidationByUrl: state.browserValidationByUrl ?? {},
+  browserValidationChatByUrl: state.browserValidationChatByUrl ?? {},
+  browserValidationStatusByUrl: state.browserValidationStatusByUrl ?? {},
 });
 
 const createEmptyProjectState = (): ProjectState => ({
@@ -140,6 +377,8 @@ const createEmptyProjectState = (): ProjectState => ({
   chat: [],
   autoLayoutLocked: true,
   browserValidationByUrl: {},
+  browserValidationChatByUrl: {},
+  browserValidationStatusByUrl: {},
 });
 
 const toTimestamp = (value: string) => {
@@ -151,13 +390,21 @@ const sortChatSummariesDesc = (
   chats: ProjectChatSummary[],
 ): ProjectChatSummary[] =>
   [...chats].sort(
-    (left, right) => toTimestamp(right.updatedAt) - toTimestamp(left.updatedAt),
+    (left, right) => {
+      const leftValidation = left.isValidation === true ? 1 : 0;
+      const rightValidation = right.isValidation === true ? 1 : 0;
+      if (leftValidation !== rightValidation) {
+        return rightValidation - leftValidation;
+      }
+      return toTimestamp(right.updatedAt) - toTimestamp(left.updatedAt);
+    },
   );
 
 interface FlowWorkspaceSession {
   slotId: string;
   chatId: string | null;
   initialState: ProjectState;
+  pendingBrowserTransfer: BrowserTabTransferRequest | null;
 }
 
 const buildChatSlotId = (chatId: string): string => `chat:${chatId}`;
@@ -173,9 +420,18 @@ const applyRunningStatusToSummaries = (
   }));
 
 interface FlowWorkspaceInnerProps extends FlowWorkspaceProps {
+  sessionSlotId: string;
   activeChatId: string | null;
+  pendingBrowserTransfer: BrowserTabTransferRequest | null;
   chatSummaries: ProjectChatSummary[];
-  onSwitchChat: (chatId: string) => Promise<void>;
+  onSwitchChat: (
+    chatId: string,
+    browserTransfer?: BrowserTabTransferPayload,
+  ) => Promise<void>;
+  onConsumePendingBrowserTransfer: (
+    slotId: string,
+    requestId: string,
+  ) => void;
   onRenameChat: (chatId: string, title: string) => Promise<void>;
   onDeleteChat: (chatId: string) => Promise<void>;
   onCreateDraftChat: () => void;
@@ -246,6 +502,7 @@ function FlowWorkspaceLoader(props: FlowWorkspaceProps) {
             slotId,
             chatId: resolvedChatId,
             initialState: coerceProjectState(result.state),
+            pendingBrowserTransfer: null,
           },
         ]);
         setActiveSlotId(slotId);
@@ -258,20 +515,11 @@ function FlowWorkspaceLoader(props: FlowWorkspaceProps) {
           ),
         );
       })
-      .catch(() => {
+      .catch((error) => {
         if (cancelled) {
           return;
         }
-        const slotId = buildDraftSlotId();
-        setSessions([
-          {
-            slotId,
-            chatId: null,
-            initialState: coerceProjectState(props.initialState),
-          },
-        ]);
-        setActiveSlotId(slotId);
-        setChatSummaries([]);
+        throw error;
       })
       .finally(() => {
         if (cancelled) {
@@ -285,14 +533,51 @@ function FlowWorkspaceLoader(props: FlowWorkspaceProps) {
   }, [props.initialState, props.project.path]);
 
   const handleSwitchChat = useCallback(
-    async (chatId: string) => {
-      if (!chatId || chatId === activeChatId) {
+    async (
+      chatId: string,
+      browserTransfer?: BrowserTabTransferPayload,
+    ) => {
+      if (!chatId) {
+        return;
+      }
+      if (chatId === activeChatId) {
+        if (browserTransfer && activeSlotIdRef.current) {
+          const activeSlot = activeSlotIdRef.current;
+          setSessions((previous) =>
+            previous.map((session) =>
+              session.slotId === activeSlot
+                ? {
+                    ...session,
+                    pendingBrowserTransfer: {
+                      requestId: crypto.randomUUID(),
+                      ...browserTransfer,
+                    },
+                  }
+                : session,
+            ),
+          );
+        }
         return;
       }
       const existing = sessionsRef.current.find(
         (session) => session.chatId === chatId,
       );
       if (existing) {
+        if (browserTransfer) {
+          setSessions((previous) =>
+            previous.map((session) =>
+              session.slotId === existing.slotId
+                ? {
+                    ...session,
+                    pendingBrowserTransfer: {
+                      requestId: crypto.randomUUID(),
+                      ...browserTransfer,
+                    },
+                  }
+                : session,
+            ),
+          );
+        }
         setActiveSlotId(existing.slotId);
         return;
       }
@@ -313,6 +598,12 @@ function FlowWorkspaceLoader(props: FlowWorkspaceProps) {
               slotId,
               chatId: result.chatId,
               initialState: coerceProjectState(result.state),
+              pendingBrowserTransfer: browserTransfer
+                ? {
+                    requestId: crypto.randomUUID(),
+                    ...browserTransfer,
+                  }
+                : null,
             },
           ];
         });
@@ -327,6 +618,29 @@ function FlowWorkspaceLoader(props: FlowWorkspaceProps) {
       }
     },
     [activeChatId, props.project.path, runningChatIds],
+  );
+
+  const handleConsumePendingBrowserTransfer = useCallback(
+    (slotId: string, requestId: string) => {
+      setSessions((previous) =>
+        previous.map((session) => {
+          if (session.slotId !== slotId) {
+            return session;
+          }
+          if (
+            !session.pendingBrowserTransfer ||
+            session.pendingBrowserTransfer.requestId !== requestId
+          ) {
+            return session;
+          }
+          return {
+            ...session,
+            pendingBrowserTransfer: null,
+          };
+        }),
+      );
+    },
+    [],
   );
 
   const handleCreateDraftChat = useCallback(() => {
@@ -344,6 +658,7 @@ function FlowWorkspaceLoader(props: FlowWorkspaceProps) {
         slotId,
         chatId: null,
         initialState: createEmptyProjectState(),
+        pendingBrowserTransfer: null,
       },
     ]);
     setActiveSlotId(slotId);
@@ -373,6 +688,8 @@ function FlowWorkspaceLoader(props: FlowWorkspaceProps) {
           chat: state.chat,
           autoLayoutLocked: state.autoLayoutLocked,
           browserValidationByUrl: state.browserValidationByUrl,
+          browserValidationChatByUrl: state.browserValidationChatByUrl,
+          browserValidationStatusByUrl: state.browserValidationStatusByUrl,
         },
       });
       const nextChatId = result.activeChatId ?? result.chat.id;
@@ -448,6 +765,7 @@ function FlowWorkspaceLoader(props: FlowWorkspaceProps) {
                 slotId: draftSlotId,
                 chatId: null,
                 initialState: stateFromServer,
+                pendingBrowserTransfer: null,
               },
             ];
             nextSlotId = draftSlotId;
@@ -466,6 +784,7 @@ function FlowWorkspaceLoader(props: FlowWorkspaceProps) {
                 slotId,
                 chatId: nextActiveChatId,
                 initialState: stateFromServer,
+                pendingBrowserTransfer: null,
               },
             ];
             nextSlotId = slotId;
@@ -495,12 +814,19 @@ function FlowWorkspaceLoader(props: FlowWorkspaceProps) {
         if (alreadyBound) {
           return previous;
         }
-        const firstDraft = previous.find((session) => session.chatId === null);
-        if (!firstDraft) {
+        const targetSlotId = activeSlotIdRef.current;
+        if (!targetSlotId) {
+          return previous;
+        }
+        const activeDraft = previous.find(
+          (session) =>
+            session.slotId === targetSlotId && session.chatId === null,
+        );
+        if (!activeDraft) {
           return previous;
         }
         return previous.map((session) =>
-          session.slotId === firstDraft.slotId
+          session.slotId === activeDraft.slotId
             ? { ...session, chatId: chat.id }
             : session,
         );
@@ -547,10 +873,13 @@ function FlowWorkspaceLoader(props: FlowWorkspaceProps) {
         >
           <FlowWorkspaceInner
             {...props}
+            sessionSlotId={session.slotId}
             initialState={session.initialState}
             activeChatId={session.chatId}
+            pendingBrowserTransfer={session.pendingBrowserTransfer}
             chatSummaries={chatSummaries}
             onSwitchChat={handleSwitchChat}
+            onConsumePendingBrowserTransfer={handleConsumePendingBrowserTransfer}
             onRenameChat={handleRenameChat}
             onDeleteChat={handleDeleteChat}
             onCreateDraftChat={handleCreateDraftChat}
@@ -573,10 +902,13 @@ function FlowWorkspaceLoader(props: FlowWorkspaceProps) {
 
 function FlowWorkspaceInner({
   project,
+  sessionSlotId,
   initialState,
   activeChatId,
+  pendingBrowserTransfer,
   chatSummaries,
   onSwitchChat,
+  onConsumePendingBrowserTransfer,
   onRenameChat,
   onDeleteChat,
   onCreateDraftChat,
@@ -591,6 +923,8 @@ function FlowWorkspaceInner({
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [developerMode, setDeveloperMode] = useState(false);
   const [sessionChatId, setSessionChatId] = useState<string | null>(activeChatId);
+  const [externalPersistedChatMessages, setExternalPersistedChatMessages] =
+    useState<ChatMessage[] | null>(null);
   const [flowInstance, setFlowInstance] = useState<ReactFlowInstance | null>(
     null,
   );
@@ -599,6 +933,7 @@ function FlowWorkspaceInner({
   const [autoLayoutLocked, setAutoLayoutLocked] = useState(
     () => initialState.autoLayoutLocked ?? true,
   );
+  const [showSupportRelations, setShowSupportRelations] = useState(true);
   const [chatScrollSignal, setChatScrollSignal] = useState(0);
   const [chatFocusSignal, setChatFocusSignal] = useState(0);
   const [layoutModel, setLayoutModel] = useState<IJsonModel>(
@@ -608,6 +943,13 @@ function FlowWorkspaceInner({
   const [browserValidationByUrl, setBrowserValidationByUrl] = useState<
     Record<string, BrowserPageValidationRecord>
   >(() => initialState.browserValidationByUrl ?? {});
+  const [browserValidationChatByUrl, setBrowserValidationChatByUrl] = useState<
+    Record<string, string>
+  >(() => initialState.browserValidationChatByUrl ?? {});
+  const [browserValidationStatusByUrl, setBrowserValidationStatusByUrl] =
+    useState<Record<string, BrowserPageValidationStatusRecord>>(
+      () => initialState.browserValidationStatusByUrl ?? {},
+    );
   const [browserBounds, setBrowserBounds] = useState<
     Record<string, BrowserViewBounds>
   >({});
@@ -619,10 +961,25 @@ function FlowWorkspaceInner({
   const browserTabsRef = useRef<BrowserViewTabState[]>([]);
   const browserBoundsRef = useRef<Record<string, BrowserViewBounds>>({});
   const browserHighlightTimersRef = useRef<Set<number>>(new Set());
+  const nodesRef = useRef<FlowNode[]>(initialState.nodes ?? []);
+  const edgesRef = useRef<FlowEdge[]>(initialState.edges ?? []);
   const projectTitleClickTimestampsRef = useRef<number[]>([]);
   const referenceResolveCacheRef = useRef<
     Map<string, DeepResearchResolvedReference | null>
   >(new Map());
+  const browserValidationRunsRef = useRef<
+    Map<string, BrowserValidationRunSession>
+  >(new Map());
+  const browserValidationByUrlRef = useRef<
+    Record<string, BrowserPageValidationRecord>
+  >(initialState.browserValidationByUrl ?? {});
+  const browserValidationChatByUrlRef = useRef<Record<string, string>>(
+    initialState.browserValidationChatByUrl ?? {},
+  );
+  const browserValidationStatusByUrlRef = useRef<
+    Record<string, BrowserPageValidationStatusRecord>
+  >(initialState.browserValidationStatusByUrl ?? {});
+  const validationChatMessagesRef = useRef<Record<string, ChatMessage[]>>({});
   const saveTimer = useRef<number | null>(null);
   const inputZoomRef = useRef<{ viewport: Viewport; nodeId: string } | null>(null);
   const nodeZoomRef = useRef<Viewport | null>(null);
@@ -639,6 +996,36 @@ function FlowWorkspaceInner({
   const viewportRef = useRef<Viewport>({ x: 0, y: 0, zoom: 1 });
   const { getNode } = useReactFlow();
 
+  const setValidationStatusForUrls = useCallback(
+    ({
+      urls,
+      status,
+      error,
+      failureReason,
+    }: {
+      urls: (string | null | undefined)[];
+      status: "running" | "complete" | "failed";
+      error?: string;
+      failureReason?: BrowserValidationFailureReason;
+    }) => {
+      const record = buildBrowserValidationStatusRecord({
+        status,
+        error,
+        failureReason,
+      });
+      setBrowserValidationStatusByUrl((previous) => {
+        const next = mergeBrowserValidationStatusByUrls({
+          previous,
+          urls,
+          record,
+        });
+        browserValidationStatusByUrlRef.current = next;
+        return next;
+      });
+    },
+    [],
+  );
+
   const {
     nodes,
     setNodes,
@@ -649,8 +1036,58 @@ function FlowWorkspaceInner({
     hydrated,
   } = useFlowState(initialState);
   useEffect(() => {
+    nodesRef.current = nodes;
+  }, [nodes]);
+  useEffect(() => {
+    edgesRef.current = edges;
+  }, [edges]);
+  useEffect(() => {
     setSessionChatId(activeChatId);
+    setExternalPersistedChatMessages(null);
   }, [activeChatId]);
+  useEffect(() => {
+    const handleValidationChatMessagesUpdated = (event: Event) => {
+      const typedEvent =
+        event as CustomEvent<ValidationChatMessagesUpdatedEventDetail>;
+      const detail = typedEvent.detail;
+      if (!detail || detail.chatId !== sessionChatId) {
+        return;
+      }
+      setExternalPersistedChatMessages(detail.messages);
+      if (detail.validationByUrl) {
+        setBrowserValidationByUrl((previous) => ({
+          ...previous,
+          ...detail.validationByUrl,
+        }));
+      }
+      if (detail.validationChatByUrl) {
+        setBrowserValidationChatByUrl((previous) => ({
+          ...previous,
+          ...detail.validationChatByUrl,
+        }));
+      }
+      if (detail.validationStatusByUrl) {
+        setBrowserValidationStatusByUrl((previous) => ({
+          ...previous,
+          ...detail.validationStatusByUrl,
+        }));
+      }
+    };
+    window.addEventListener(
+      VALIDATION_CHAT_MESSAGES_UPDATED_EVENT,
+      handleValidationChatMessagesUpdated as EventListener,
+    );
+    return () => {
+      window.removeEventListener(
+        VALIDATION_CHAT_MESSAGES_UPDATED_EVENT,
+        handleValidationChatMessagesUpdated as EventListener,
+      );
+    };
+  }, [sessionChatId]);
+  const resolvedInitialChatMessages = useMemo(
+    () => externalPersistedChatMessages ?? initialState.chat ?? [],
+    [externalPersistedChatMessages, initialState.chat],
+  );
   const {
     profiles,
     setProfiles,
@@ -659,7 +1096,16 @@ function FlowWorkspaceInner({
     activeProfile,
   } = useProfileSettings(project.path);
   const { panelVisible, panelNodeId } = usePanelState(selectedId, isDragging);
-  const displayEdges = useMemo(() => edges, [edges]);
+  const displayEdges = useMemo(
+    () =>
+      showSupportRelations
+        ? edges
+        : edges.filter((edge) => {
+            const edgeData = edge.data as { relationType?: string } | undefined;
+            return edgeData?.relationType !== "support";
+          }),
+    [edges, showSupportRelations],
+  );
   const runtimeSettings = useMemo(
     () => buildRuntimeSettings(activeProfile),
     [activeProfile],
@@ -679,6 +1125,8 @@ function FlowWorkspaceInner({
           chat: [],
           autoLayoutLocked,
           browserValidationByUrl,
+          browserValidationChatByUrl,
+          browserValidationStatusByUrl,
         },
       });
       if (nextChatId) {
@@ -687,7 +1135,9 @@ function FlowWorkspaceInner({
     },
     [
       autoLayoutLocked,
+      browserValidationChatByUrl,
       browserValidationByUrl,
+      browserValidationStatusByUrl,
       edges,
       nodes,
       onPersistDraftChat,
@@ -708,10 +1158,14 @@ function FlowWorkspaceInner({
     busy,
     chatBusy,
     graphBusy,
+    asyncTaskBusy,
+    canValidateCurrentChat,
+    validateCurrentChat,
     retryMessage,
     handleSendFromHistory,
     handleSendFromPanel,
     stopChatGeneration,
+    stopAsyncTasks,
   } = useChatActions({
     projectPath: project.path,
     chatId: sessionChatId,
@@ -722,7 +1176,7 @@ function FlowWorkspaceInner({
     selectedId,
     flowInstance,
     activeProfile,
-    initialMessages: initialState.chat ?? [],
+    initialMessages: resolvedInitialChatMessages,
     onBeforeSendPrompt: persistDraftChatBeforeSend,
   });
   const lastFailedMessageId = useMemo(() => {
@@ -918,21 +1372,38 @@ function FlowWorkspaceInner({
   }, [browserBounds]);
 
   useEffect(() => {
+    browserValidationByUrlRef.current = browserValidationByUrl;
+  }, [browserValidationByUrl]);
+
+  useEffect(() => {
+    browserValidationChatByUrlRef.current = browserValidationChatByUrl;
+  }, [browserValidationChatByUrl]);
+
+  useEffect(() => {
+    browserValidationStatusByUrlRef.current = browserValidationStatusByUrl;
+  }, [browserValidationStatusByUrl]);
+
+  useEffect(() => {
     referenceResolveCacheRef.current.clear();
   }, [project.path]);
 
   useEffect(() => {
     const highlightTimers = browserHighlightTimersRef.current;
+    const validationRuns = browserValidationRunsRef.current;
     return () => {
+      validationRuns.forEach((run) => {
+        run.abortController.abort();
+      });
+      validationRuns.clear();
       highlightTimers.forEach((timerId) => {
         window.clearTimeout(timerId);
       });
       highlightTimers.clear();
       const tabs = browserTabsRef.current;
       tabs.forEach((tab) => {
-        trpc.browserView.close.mutate({ tabId: tab.id }).catch(() => undefined);
+        void trpc.browserView.close.mutate({ tabId: tab.id });
       });
-      trpc.browserView.hide.mutate().catch(() => undefined);
+      void trpc.browserView.hide.mutate();
     };
   }, []);
 
@@ -962,7 +1433,7 @@ function FlowWorkspaceInner({
     const previousIds = previousBrowserTabIdsRef.current;
     previousIds.forEach((tabId) => {
       if (!existingIds.has(tabId)) {
-        trpc.browserView.close.mutate({ tabId }).catch(() => undefined);
+        void trpc.browserView.close.mutate({ tabId });
         openedBrowserTabsRef.current.delete(tabId);
       }
     });
@@ -983,7 +1454,7 @@ function FlowWorkspaceInner({
 
     existingIds.forEach((tabId) => {
       if (!visibleIds.has(tabId)) {
-        trpc.browserView.hideTab.mutate({ tabId }).catch(() => undefined);
+        void trpc.browserView.hideTab.mutate({ tabId });
       }
     });
 
@@ -994,24 +1465,18 @@ function FlowWorkspaceInner({
         return;
       }
       if (!openedBrowserTabsRef.current.has(tabId)) {
-        trpc.browserView
-          .open
-          .mutate({
-            tabId,
-            url: tab.url,
-            bounds,
-          })
-          .catch(() => undefined);
+        void trpc.browserView.open.mutate({
+          tabId,
+          url: tab.url,
+          bounds,
+        });
         openedBrowserTabsRef.current.add(tabId);
         return;
       }
-      trpc.browserView
-        .updateBounds
-        .mutate({
-          tabId,
-          bounds,
-        })
-        .catch(() => undefined);
+      void trpc.browserView.updateBounds.mutate({
+        tabId,
+        bounds,
+      });
     });
   }, [layoutModel]);
 
@@ -1044,6 +1509,9 @@ function FlowWorkspaceInner({
               isLoading: payload.isLoading ?? tab.isLoading,
               validationStatus: urlChanged ? undefined : tab.validationStatus,
               validationError: urlChanged ? undefined : tab.validationError,
+              validationFailureReason: urlChanged
+                ? undefined
+                : tab.validationFailureReason,
             };
           },
         ),
@@ -1071,6 +1539,756 @@ function FlowWorkspaceInner({
       ipc.off("browserview-selection", handleSelection);
     };
   }, []);
+
+  const persistCurrentChatStateNow = useCallback(async () => {
+    if (!saveEnabled) {
+      return;
+    }
+    if (!sessionChatId) {
+      return;
+    }
+    if (!hydrated.current) {
+      return;
+    }
+    const result = await trpc.project.saveState.mutate({
+      path: project.path,
+      chatId: sessionChatId,
+      settings: runtimeSettings,
+      state: {
+        nodes,
+        edges,
+        chat: chatMessages,
+        autoLayoutLocked,
+        browserValidationByUrl,
+        browserValidationChatByUrl,
+        browserValidationStatusByUrl,
+        version: 1,
+      },
+    });
+    onSavedChatUpdate(result.chat);
+  }, [
+    autoLayoutLocked,
+    browserValidationByUrl,
+    browserValidationChatByUrl,
+    browserValidationStatusByUrl,
+    chatMessages,
+    edges,
+    hydrated,
+    nodes,
+    onSavedChatUpdate,
+    project.path,
+    runtimeSettings,
+    saveEnabled,
+    sessionChatId,
+  ]);
+
+  const switchChatWithOptionalBrowserTransfer = useCallback(
+    async (
+      chatId: string,
+      browserTransfer?: BrowserTabTransferPayload,
+    ) => {
+      await persistCurrentChatStateNow();
+      await onSwitchChat(chatId, browserTransfer);
+    },
+    [onSwitchChat, persistCurrentChatStateNow],
+  );
+
+  const persistValidationChatState = useCallback(
+    async ({
+      chatId,
+      messages,
+      pageMapping,
+      validationByUrl,
+      validationStatusByUrl,
+    }: {
+      chatId: string;
+      messages: ChatMessage[];
+      pageMapping: Record<string, string>;
+      validationByUrl: Record<string, BrowserPageValidationRecord>;
+      validationStatusByUrl: Record<string, BrowserPageValidationStatusRecord>;
+    }) => {
+      validationChatMessagesRef.current[chatId] = messages;
+      dispatchValidationChatMessagesUpdated({
+        chatId,
+        messages,
+        validationByUrl,
+        validationChatByUrl: pageMapping,
+        validationStatusByUrl,
+      });
+      const result = await trpc.project.saveState.mutate({
+        path: project.path,
+        chatId,
+        activate: false,
+        settings: runtimeSettings,
+        state: {
+          version: 1,
+          nodes: [],
+          edges: [],
+          chat: messages,
+          autoLayoutLocked: true,
+          browserValidationByUrl: validationByUrl,
+          browserValidationChatByUrl: pageMapping,
+          browserValidationStatusByUrl: validationStatusByUrl,
+        },
+      });
+      onSavedChatUpdate(result.chat);
+    },
+    [onSavedChatUpdate, project.path, runtimeSettings],
+  );
+
+  const stopPageValidationRun = useCallback((tabRuntimeId: string): boolean => {
+    const running = browserValidationRunsRef.current.get(tabRuntimeId);
+    if (!running) {
+      logBrowserValidate("stop-miss", {
+        tabRuntimeId,
+      });
+      return false;
+    }
+    logBrowserValidate("stop-hit", {
+      tabRuntimeId,
+      runId: running.runId,
+      chatId: running.chatId,
+    });
+    running.abortController.abort();
+    return true;
+  }, []);
+
+  const startPageValidation = useCallback(
+    async ({
+      tabRuntimeId,
+      tab,
+      normalizedTabUrl,
+      captureValidationSnapshot,
+      onRunning,
+      onComplete,
+      onFailed,
+    }: {
+      tabRuntimeId: string;
+      tab: BrowserViewTabState;
+      normalizedTabUrl: string;
+      captureValidationSnapshot: () => Promise<{
+        snapshot?: {
+          text: string;
+          url: string;
+          title?: string;
+        } | null;
+      }>;
+      onRunning: () => void | Promise<void>;
+      onComplete: (record: BrowserPageValidationRecord) => void | Promise<void>;
+      onFailed: (result: {
+        message: string;
+        reason: BrowserValidationFailureReason;
+      }) => void | Promise<void>;
+    }) => {
+      logBrowserValidate("start-request", {
+        tabRuntimeId,
+        url: normalizedTabUrl,
+        title: tab.title,
+      });
+      const previousRun = browserValidationRunsRef.current.get(tabRuntimeId);
+      if (previousRun) {
+        logBrowserValidate("abort-previous-run", {
+          tabRuntimeId,
+          previousRunId: previousRun.runId,
+        });
+        previousRun.abortController.abort();
+      }
+
+      await onRunning();
+      setValidationStatusForUrls({
+        urls: [normalizedTabUrl],
+        status: "running",
+      });
+
+      const seed = createPageValidationChatSeed({
+        pageUrl: normalizedTabUrl,
+        pageTitle: tab.title,
+      });
+      const mappedChatId = browserValidationChatByUrlRef.current[normalizedTabUrl];
+      const hasBoundValidationChat = typeof mappedChatId === "string";
+      const chatId = mappedChatId
+        ? mappedChatId
+        : (
+            await trpc.project.createChat.mutate({
+              path: project.path,
+              firstQuestion: seed.firstQuestion,
+              settings: runtimeSettings,
+              activate: false,
+              state: {
+                version: 1,
+                nodes: [],
+                edges: [],
+                chat: [seed.requestMessage, seed.runningEventMessage],
+                autoLayoutLocked: true,
+                browserValidationByUrl: {},
+                browserValidationChatByUrl: {},
+                browserValidationStatusByUrl: {},
+              },
+            })
+          ).chat.id;
+      const existingMappingsForChat = Object.fromEntries(
+        Object.entries(browserValidationChatByUrlRef.current).filter(
+          ([, mappedId]) => mappedId === chatId,
+        ),
+      );
+      const initialMapping = {
+        ...existingMappingsForChat,
+        [normalizedTabUrl]: chatId,
+      };
+      const existingMessages = hasBoundValidationChat
+        ? validationChatMessagesRef.current[chatId] ??
+          (
+            await trpc.project.readChatState.mutate({
+              path: project.path,
+              chatId,
+            })
+          ).state.chat ??
+          []
+        : [];
+      const seedMessages: ChatMessage[] = [
+        ...existingMessages,
+        seed.requestMessage,
+        seed.runningEventMessage,
+      ];
+      let runningMessages = seedMessages;
+      let runningPersistChain: Promise<void> = Promise.resolve();
+      const queueRunningValidationChatPersist = (messages: ChatMessage[]) => {
+        runningMessages = messages;
+        validationChatMessagesRef.current[chatId] = messages;
+        dispatchValidationChatMessagesUpdated({
+          chatId,
+          messages,
+          validationByUrl: browserValidationByUrlRef.current,
+          validationChatByUrl: initialMapping,
+          validationStatusByUrl: browserValidationStatusByUrlRef.current,
+        });
+        runningPersistChain = runningPersistChain.then(async () => {
+          await persistValidationChatState({
+            chatId,
+            messages,
+            pageMapping: initialMapping,
+            validationByUrl: browserValidationByUrlRef.current,
+            validationStatusByUrl: browserValidationStatusByUrlRef.current,
+          });
+        });
+      };
+      validationChatMessagesRef.current[chatId] = seedMessages;
+      await persistValidationChatState({
+        chatId,
+        messages: seedMessages,
+        pageMapping: initialMapping,
+        validationByUrl: browserValidationByUrlRef.current,
+        validationStatusByUrl: browserValidationStatusByUrlRef.current,
+      });
+      setBrowserValidationChatByUrl((prev) => ({
+        ...prev,
+        ...initialMapping,
+      }));
+      browserValidationChatByUrlRef.current = {
+        ...browserValidationChatByUrlRef.current,
+        ...initialMapping,
+      };
+
+      const abortController = new AbortController();
+      const runId = `validate-run-${crypto.randomUUID()}`;
+      const runSession: BrowserValidationRunSession = {
+        runId,
+        tabRuntimeId,
+        chatId,
+        pageUrl: normalizedTabUrl,
+        querySeed: seed.firstQuestion,
+        eventId: seed.eventId,
+        toolCallId: seed.toolCallId,
+        abortController,
+      };
+      browserValidationRunsRef.current.set(tabRuntimeId, runSession);
+      startRunningChatJob(project.path, chatId, runId);
+      let terminalStatusSettled = false;
+      const settleComplete = async (record: BrowserPageValidationRecord) => {
+        if (terminalStatusSettled) {
+          return;
+        }
+        terminalStatusSettled = true;
+        await onComplete(record);
+      };
+      const settleFailed = async (message: string) => {
+        if (terminalStatusSettled) {
+          return;
+        }
+        terminalStatusSettled = true;
+        const reason = resolveBrowserValidationFailureReason(message);
+        setValidationStatusForUrls({
+          urls: [normalizedTabUrl],
+          status: "failed",
+          error: message,
+          failureReason: reason,
+        });
+        logBrowserValidate("terminal-failed", {
+          tabRuntimeId,
+          runId,
+          message,
+          reason,
+        });
+        await onFailed({
+          message,
+          reason,
+        });
+      };
+      logBrowserValidate("run-started", {
+        tabRuntimeId,
+        runId,
+        chatId,
+        querySeed: seed.firstQuestion,
+      });
+      try {
+        const {
+          resolvedPageUrl,
+          record,
+          query,
+          projectId,
+          searchId,
+          sources,
+          references,
+        } = await executeBrowserValidation({
+          tab,
+          normalizedTabUrl,
+          projectPath: project.path,
+          runtimeSettings,
+          deepResearchConfig,
+          captureValidationSnapshot,
+          validateAnswer: (input, signal) =>
+            runValidateStream(
+              {
+                ...input,
+                toolCallId: seed.toolCallId,
+              },
+              signal ?? abortController.signal,
+              (event) => {
+                const activeRun = browserValidationRunsRef.current.get(tabRuntimeId);
+                if (!activeRun || activeRun.runId !== runId) {
+                  return;
+                }
+                logBrowserValidate("stream-event", {
+                  tabRuntimeId,
+                  runId,
+                  type: event.type,
+                  toolCallId: event.payload.toolCallId,
+                  status:
+                    event.type === "subagent-stream"
+                      ? "running"
+                      : event.payload.status ?? "running",
+                });
+                if (event.type === "subagent-stream") {
+                  const toolCallId = event.payload.toolCallId;
+                  const eventId = `subagent-${toolCallId}`;
+                  const existingEvent = runningMessages.find(
+                    (message) =>
+                      message.id === eventId && message.kind === "subagent-event",
+                  );
+                  const subagentEvent: ChatMessage = {
+                    id: eventId,
+                    role: "assistant",
+                    content: "",
+                    createdAt:
+                      existingEvent?.createdAt ?? seed.runningEventMessage.createdAt,
+                    kind: "subagent-event",
+                    toolName: event.payload.toolName,
+                    toolInput: {
+                      responseId: seed.requestMessageId,
+                      toolCallId,
+                    },
+                    toolOutput: event.payload,
+                    toolStatus: "running",
+                    status: "complete",
+                  };
+                  queueRunningValidationChatPersist(
+                    upsertChatMessage(runningMessages, subagentEvent),
+                  );
+                  return;
+                }
+                const toolCallId = event.payload.toolCallId;
+                const eventId = `deepsearch-${toolCallId}`;
+                const existingEvent = runningMessages.find(
+                  (message) =>
+                    message.id === eventId && message.kind === "deepsearch-event",
+                );
+                const resolvedStatus =
+                  event.payload.status === "failed"
+                    ? "failed"
+                    : event.payload.status === "complete" ||
+                        event.payload.complete === true
+                      ? "complete"
+                      : "running";
+                const resolvedError =
+                  typeof event.payload.error === "string" &&
+                  event.payload.error.trim().length > 0
+                    ? event.payload.error
+                    : undefined;
+                const deepSearchEvent: ChatMessage = {
+                  id: eventId,
+                  role: "assistant",
+                  content: "",
+                  createdAt:
+                    existingEvent?.createdAt ?? seed.runningEventMessage.createdAt,
+                  kind: "deepsearch-event",
+                  toolName: event.payload.toolName,
+                  toolInput: {
+                    responseId: seed.requestMessageId,
+                    toolCallId,
+                  },
+                  toolOutput: event.payload,
+                  toolStatus: resolvedStatus,
+                  status: "complete",
+                  error: resolvedError,
+                };
+                queueRunningValidationChatPersist(
+                  upsertChatMessage(runningMessages, deepSearchEvent),
+                );
+              },
+            ),
+          signal: abortController.signal,
+        });
+        const activeRun = browserValidationRunsRef.current.get(tabRuntimeId);
+        if (!activeRun || activeRun.runId !== runId) {
+          logBrowserValidate("run-ignored-inactive", {
+            tabRuntimeId,
+            runId,
+          });
+          return;
+        }
+        await runningPersistChain;
+        const normalizedSources = Array.isArray(sources) ? sources : [];
+        const normalizedReferences = Array.isArray(references) ? references : [];
+        const completedEvent = buildCompletedValidationEvent({
+          previousEvent:
+            runningMessages.find(
+              (message) =>
+                message.id === seed.eventId && message.kind === "deepsearch-event",
+            ) ?? seed.runningEventMessage,
+          query,
+          searchId,
+          projectId,
+          sources: normalizedSources,
+          references: normalizedReferences,
+        });
+        const completedMessages = upsertChatMessage(
+          runningMessages,
+          completedEvent,
+        );
+        const pageMapping: Record<string, string> = {
+          [normalizedTabUrl]: chatId,
+          [resolvedPageUrl]: chatId,
+        };
+        setValidationStatusForUrls({
+          urls: [normalizedTabUrl, resolvedPageUrl],
+          status: "complete",
+        });
+        const nextValidationByUrl = {
+          ...browserValidationByUrlRef.current,
+          [resolvedPageUrl]: record,
+        };
+        browserValidationByUrlRef.current = nextValidationByUrl;
+        setBrowserValidationByUrl(nextValidationByUrl);
+        const nextValidationChatByUrl = {
+          ...browserValidationChatByUrlRef.current,
+          [normalizedTabUrl]: chatId,
+          [resolvedPageUrl]: chatId,
+        };
+        browserValidationChatByUrlRef.current = nextValidationChatByUrl;
+        setBrowserValidationChatByUrl(nextValidationChatByUrl);
+        await persistValidationChatState({
+          chatId,
+          messages: completedMessages,
+          pageMapping,
+          validationByUrl: nextValidationByUrl,
+          validationStatusByUrl: browserValidationStatusByUrlRef.current,
+        });
+        const graphInsertion = buildValidationGraphInsertion({
+          baseNodes: nodesRef.current,
+          validation: record,
+          references: normalizedReferences,
+        });
+        if (graphInsertion.nodes.length > 0) {
+          setNodes((prev) => [...prev, ...graphInsertion.nodes]);
+        }
+        if (graphInsertion.edges.length > 0) {
+          setEdges((prev) => [...prev, ...graphInsertion.edges]);
+        }
+        await settleComplete(record);
+        logBrowserValidate("terminal-complete", {
+          tabRuntimeId,
+          runId,
+          accuracy: record.accuracy,
+          sourceCount: record.sourceCount,
+          referenceCount: record.referenceCount,
+        });
+      } catch (error) {
+        const message = isAbortError(error)
+          ? "Validation stopped by user."
+          : error instanceof Error
+            ? error.message
+            : "Page validation failed";
+        const activeRun = browserValidationRunsRef.current.get(tabRuntimeId);
+        if (!activeRun) {
+          await settleFailed(message);
+          if (!isAbortError(error)) {
+            throw error instanceof Error ? error : new Error(message);
+          }
+          return;
+        }
+        if (activeRun.runId !== runId) {
+          logBrowserValidate("ignore-error-stale-run", {
+            tabRuntimeId,
+            runId,
+            activeRunId: activeRun.runId,
+            isAbort: isAbortError(error),
+          });
+          if (!isAbortError(error)) {
+            throw error instanceof Error ? error : new Error(message);
+          }
+          return;
+        }
+        await runningPersistChain;
+        const failedEvent = buildFailedValidationEvent({
+          previousEvent:
+            runningMessages.find(
+              (chatMessage) =>
+                chatMessage.id === seed.eventId &&
+                chatMessage.kind === "deepsearch-event",
+            ) ?? seed.runningEventMessage,
+          query: runSession.querySeed,
+          errorMessage: message,
+        });
+        const failedMessages = upsertChatMessage(
+          runningMessages,
+          failedEvent,
+        );
+        await persistValidationChatState({
+          chatId,
+          messages: failedMessages,
+          pageMapping: {
+            [normalizedTabUrl]: chatId,
+          },
+          validationByUrl: browserValidationByUrlRef.current,
+          validationStatusByUrl: browserValidationStatusByUrlRef.current,
+        });
+        await settleFailed(message);
+        if (isAbortError(error)) {
+          logBrowserValidate("aborted", {
+            tabRuntimeId,
+            runId,
+          });
+          return;
+        }
+        logBrowserValidate("failed-throw", {
+          tabRuntimeId,
+          runId,
+          message,
+        });
+        throw error instanceof Error ? error : new Error(message);
+      } finally {
+        const activeRun = browserValidationRunsRef.current.get(tabRuntimeId);
+        if (activeRun?.runId === runId && !terminalStatusSettled) {
+          logBrowserValidate("terminal-missing", {
+            tabRuntimeId,
+            runId,
+          });
+          await settleFailed("Validation finished without terminal status.");
+        }
+        finishRunningChatJob(project.path, chatId, runId);
+        if (activeRun?.runId === runId) {
+          browserValidationRunsRef.current.delete(tabRuntimeId);
+        }
+        logBrowserValidate("run-finished", {
+          tabRuntimeId,
+          runId,
+        });
+      }
+    },
+    [
+      setValidationStatusForUrls,
+      deepResearchConfig,
+      persistValidationChatState,
+      project.path,
+      runtimeSettings,
+      setEdges,
+      setNodes,
+    ],
+  );
+
+  const handleCdpValidateRequest = useCallback(
+    async (payload: CdpBrowserValidateRequestPayload) => {
+      const sessionId =
+        typeof payload.sessionId === "string" ? payload.sessionId.trim() : "";
+      const normalizedTabUrl = normalizeHttpUrl(payload.url);
+      if (!sessionId || !normalizedTabUrl) {
+        if (sessionId) {
+          await trpc.cdpBrowser.setValidationState.mutate({
+            sessionId,
+            status: "failed",
+            message: "Invalid page URL for validation.",
+          });
+        }
+        return;
+      }
+      const tab: BrowserViewTabState = {
+        id: `cdp:${sessionId}`,
+        url: normalizedTabUrl,
+        title: payload.title,
+      };
+      const tabRuntimeId = `cdp:${sessionId}`;
+      logBrowserValidate("cdp-start-request", {
+        sessionId,
+        tabRuntimeId,
+        url: normalizedTabUrl,
+      });
+      try {
+        await startPageValidation({
+          tabRuntimeId,
+          tab,
+          normalizedTabUrl,
+          captureValidationSnapshot: () =>
+            trpc.cdpBrowser.captureValidationSnapshot.mutate({ sessionId }),
+          onRunning: async () => {
+            logBrowserValidate("cdp-ui-running", {
+              sessionId,
+            });
+            await trpc.cdpBrowser.setValidationState.mutate({
+              sessionId,
+              status: "running",
+            });
+          },
+          onComplete: async (record) => {
+            logBrowserValidate("cdp-ui-complete", {
+              sessionId,
+              accuracy: record.accuracy,
+            });
+            const completeMessage =
+              record.accuracy && record.accuracy.length > 0
+                ? `Validation complete (${record.accuracy}).`
+                : "Validation complete.";
+            await trpc.cdpBrowser.setValidationState.mutate({
+              sessionId,
+              status: "complete",
+              message: completeMessage,
+            });
+          },
+          onFailed: async ({ message, reason }) => {
+            logBrowserValidate("cdp-ui-failed", {
+              sessionId,
+              message,
+              reason,
+            });
+            await trpc.cdpBrowser.setValidationState.mutate({
+              sessionId,
+              status: "failed",
+              message,
+            });
+          },
+        });
+      } catch (error) {
+        const message =
+          error instanceof Error ? error.message : "Page validation failed";
+        logBrowserValidate("cdp-ui-failed-catch", {
+          sessionId,
+          message,
+        });
+        await trpc.cdpBrowser.setValidationState.mutate({
+          sessionId,
+          status: "failed",
+          message,
+        });
+        throw error instanceof Error ? error : new Error(message);
+      }
+    },
+    [startPageValidation],
+  );
+
+  const handleCdpValidateStopRequest = useCallback(
+    async (payload: CdpBrowserValidateStopRequestPayload) => {
+      const sessionId =
+        typeof payload.sessionId === "string" ? payload.sessionId.trim() : "";
+      if (!sessionId) {
+        return;
+      }
+      const stopped = stopPageValidationRun(`cdp:${sessionId}`);
+      logBrowserValidate("cdp-stop-request", {
+        sessionId,
+        stopped,
+      });
+      if (!stopped) {
+        return;
+      }
+      await trpc.cdpBrowser.setValidationState
+        .mutate({
+          sessionId,
+          status: "failed",
+          message: "Validation stopped by user.",
+        });
+    },
+    [stopPageValidationRun],
+  );
+
+  const handleCdpOpenValidationChatRequest = useCallback(
+    (payload: CdpBrowserValidateRequestPayload) => {
+      const normalizedTabUrl = normalizeHttpUrl(payload.url);
+      if (!normalizedTabUrl) {
+        return;
+      }
+      const chatId = browserValidationChatByUrlRef.current[normalizedTabUrl];
+      if (!chatId) {
+        return;
+      }
+      void switchChatWithOptionalBrowserTransfer(chatId, {
+        url: normalizedTabUrl,
+        title: payload.title,
+      });
+    },
+    [switchChatWithOptionalBrowserTransfer],
+  );
+
+  useEffect(() => {
+    const ipc = window.ipcRenderer;
+    if (!ipc) {
+      return;
+    }
+    const handleValidateRequest = (
+      _event: IpcRendererEvent,
+      payload: CdpBrowserValidateRequestPayload,
+    ) => {
+      void handleCdpValidateRequest(payload);
+    };
+    const handleValidateStopRequest = (
+      _event: IpcRendererEvent,
+      payload: CdpBrowserValidateStopRequestPayload,
+    ) => {
+      void handleCdpValidateStopRequest(payload);
+    };
+    const handleOpenValidationChatRequest = (
+      _event: IpcRendererEvent,
+      payload: CdpBrowserValidateRequestPayload,
+    ) => {
+      handleCdpOpenValidationChatRequest(payload);
+    };
+    ipc.on("cdp-browser-validate-request", handleValidateRequest);
+    ipc.on("cdp-browser-validate-stop-request", handleValidateStopRequest);
+    ipc.on(
+      "cdp-browser-open-validation-chat-request",
+      handleOpenValidationChatRequest,
+    );
+    return () => {
+      ipc.off("cdp-browser-validate-request", handleValidateRequest);
+      ipc.off("cdp-browser-validate-stop-request", handleValidateStopRequest);
+      ipc.off(
+        "cdp-browser-open-validation-chat-request",
+        handleOpenValidationChatRequest,
+      );
+    };
+  }, [
+    handleCdpOpenValidationChatRequest,
+    handleCdpValidateRequest,
+    handleCdpValidateStopRequest,
+  ]);
 
   const openOrFocusTab = useCallback(
     (tabKind: "chat" | "graph") => {
@@ -1214,23 +2432,27 @@ function FlowWorkspaceInner({
       attempt = 0,
     ) => {
       if (attempt > 8) {
-        return;
+        throw new Error(
+          `highlightReference retry budget exceeded for tab ${tabId}`,
+        );
       }
       const delay = attempt === 0 ? 180 : Math.min(1300, 220 * (attempt + 1));
       const timerId = window.setTimeout(() => {
         browserHighlightTimersRef.current.delete(timerId);
-        trpc.browserView.highlightReference
+        void trpc.browserView.highlightReference
           .mutate({
             tabId,
             reference,
           })
           .then((result) => {
             if (!result.ok) {
+              if (attempt >= 8) {
+                throw new Error(
+                  `highlightReference failed after retries for tab ${tabId}`,
+                );
+              }
               scheduleBrowserReferenceHighlight(tabId, reference, attempt + 1);
             }
-          })
-          .catch(() => {
-            scheduleBrowserReferenceHighlight(tabId, reference, attempt + 1);
           });
       }, delay);
       browserHighlightTimersRef.current.add(timerId);
@@ -1252,18 +2474,13 @@ function FlowWorkspaceInner({
       if (cached !== undefined) {
         return cached;
       }
-      try {
-        const result = await trpc.deepSearch.resolveReference.mutate({
-          projectPath: project.path,
-          uri: normalizedUri,
-        });
-        const reference = result.reference ?? null;
-        referenceResolveCacheRef.current.set(normalizedUri, reference);
-        return reference;
-      } catch {
-        referenceResolveCacheRef.current.set(normalizedUri, null);
-        return null;
-      }
+      const result = await trpc.deepSearch.resolveReference.mutate({
+        projectPath: project.path,
+        uri: normalizedUri,
+      });
+      const reference = result.reference ?? null;
+      referenceResolveCacheRef.current.set(normalizedUri, reference);
+      return reference;
     },
     [project.path],
   );
@@ -1296,25 +2513,22 @@ function FlowWorkspaceInner({
     ) => {
       const normalizedUrl = normalizeHttpUrl(url);
       if (!normalizedUrl) {
-        console.warn("[cdp-browser]", "openCdpUrl:invalid-url", { url });
+        console.warn(CDP_OPEN_LOG_PREFIX, "openCdpUrl:invalid-url", { url });
         return;
       }
-      console.info("[cdp-browser]", "openCdpUrl:request", {
+      console.info(CDP_OPEN_LOG_PREFIX, "openCdpUrl:request", {
         url: normalizedUrl,
         hasReference: Boolean(reference),
         refId: reference?.refId ?? null,
         referenceTextLength: reference?.text.length ?? 0,
       });
-      trpc.cdpBrowser.open
+      void trpc.cdpBrowser.open
         .mutate({
           url: normalizedUrl,
           reference,
         })
         .then((result) => {
-          console.info("[cdp-browser]", "openCdpUrl:response", result);
-        })
-        .catch((error) => {
-          console.error("[cdp-browser]", "openCdpUrl:error", error);
+          console.info(CDP_OPEN_LOG_PREFIX, "openCdpUrl:response", result);
         });
     },
     [],
@@ -1365,11 +2579,45 @@ function FlowWorkspaceInner({
     ],
   );
 
+  useEffect(() => {
+    if (!pendingBrowserTransfer) {
+      return;
+    }
+    const {
+      requestId,
+      url,
+      title,
+      referenceHighlight,
+    } = pendingBrowserTransfer;
+    const normalizedUrl = normalizeHttpUrl(url);
+    if (!normalizedUrl) {
+      onConsumePendingBrowserTransfer(sessionSlotId, requestId);
+      return;
+    }
+    if (prefersCdpBrowser) {
+      openCdpUrl(normalizedUrl, referenceHighlight);
+    } else {
+      const tabId = openBrowserUrl(normalizedUrl, title, referenceHighlight);
+      if (tabId && referenceHighlight) {
+        scheduleBrowserReferenceHighlight(tabId, referenceHighlight);
+      }
+    }
+    onConsumePendingBrowserTransfer(sessionSlotId, requestId);
+  }, [
+    onConsumePendingBrowserTransfer,
+    openBrowserUrl,
+    openCdpUrl,
+    pendingBrowserTransfer,
+    prefersCdpBrowser,
+    scheduleBrowserReferenceHighlight,
+    sessionSlotId,
+  ]);
+
   const handleBrowserBoundsChange = useCallback(
     (tabId: string, bounds: BrowserViewBounds) => {
       setBrowserBounds((prev) => ({ ...prev, [tabId]: bounds }));
       if (bounds.width <= 1 || bounds.height <= 1) {
-        trpc.browserView.hideTab.mutate({ tabId }).catch(() => undefined);
+        void trpc.browserView.hideTab.mutate({ tabId });
         return;
       }
       const tab = browserTabMap.get(tabId);
@@ -1377,45 +2625,39 @@ function FlowWorkspaceInner({
         return;
       }
       if (!openedBrowserTabsRef.current.has(tabId)) {
-        trpc.browserView
-          .open
-          .mutate({
-            tabId,
-            url: tab.url,
-            bounds,
-          })
-          .catch(() => undefined);
+        void trpc.browserView.open.mutate({
+          tabId,
+          url: tab.url,
+          bounds,
+        });
         openedBrowserTabsRef.current.add(tabId);
         return;
       }
-      trpc.browserView
-        .updateBounds
-        .mutate({
-          tabId,
-          bounds,
-        })
-        .catch(() => undefined);
+      void trpc.browserView.updateBounds.mutate({
+        tabId,
+        bounds,
+      });
     },
     [browserTabMap],
   );
 
   const handleBrowserBack = useCallback((tabId: string) => {
-    trpc.browserView.back.mutate({ tabId }).catch(() => undefined);
+    void trpc.browserView.back.mutate({ tabId });
   }, []);
 
   const handleBrowserForward = useCallback((tabId: string) => {
-    trpc.browserView.forward.mutate({ tabId }).catch(() => undefined);
+    void trpc.browserView.forward.mutate({ tabId });
   }, []);
 
   const handleBrowserReload = useCallback((tabId: string) => {
-    trpc.browserView.reload.mutate({ tabId }).catch(() => undefined);
+    void trpc.browserView.reload.mutate({ tabId });
   }, []);
 
   const handleBrowserOpenExternal = useCallback((url: string) => {
     if (!isHttpUrl(url)) {
       return;
     }
-    trpc.browserView.openExternal.mutate({ url }).catch(() => undefined);
+    void trpc.browserView.openExternal.mutate({ url });
   }, []);
 
   const handleBrowserOpenCdp = useCallback(
@@ -1426,8 +2668,8 @@ function FlowWorkspaceInner({
     [browserTabMap, openCdpUrl],
   );
 
-  const handleBrowserValidate = useCallback(
-    async (tabId: string) => {
+  const handleBrowserOpenValidationChat = useCallback(
+    (tabId: string) => {
       const tab = browserTabMap.get(tabId);
       if (!tab) {
         return;
@@ -1436,53 +2678,151 @@ function FlowWorkspaceInner({
       if (!normalizedTabUrl) {
         return;
       }
-      setBrowserTabs((prev) =>
-        updateBrowserTabValidationState({
-          tabs: prev,
+      const chatId = browserValidationChatByUrlRef.current[normalizedTabUrl];
+      if (!chatId) {
+        return;
+      }
+      void switchChatWithOptionalBrowserTransfer(chatId, {
+        url: normalizedTabUrl,
+        title: tab.title,
+        referenceHighlight: tab.referenceHighlight,
+      });
+    },
+    [browserTabMap, switchChatWithOptionalBrowserTransfer],
+  );
+
+  const handleBrowserValidate = useCallback(
+    (tabId: string) => {
+      const tab = browserTabMap.get(tabId);
+      if (!tab) {
+        return;
+      }
+      const normalizedTabUrl = normalizeHttpUrl(tab.url);
+      const effectiveStatus = normalizedTabUrl
+        ? (browserValidationStatusByUrlRef.current[normalizedTabUrl]?.status ??
+            tab.validationStatus)
+        : tab.validationStatus;
+      if (effectiveStatus === "running") {
+        const stopped = stopPageValidationRun(tabId);
+        logBrowserValidate("manual-stop", {
           tabId,
-          status: "running",
-        }),
-      );
-      try {
-        const { resolvedPageUrl, record } = await executeBrowserValidation({
-          tab,
-          normalizedTabUrl,
-          projectPath: project.path,
-          runtimeSettings,
-          deepResearchConfig,
-          captureValidationSnapshot: () =>
-            trpc.browserView.captureValidationSnapshot.mutate({ tabId }),
-          validateAnswer: (input) => trpc.chat.validate.mutate(input),
+          stopped,
         });
-        setBrowserValidationByUrl((prev) => ({
-          ...prev,
-          [resolvedPageUrl]: record,
-        }));
+        if (stopped) {
+          setValidationStatusForUrls({
+            urls: [normalizedTabUrl],
+            status: "failed",
+            error: "Validation stopped by user.",
+            failureReason: "stopped",
+          });
+          setBrowserTabs((prev) =>
+            updateBrowserTabValidationState({
+              tabs: prev,
+              tabId,
+              status: "failed",
+              error: "Validation stopped by user.",
+              failureReason: "stopped",
+            }),
+          );
+          return;
+        }
+        setValidationStatusForUrls({
+          urls: [normalizedTabUrl],
+          status: "failed",
+          error: "Validation run is no longer active. Please retry.",
+          failureReason: "failed",
+        });
         setBrowserTabs((prev) =>
           updateBrowserTabValidationState({
             tabs: prev,
             tabId,
-            status: "complete",
+            status: "failed",
+            error: "Validation run is no longer active. Please retry.",
+            failureReason: "failed",
           }),
         );
-      } catch (error) {
+        return;
+      }
+      if (!normalizedTabUrl) {
+        return;
+      }
+      logBrowserValidate("manual-start", {
+        tabId,
+        url: normalizedTabUrl,
+        title: tab.title,
+      });
+      void startPageValidation({
+        tabRuntimeId: tabId,
+        tab,
+        normalizedTabUrl,
+        captureValidationSnapshot: () =>
+          trpc.browserView.captureValidationSnapshot.mutate({ tabId }),
+        onRunning: () => {
+          logBrowserValidate("ui-running", {
+            tabId,
+          });
+          setBrowserTabs((prev) =>
+            updateBrowserTabValidationState({
+              tabs: prev,
+              tabId,
+              status: "running",
+            }),
+          );
+        },
+        onComplete: () => {
+          logBrowserValidate("ui-complete", {
+            tabId,
+          });
+          setBrowserTabs((prev) =>
+            updateBrowserTabValidationState({
+              tabs: prev,
+              tabId,
+              status: "complete",
+            }),
+          );
+        },
+        onFailed: ({ message, reason }) => {
+          logBrowserValidate("ui-failed", {
+            tabId,
+            message,
+            reason,
+          });
+          setBrowserTabs((prev) =>
+            updateBrowserTabValidationState({
+              tabs: prev,
+              tabId,
+              status: "failed",
+              error: message,
+              failureReason: reason,
+            }),
+          );
+        },
+      }).catch((error) => {
         const message =
           error instanceof Error ? error.message : "Page validation failed";
+        const failureReason = resolveBrowserValidationFailureReason(message);
+        logBrowserValidate("ui-failed-catch", {
+          tabId,
+          message,
+          reason: failureReason,
+        });
         setBrowserTabs((prev) =>
           updateBrowserTabValidationState({
             tabs: prev,
             tabId,
             status: "failed",
             error: message,
+            failureReason,
           }),
         );
-      }
+        throw error instanceof Error ? error : new Error(message);
+      });
     },
     [
       browserTabMap,
-      deepResearchConfig,
-      project.path,
-      runtimeSettings,
+      setValidationStatusForUrls,
+      startPageValidation,
+      stopPageValidationRun,
     ],
   );
 
@@ -1503,20 +2843,18 @@ function FlowWorkspaceInner({
                 referenceHighlight: undefined,
                 validationStatus: undefined,
                 validationError: undefined,
+                validationFailureReason: undefined,
               }
             : tab,
         ),
       );
       const bounds = browserBounds[tabId];
       if (bounds) {
-        trpc.browserView
-          .open
-          .mutate({
-            tabId,
-            url: normalizedUrl,
-            bounds,
-          })
-          .catch(() => undefined);
+        void trpc.browserView.open.mutate({
+          tabId,
+          url: normalizedUrl,
+          bounds,
+        });
         openedBrowserTabsRef.current.add(tabId);
       }
     },
@@ -1563,7 +2901,7 @@ function FlowWorkspaceInner({
       window.clearTimeout(saveTimer.current);
     }
     saveTimer.current = window.setTimeout(() => {
-      trpc.project.saveState
+      void trpc.project.saveState
         .mutate({
           path: project.path,
           chatId: sessionChatId,
@@ -1573,13 +2911,14 @@ function FlowWorkspaceInner({
             chat: chatMessages,
             autoLayoutLocked,
             browserValidationByUrl,
+            browserValidationChatByUrl,
+            browserValidationStatusByUrl,
             version: 1,
           },
         })
         .then((result) => {
           onSavedChatUpdate(result.chat);
-        })
-        .catch(() => undefined);
+        });
     }, 500);
     return () => {
       if (saveTimer.current) {
@@ -1588,7 +2927,9 @@ function FlowWorkspaceInner({
     };
   }, [
     autoLayoutLocked,
+    browserValidationChatByUrl,
     browserValidationByUrl,
+    browserValidationStatusByUrl,
     chatMessages,
     edges,
     hydrated,
@@ -1600,7 +2941,7 @@ function FlowWorkspaceInner({
   ]);
 
   const handleExit = useCallback(() => {
-    trpc.preview.hide.mutate().catch(() => undefined);
+    void trpc.preview.hide.mutate();
     onExit();
   }, [onExit]);
 
@@ -1804,12 +3145,14 @@ function FlowWorkspaceInner({
         zoom={viewport.zoom}
         prompt={panelInput}
         busy={busy}
+        asyncBusy={asyncTaskBusy}
         onPromptChange={setPanelInput}
         onSend={() => {
           void handleSendFromPanel();
           setChatScrollSignal((prev) => prev + 1);
         }}
         onStop={stopChatGeneration}
+        onStopAsync={stopAsyncTasks}
         onRetry={retryMessage}
         retryMessageId={lastFailedMessageId}
         onFocusZoom={handleInputFocusZoom}
@@ -1826,6 +3169,14 @@ function FlowWorkspaceInner({
         normalizedTabUrl !== null
           ? browserValidationByUrl[normalizedTabUrl]
           : undefined;
+      const validationChatId =
+        normalizedTabUrl !== null
+          ? browserValidationChatByUrl[normalizedTabUrl]
+          : undefined;
+      const validationStatusRecord =
+        normalizedTabUrl !== null
+          ? browserValidationStatusByUrl[normalizedTabUrl]
+          : undefined;
       return (
         <BrowserTab
           tabId={browserTabId}
@@ -1833,13 +3184,20 @@ function FlowWorkspaceInner({
           canGoBack={tab?.canGoBack}
           canGoForward={tab?.canGoForward}
           validation={validation}
-          validationStatus={tab?.validationStatus}
-          validationError={tab?.validationError}
+          validationChatId={validationChatId}
+          validationStatus={
+            validationStatusRecord?.status ?? tab?.validationStatus
+          }
+          validationError={validationStatusRecord?.error ?? tab?.validationError}
+          validationFailureReason={
+            validationStatusRecord?.failureReason ?? tab?.validationFailureReason
+          }
           onBoundsChange={handleBrowserBoundsChange}
           onRequestBack={handleBrowserBack}
           onRequestForward={handleBrowserForward}
           onRequestReload={handleBrowserReload}
           onRequestValidate={handleBrowserValidate}
+          onRequestOpenValidationChat={handleBrowserOpenValidationChat}
           onRequestOpenCdp={handleBrowserOpenCdp}
           onRequestOpenExternal={handleBrowserOpenExternal}
           onRequestNavigate={handleBrowserNavigate}
@@ -1868,10 +3226,14 @@ function FlowWorkspaceInner({
           graphGenerationEnabled={graphGenerationEnabled}
           onGraphGenerationEnabledChange={setGraphGenerationEnabled}
           busy={chatBusy}
+          asyncBusy={asyncTaskBusy}
+          canValidateChat={canValidateCurrentChat}
+          onValidateChat={validateCurrentChat}
           graphBusy={graphBusy}
           onInputChange={setHistoryInput}
           onSend={handleSendFromHistory}
           onStop={stopChatGeneration}
+          onStopAsync={stopAsyncTasks}
           onRetry={retryMessage}
           lastFailedMessageId={lastFailedMessageId}
         />
@@ -1907,6 +3269,30 @@ function FlowWorkspaceInner({
           >
             <Background gap={20} size={1} color="var(--flow-grid)" />
             <Panel position="top-right" className="flex items-center gap-2">
+              <Button
+                size="icon"
+                variant="outline"
+                className={`h-9 w-9 border-border/70 bg-card/80 text-muted-foreground transition-colors hover:border-border hover:bg-accent/40 hover:text-foreground ${
+                  showSupportRelations ? "border-primary/50 text-foreground" : ""
+                }`}
+                onClick={() => {
+                  setShowSupportRelations((prev) => !prev);
+                }}
+                disabled={nodes.length === 0}
+                aria-label={
+                  showSupportRelations
+                    ? "Hide support relations"
+                    : "Show support relations"
+                }
+                aria-pressed={showSupportRelations}
+                title={
+                  showSupportRelations
+                    ? "Hide support relations"
+                    : "Show support relations"
+                }
+              >
+                <GitBranch />
+              </Button>
               {!autoLayoutLocked ? (
                 <Button
                   size="icon"
@@ -1959,11 +3345,42 @@ function FlowWorkspaceInner({
     }
     return null;
   };
+  const inferBrowserTransferForChat = useCallback(
+    (chatId: string): BrowserTabTransferPayload | undefined => {
+      const mappedUrls = Object.entries(browserValidationChatByUrl)
+        .filter(([, mappedChatId]) => mappedChatId === chatId)
+        .map(([url]) => url);
+      if (mappedUrls.length === 0) {
+        return undefined;
+      }
+      const selectedUrl = [...mappedUrls].sort((left, right) => {
+        const leftTime = Date.parse(browserValidationByUrl[left]?.checkedAt ?? "");
+        const rightTime = Date.parse(browserValidationByUrl[right]?.checkedAt ?? "");
+        const normalizedLeft = Number.isFinite(leftTime) ? leftTime : 0;
+        const normalizedRight = Number.isFinite(rightTime) ? rightTime : 0;
+        return normalizedRight - normalizedLeft;
+      })[0];
+      const normalizedUrl = normalizeHttpUrl(selectedUrl);
+      if (!normalizedUrl) {
+        return undefined;
+      }
+      const record = browserValidationByUrl[selectedUrl];
+      return {
+        url: normalizedUrl,
+        title: record?.title ?? record?.referenceTitle,
+      };
+    },
+    [browserValidationByUrl, browserValidationChatByUrl],
+  );
+
   const handleSwitchChatAction = useCallback(
     (chatId: string) => {
-      void onSwitchChat(chatId);
+      void switchChatWithOptionalBrowserTransfer(
+        chatId,
+        inferBrowserTransferForChat(chatId),
+      );
     },
-    [onSwitchChat],
+    [inferBrowserTransferForChat, switchChatWithOptionalBrowserTransfer],
   );
   const handleRenameChatAction = useCallback(
     (chatId: string, title: string) => {
@@ -1983,19 +3400,18 @@ function FlowWorkspaceInner({
       const browserTabId = parseBrowserTabId(tabId);
       if (browserTabId) {
         const tab = browserTabMap.get(browserTabId);
-        const resolvedLabel = normalizeBrowserLabel(tab?.title);
-        const rawLabel =
-          resolvedLabel ??
-          (() => {
-            if (!tab?.url) {
-              return "Browser";
-            }
-            try {
+          const resolvedLabel = normalizeBrowserLabel(tab?.title);
+          const rawLabel =
+            resolvedLabel ??
+            (() => {
+              if (!tab?.url) {
+                return "Browser";
+              }
+              if (!URL.canParse(tab.url)) {
+                return tab.url;
+              }
               return new URL(tab.url).host;
-            } catch {
-              return tab.url;
-            }
-          })();
+            })();
         const label = truncateLabel(rawLabel, BROWSER_TAB_MAX_LABEL_LENGTH);
         return (
           <div className="flex min-w-0 items-center gap-2">

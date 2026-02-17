@@ -1,6 +1,9 @@
 import type { FlowEdge, FlowNode } from "../../types/flow";
 import type { ChatMessage } from "../../types/chat";
-import type { BrowserPageValidationRecord } from "../../types/browserview";
+import type {
+  BrowserPageValidationRecord,
+  BrowserPageValidationStatusRecord,
+} from "../../types/browserview";
 import type { Theme } from "../../lib/theme";
 
 export interface ProjectState {
@@ -9,6 +12,8 @@ export interface ProjectState {
   chat: ChatMessage[];
   autoLayoutLocked?: boolean;
   browserValidationByUrl?: Record<string, BrowserPageValidationRecord>;
+  browserValidationChatByUrl?: Record<string, string>;
+  browserValidationStatusByUrl?: Record<string, BrowserPageValidationStatusRecord>;
 }
 
 export interface ProjectChatSummary {
@@ -17,6 +22,7 @@ export interface ProjectChatSummary {
   createdAt: string;
   updatedAt: string;
   isRunning?: boolean;
+  isValidation?: boolean;
 }
 
 export interface ProjectInfo {

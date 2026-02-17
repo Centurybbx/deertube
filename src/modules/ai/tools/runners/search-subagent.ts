@@ -51,6 +51,7 @@ import {
 import type {
   ExtractedEvidence,
   SearchResult,
+  SubagentStreamPayload,
   SubagentUIMessage,
 } from "../types";
 import { runExtractSubagent } from "./extract-subagent";
@@ -64,8 +65,6 @@ const normalizeToolKey = (value: string): string =>
 
 const SEARCH_VIEWPOINT_FALLBACK =
   "Insufficient validated evidence from this source to form a reliable query-grounded viewpoint.";
-const EXTRACT_FAILURE_VIEWPOINT =
-  "Extraction halted early; this source cannot yet provide a reliable, query-grounded viewpoint.";
 
 const normalizeSearchViewpoint = (
   value: string | undefined,
@@ -136,6 +135,7 @@ export async function runSearchSubagent({
   strictness = "all-claims",
   mode = "search",
   answerToValidate = "",
+  onSubagentStream,
 }: {
   query: string;
   searchId: string;
@@ -157,6 +157,7 @@ export async function runSearchSubagent({
   strictness?: DeepResearchStrictness;
   mode?: "search" | "validate";
   answerToValidate?: string;
+  onSubagentStream?: (payload: SubagentStreamPayload) => void;
 }): Promise<SearchResult[]> {
   console.log("[subagent.runSearch]", {
     query,
@@ -215,7 +216,7 @@ export async function runSearchSubagent({
         const message = `search call budget exceeded (${resolvedSubagentConfig.maxSearchCalls}).`;
         searchToolErrorCount += 1;
         searchToolErrors.push(message);
-        return { results: [], error: message };
+        throw new Error(message);
       }
       if (
         repeatedSearchCalls > resolvedSubagentConfig.maxRepeatSearchQuery
@@ -223,7 +224,7 @@ export async function runSearchSubagent({
         const message = `repeated search query blocked (${resolvedSubagentConfig.maxRepeatSearchQuery}x max): ${inputQuery}`;
         searchToolErrorCount += 1;
         searchToolErrors.push(message);
-        return { results: [], error: message };
+        throw new Error(message);
       }
       console.log("[subagent.search]", {
         query: inputQuery,
@@ -267,10 +268,7 @@ export async function runSearchSubagent({
           query: inputQuery,
           error: clampText(message, 260),
         });
-        return {
-          results: [],
-          error: message,
-        };
+        throw error instanceof Error ? error : new Error(message);
       }
     },
   });
@@ -353,18 +351,7 @@ export async function runSearchSubagent({
         const errorMessage = `extract call budget exceeded (${resolvedSubagentConfig.maxExtractCalls}).`;
         extractToolErrorCount += 1;
         extractToolErrors.push(errorMessage);
-        return {
-          url,
-          title: searchLookup.get(url)?.title,
-          pageId: undefined,
-          lineCount: 0,
-          broken: true,
-          inrelavate: false,
-          viewpoint: EXTRACT_FAILURE_VIEWPOINT,
-          selections: [],
-          error: errorMessage,
-          rawModelOutput: "",
-        };
+        throw new Error(errorMessage);
       }
       if (
         repeatedExtractCalls > resolvedSubagentConfig.maxRepeatExtractUrl
@@ -372,18 +359,7 @@ export async function runSearchSubagent({
         const errorMessage = `repeated extract URL blocked (${resolvedSubagentConfig.maxRepeatExtractUrl}x max): ${url}`;
         extractToolErrorCount += 1;
         extractToolErrors.push(errorMessage);
-        return {
-          url,
-          title: searchLookup.get(url)?.title,
-          pageId: undefined,
-          lineCount: 0,
-          broken: true,
-          inrelavate: false,
-          viewpoint: EXTRACT_FAILURE_VIEWPOINT,
-          selections: [],
-          error: errorMessage,
-          rawModelOutput: "",
-        };
+        throw new Error(errorMessage);
       }
       const extractStartedAt = Date.now();
       let stage = "init";
@@ -596,18 +572,7 @@ export async function runSearchSubagent({
           elapsedMs: Date.now() - extractStartedAt,
           error: clampText(errorMessage, 300),
         });
-        return {
-          url,
-          title: pageTitle,
-          pageId,
-          lineCount,
-          broken: true,
-          inrelavate: false,
-          viewpoint: EXTRACT_FAILURE_VIEWPOINT,
-          selections: [],
-          error: errorMessage,
-          rawModelOutput,
-        };
+        throw error instanceof Error ? error : new Error(errorMessage);
       }
     },
   });
@@ -818,7 +783,13 @@ export async function runSearchSubagent({
     } else {
       accumulatedMessages.push(uiMessage);
     }
-    writeSubagentStream(writer, toolCallId, toolName, accumulatedMessages);
+    writeSubagentStream(
+      writer,
+      toolCallId,
+      toolName,
+      accumulatedMessages,
+      onSubagentStream,
+    );
     if (uiMessage.role === "assistant") {
       const outputs = collectToolOutputs(uiMessage);
       outputs.forEach((output) => {
@@ -919,51 +890,11 @@ export async function runSearchSubagent({
       searchToolCallCount,
       extractToolCallCount,
     });
+    throw new Error(
+      "search subagent did not call writeResults before finishing.",
+    );
   }
-
-  const buildFallbackPayloadFromExtractHistory =
-    (): SearchSubagentFinalPayload => {
-      const results: SearchSubagentFinalPayload["results"] = [];
-      const urls = new Set<string>([
-        ...Array.from(extractedEvidenceByUrl.keys()),
-        ...Array.from(extractedMetaByUrl.keys()),
-      ]);
-      urls.forEach((url) => {
-        const evidence = extractedEvidenceByUrl.get(url);
-        const meta = extractedMetaByUrl.get(url);
-        const selections = evidence?.selections ?? [];
-        const hasEvidence = selections.length > 0;
-        const error = meta?.error?.trim();
-        const broken = meta?.broken;
-        const inrelavate = meta?.inrelavate;
-        if (!hasEvidence && !broken && !inrelavate && !error) {
-          return;
-        }
-        results.push({
-          url,
-          viewpoint: normalizeSearchViewpoint(meta?.viewpoint),
-          content: "",
-          selections,
-          broken,
-          inrelavate,
-          error,
-        });
-      });
-      const errors: string[] = [];
-      if (results.length === 0) {
-        errors.push(
-          "search subagent did not call writeResults before finishing and no extract history was available.",
-        );
-      } else {
-        errors.push(
-          "search subagent did not call writeResults before finishing; used extract-history fallback.",
-        );
-      }
-      return { results, errors };
-    };
-
-  const parsed =
-    collectedFinalPayload ?? buildFallbackPayloadFromExtractHistory();
+  const parsed = collectedFinalPayload;
 
   const enforceWriteResultsConsistency = (
     candidate: SearchResult[],
@@ -1048,7 +979,7 @@ export async function runSearchSubagent({
     );
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    searchToolErrors.push(`writeResults payload parse failed: ${message}`);
+    throw new Error(`writeResults payload parse failed: ${message}`);
   }
   const {
     normalized: checkedToolResults,
@@ -1109,7 +1040,7 @@ export async function runSearchSubagent({
     searchToolCallCount > 0 && searchToolErrorCount === searchToolCallCount;
   const allExtractCallsFailed =
     extractToolCallCount > 0 && extractToolErrorCount === extractToolCallCount;
-  if ((allSearchCallsFailed || allExtractCallsFailed) && !hasUsableEvidence) {
+  if (allSearchCallsFailed && allExtractCallsFailed && !hasUsableEvidence) {
     const fatalErrors = Array.from(
       new Set(
         [...normalizedGlobalErrors]
@@ -1123,6 +1054,9 @@ export async function runSearchSubagent({
       allExtractCallsFailed,
       fatalErrors: fatalErrors.map((entry) => clampText(entry, 180)),
     });
+    throw new Error(
+      fatalErrors.join("\n") || "All tool calls failed during evidence collection.",
+    );
   }
   if (mergedResults.length > 0) {
     console.log("[subagent.runSearch.done]", {

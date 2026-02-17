@@ -10,7 +10,12 @@ import {
   buildDeepSearchSources,
   writeDeepSearchStream,
 } from "../helpers";
-import type { DeepSearchReference, DeepSearchSource } from "../types";
+import type {
+  DeepSearchReference,
+  DeepSearchSource,
+  DeepSearchStreamPayload,
+  SubagentStreamPayload,
+} from "../types";
 import { runSearchSubagent } from "./search-subagent";
 
 export async function runDeepSearchTool({
@@ -29,6 +34,8 @@ export async function runDeepSearchTool({
   externalSkills,
   mode = "search",
   validateTargetAnswer = "",
+  onSubagentStream,
+  onDeepSearchStream,
 }: {
   query: string;
   searchModel: LanguageModel;
@@ -45,6 +52,11 @@ export async function runDeepSearchTool({
   externalSkills?: RuntimeAgentSkill[];
   mode?: "search" | "validate";
   validateTargetAnswer?: string;
+  onSubagentStream?: (payload: SubagentStreamPayload) => void;
+  onDeepSearchStream?: (
+    payload: DeepSearchStreamPayload,
+    done: boolean,
+  ) => void;
 }): Promise<{
   conclusion?: string;
   sources: DeepSearchSource[];
@@ -67,6 +79,7 @@ export async function runDeepSearchTool({
         complete: true,
       },
       true,
+      onDeepSearchStream,
     );
     throw new Error(message);
   }
@@ -77,13 +90,20 @@ export async function runDeepSearchTool({
   const searchId = searchSession.searchId;
   const searchCreatedAt = searchSession.createdAt ?? fallbackCreatedAt;
   const projectId = deepResearchStore?.projectId;
-  writeDeepSearchStream(writer, toolCallId, toolName, {
-    mode,
-    query: normalizedQuery,
-    projectId,
-    searchId,
-    status: "running",
-  });
+  writeDeepSearchStream(
+    writer,
+    toolCallId,
+    toolName,
+    {
+      mode,
+      query: normalizedQuery,
+      projectId,
+      searchId,
+      status: "running",
+    },
+    false,
+    onDeepSearchStream,
+  );
 
   try {
     const subagentConfig =
@@ -116,20 +136,28 @@ export async function runDeepSearchTool({
       strictness,
       mode,
       answerToValidate: validateTargetAnswer,
+      onSubagentStream,
     });
     const references = buildDeepSearchReferences(results, projectId, searchId, {
       includeValidationFields: mode === "validate",
     });
     const sources = buildDeepSearchSources(results, references);
-    writeDeepSearchStream(writer, toolCallId, toolName, {
-      mode,
-      query: normalizedQuery,
-      projectId,
-      searchId,
-      sources,
-      references,
-      status: "running",
-    });
+    writeDeepSearchStream(
+      writer,
+      toolCallId,
+      toolName,
+      {
+        mode,
+        query: normalizedQuery,
+        projectId,
+        searchId,
+        sources,
+        references,
+        status: "running",
+      },
+      false,
+      onDeepSearchStream,
+    );
 
     const sourceErrors = Array.from(
       new Set(
@@ -192,6 +220,7 @@ export async function runDeepSearchTool({
         complete: true,
       },
       true,
+      onDeepSearchStream,
     );
 
     return {
@@ -217,6 +246,7 @@ export async function runDeepSearchTool({
         complete: true,
       },
       true,
+      onDeepSearchStream,
     );
     throw error instanceof Error ? error : new Error(message);
   }

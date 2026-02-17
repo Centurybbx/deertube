@@ -10,6 +10,9 @@ import type { FlowEdge, FlowNode } from '../../../src/types/flow'
 import type { ChatMessage } from '../../../src/types/chat'
 import type {
   BrowserPageValidationRecord,
+  BrowserPageValidationStatusRecord,
+  BrowserValidationFailureReason,
+  BrowserValidationStatus,
   ReferenceAccuracy,
 } from '../../../src/types/browserview'
 
@@ -19,6 +22,8 @@ interface ChatSessionState {
   chat: ChatMessage[]
   autoLayoutLocked?: boolean
   browserValidationByUrl?: Record<string, BrowserPageValidationRecord>
+  browserValidationChatByUrl?: Record<string, string>
+  browserValidationStatusByUrl?: Record<string, BrowserPageValidationStatusRecord>
 }
 
 interface ProjectChatRecord {
@@ -36,6 +41,7 @@ interface ProjectChatSummary {
   createdAt: string
   updatedAt: string
   isRunning: boolean
+  isValidation: boolean
 }
 
 interface ProjectStoreState {
@@ -67,6 +73,73 @@ function sanitizeProjectName(name: string) {
   return name.replace(/[\\/:*?"<>|]/g, '').trim()
 }
 
+const hasNodeErrorCode = (error: unknown, code: string): boolean =>
+  typeof error === 'object'
+  && error !== null
+  && 'code' in error
+  && (error as { code?: unknown }).code === code
+
+const jsonWriteQueueByFile = new Map<string, Promise<void>>()
+
+const extractCorruptedJsonRoot = (raw: string): string | null => {
+  let start = 0
+  while (start < raw.length && /\s/.test(raw[start])) {
+    start += 1
+  }
+  const first = raw[start]
+  if (first !== '{' && first !== '[') {
+    return null
+  }
+  let inString = false
+  let escaped = false
+  let depth = 0
+  let end = -1
+  for (let index = start; index < raw.length; index += 1) {
+    const ch = raw[index]
+    if (inString) {
+      if (escaped) {
+        escaped = false
+        continue
+      }
+      if (ch === '\\') {
+        escaped = true
+        continue
+      }
+      if (ch === '"') {
+        inString = false
+      }
+      continue
+    }
+    if (ch === '"') {
+      inString = true
+      continue
+    }
+    if (ch === '{' || ch === '[') {
+      depth += 1
+      continue
+    }
+    if (ch !== '}' && ch !== ']') {
+      continue
+    }
+    depth -= 1
+    if (depth === 0) {
+      end = index + 1
+      break
+    }
+    if (depth < 0) {
+      return null
+    }
+  }
+  if (end < 0) {
+    return null
+  }
+  const trailing = raw.slice(end)
+  if (trailing.trim().length === 0) {
+    return null
+  }
+  return raw.slice(start, end)
+}
+
 async function ensureUniqueProjectPath(root: string, name: string) {
   const base = sanitizeProjectName(name)
   if (!base) {
@@ -76,8 +149,11 @@ async function ensureUniqueProjectPath(root: string, name: string) {
     try {
       await fs.stat(candidate)
       return true
-    } catch {
-      return false
+    } catch (error) {
+      if (hasNodeErrorCode(error, 'ENOENT') || hasNodeErrorCode(error, 'ENOTDIR')) {
+        return false
+      }
+      throw error
     }
   }
   const candidate = path.join(root, base)
@@ -92,18 +168,57 @@ async function ensureUniqueProjectPath(root: string, name: string) {
 }
 
 async function readJsonFile<T>(filePath: string, fallback: T): Promise<T> {
+  let raw: string
   try {
-    const raw = await fs.readFile(filePath, 'utf-8')
-    return JSON.parse(raw) as T
+    raw = await fs.readFile(filePath, 'utf-8')
   }
-  catch {
-    return fallback
+  catch (error) {
+    if (hasNodeErrorCode(error, 'ENOENT')) {
+      return fallback
+    }
+    throw error
+  }
+  try {
+    return JSON.parse(raw) as T
+  } catch (error) {
+    const repairedRaw = extractCorruptedJsonRoot(raw)
+    if (repairedRaw) {
+      const repaired = JSON.parse(repairedRaw) as T
+      await writeJsonFile(filePath, repaired)
+      console.warn('[project.json.repaired]', {
+        filePath,
+        originalBytes: raw.length,
+        repairedBytes: repairedRaw.length,
+      })
+      return repaired
+    }
+    const message = error instanceof Error ? error.message : 'unknown'
+    throw new Error(`Invalid JSON in ${filePath}: ${message}`)
   }
 }
 
 async function writeJsonFile<T>(filePath: string, data: T) {
-  await fs.mkdir(path.dirname(filePath), { recursive: true })
-  await fs.writeFile(filePath, JSON.stringify(data, null, 2), 'utf-8')
+  const previous = jsonWriteQueueByFile.get(filePath) ?? Promise.resolve()
+  const operation = async () => {
+    await fs.mkdir(path.dirname(filePath), { recursive: true })
+    const serialized = JSON.stringify(data, null, 2)
+    const tempPath = `${filePath}.${process.pid}.${randomUUID()}.tmp`
+    await fs.writeFile(tempPath, serialized, 'utf-8')
+    await fs.rename(tempPath, filePath)
+  }
+  const running = previous.then(operation, operation)
+  const queueMarker = running.then(
+    () => undefined,
+    () => undefined,
+  )
+  jsonWriteQueueByFile.set(filePath, queueMarker)
+  try {
+    await running
+  } finally {
+    if (jsonWriteQueueByFile.get(filePath) === queueMarker) {
+      jsonWriteQueueByFile.delete(filePath)
+    }
+  }
 }
 
 async function readRecents(): Promise<RecentProject[]> {
@@ -146,6 +261,20 @@ function sortChatRecords(chats: ProjectChatRecord[]) {
   )
 }
 
+function isValidationChatRecord(chat: ProjectChatRecord): boolean {
+  const normalized = normalizeChatState(chat.state)
+  const mappedChatIds = Object.values(normalized.browserValidationChatByUrl ?? {})
+  if (mappedChatIds.includes(chat.id)) {
+    return true
+  }
+  return normalized.chat.some((message) => {
+    if (message.kind !== 'deepsearch-event') {
+      return false
+    }
+    return message.toolName === 'validate.run'
+  })
+}
+
 function toChatSummary(chat: ProjectChatRecord): ProjectChatSummary {
   return {
     id: chat.id,
@@ -153,6 +282,7 @@ function toChatSummary(chat: ProjectChatRecord): ProjectChatSummary {
     createdAt: chat.createdAt,
     updatedAt: chat.updatedAt,
     isRunning: false,
+    isValidation: isValidationChatRecord(chat),
   }
 }
 
@@ -166,6 +296,18 @@ const isReferenceAccuracy = (value: unknown): value is ReferenceAccuracy =>
   || value === 'low'
   || value === 'conflicting'
   || value === 'insufficient'
+
+const isBrowserValidationStatus = (
+  value: unknown,
+): value is BrowserValidationStatus =>
+  value === 'running'
+  || value === 'complete'
+  || value === 'failed'
+
+const isBrowserValidationFailureReason = (
+  value: unknown,
+): value is BrowserValidationFailureReason =>
+  value === 'failed' || value === 'stopped'
 
 const normalizeOptionalText = (value: unknown): string | undefined => {
   if (typeof value !== 'string') {
@@ -250,6 +392,63 @@ const normalizeBrowserValidationByUrl = (
   return normalized
 }
 
+const normalizeBrowserValidationChatByUrl = (
+  value: unknown,
+): Record<string, string> => {
+  if (!isObject(value)) {
+    return {}
+  }
+  const normalized: Record<string, string> = {}
+  Object.entries(value).forEach(([url, chatId]) => {
+    const normalizedUrl = normalizeOptionalText(url)
+    const normalizedChatId = normalizeOptionalText(chatId)
+    if (!normalizedUrl || !normalizedChatId) {
+      return
+    }
+    normalized[normalizedUrl] = normalizedChatId
+  })
+  return normalized
+}
+
+const normalizeBrowserValidationStatusRecord = (
+  value: unknown,
+): BrowserPageValidationStatusRecord | null => {
+  if (!isObject(value) || !isBrowserValidationStatus(value.status)) {
+    return null
+  }
+  const error = normalizeOptionalText(value.error)
+  const failureReason = isBrowserValidationFailureReason(value.failureReason)
+    ? value.failureReason
+    : /stopped by user|abort/i.test(error ?? '')
+      ? 'stopped'
+      : undefined
+  return {
+    status: value.status,
+    error: value.status === 'failed' ? error : undefined,
+    failureReason: value.status === 'failed' ? failureReason : undefined,
+    updatedAt:
+      normalizeOptionalText(value.updatedAt) ?? new Date().toISOString(),
+  }
+}
+
+const normalizeBrowserValidationStatusByUrl = (
+  value: unknown,
+): Record<string, BrowserPageValidationStatusRecord> => {
+  if (!isObject(value)) {
+    return {}
+  }
+  const normalized: Record<string, BrowserPageValidationStatusRecord> = {}
+  Object.entries(value).forEach(([url, status]) => {
+    const normalizedUrl = normalizeOptionalText(url)
+    const normalizedStatus = normalizeBrowserValidationStatusRecord(status)
+    if (!normalizedUrl || !normalizedStatus) {
+      return
+    }
+    normalized[normalizedUrl] = normalizedStatus
+  })
+  return normalized
+}
+
 function normalizeChatState(
   state: Partial<ChatSessionState> | undefined,
 ): ChatSessionState {
@@ -262,6 +461,12 @@ function normalizeChatState(
     browserValidationByUrl: normalizeBrowserValidationByUrl(
       state?.browserValidationByUrl,
     ),
+    browserValidationChatByUrl: normalizeBrowserValidationChatByUrl(
+      state?.browserValidationChatByUrl,
+    ),
+    browserValidationStatusByUrl: normalizeBrowserValidationStatusByUrl(
+      state?.browserValidationStatusByUrl,
+    ),
   }
 }
 
@@ -272,6 +477,8 @@ function createEmptyChatState(): ChatSessionState {
     chat: [],
     autoLayoutLocked: true,
     browserValidationByUrl: {},
+    browserValidationChatByUrl: {},
+    browserValidationStatusByUrl: {},
   }
 }
 
@@ -420,8 +627,9 @@ async function generateChatTitle(
     const generated = sanitizeGeneratedTitle(result.text ?? '')
     return generated || fallbackTitle
   } catch (error) {
-    console.warn('[project.chatTitle] generate failed', error)
-    return fallbackTitle
+    throw (error instanceof Error
+      ? error
+      : new Error('Failed to generate chat title.'))
   }
 }
 
@@ -463,6 +671,14 @@ function normalizeChatRecord(
     browserValidationByUrl:
       rawState.browserValidationByUrl as
         | Record<string, BrowserPageValidationRecord>
+        | undefined,
+    browserValidationChatByUrl:
+      rawState.browserValidationChatByUrl as
+        | Record<string, string>
+        | undefined,
+    browserValidationStatusByUrl:
+      rawState.browserValidationStatusByUrl as
+        | Record<string, BrowserPageValidationStatusRecord>
         | undefined,
   })
   const fallbackFirstQuestion = findFirstUserQuestion(state.chat)
@@ -536,6 +752,14 @@ function parseProjectStore(raw: unknown): { store: ProjectStoreState; migrated: 
     browserValidationByUrl:
       raw.browserValidationByUrl as
         | Record<string, BrowserPageValidationRecord>
+        | undefined,
+    browserValidationChatByUrl:
+      raw.browserValidationChatByUrl as
+        | Record<string, string>
+        | undefined,
+    browserValidationStatusByUrl:
+      raw.browserValidationStatusByUrl as
+        | Record<string, BrowserPageValidationStatusRecord>
         | undefined,
   })
   const hasLegacyData =
@@ -625,6 +849,70 @@ function resolveActiveChat(store: ProjectStoreState): ProjectChatRecord | null {
   return sorted[0] ?? null
 }
 
+function buildMergedBrowserValidationState(
+  activeState: ChatSessionState,
+  chats: ProjectChatRecord[],
+): Pick<
+  ChatSessionState,
+  'browserValidationByUrl' | 'browserValidationChatByUrl' | 'browserValidationStatusByUrl'
+> {
+  const byUrl: Record<string, BrowserPageValidationRecord> = {
+    ...(activeState.browserValidationByUrl ?? {}),
+  }
+  const chatByUrl: Record<string, string> = {
+    ...(activeState.browserValidationChatByUrl ?? {}),
+  }
+  const statusByUrl: Record<string, BrowserPageValidationStatusRecord> = {
+    ...(activeState.browserValidationStatusByUrl ?? {}),
+  }
+  const existingChatIds = new Set(chats.map((chat) => chat.id))
+  const sortedChats = [...chats].sort(
+    (left, right) => toTimestamp(left.updatedAt) - toTimestamp(right.updatedAt),
+  )
+  sortedChats.forEach((chat) => {
+    const normalized = normalizeChatState(chat.state)
+    Object.entries(normalized.browserValidationByUrl ?? {}).forEach(([url, record]) => {
+      byUrl[url] = record
+      if (!chatByUrl[url]) {
+        chatByUrl[url] = chat.id
+      }
+    })
+    Object.entries(normalized.browserValidationStatusByUrl ?? {}).forEach(([url, status]) => {
+      statusByUrl[url] = status
+    })
+    Object.entries(normalized.browserValidationChatByUrl ?? {}).forEach(([url, chatId]) => {
+      if (!existingChatIds.has(chatId)) {
+        return
+      }
+      chatByUrl[url] = chatId
+    })
+  })
+  Object.entries(chatByUrl).forEach(([url, chatId]) => {
+    if (!existingChatIds.has(chatId)) {
+      delete chatByUrl[url]
+    }
+  })
+  return {
+    browserValidationByUrl: byUrl,
+    browserValidationChatByUrl: chatByUrl,
+    browserValidationStatusByUrl: statusByUrl,
+  }
+}
+
+function buildChatStateForClient(
+  activeState: ChatSessionState,
+  chats: ProjectChatRecord[],
+): ChatSessionState {
+  const normalizedActive = normalizeChatState(activeState)
+  const mergedValidation = buildMergedBrowserValidationState(normalizedActive, chats)
+  return {
+    ...normalizedActive,
+    browserValidationByUrl: mergedValidation.browserValidationByUrl,
+    browserValidationChatByUrl: mergedValidation.browserValidationChatByUrl,
+    browserValidationStatusByUrl: mergedValidation.browserValidationStatusByUrl,
+  }
+}
+
 async function openProject(projectPath: string) {
   await updateRecents(projectPath)
   const store = await loadProjectStoreState(projectPath)
@@ -638,7 +926,10 @@ async function openProject(projectPath: string) {
     name: path.basename(projectPath),
     activeChatId: activeChat?.id ?? null,
     chats: toChatSummaries(store.chats),
-    state: activeChat?.state ?? createEmptyChatState(),
+    state: buildChatStateForClient(
+      activeChat?.state ?? createEmptyChatState(),
+      store.chats,
+    ),
   }
 }
 
@@ -649,6 +940,8 @@ const chatStateSchema = z.object({
   chat: z.array(z.custom<ChatMessage>()).optional(),
   autoLayoutLocked: z.boolean().optional(),
   browserValidationByUrl: z.record(z.string(), z.custom<BrowserPageValidationRecord>()).optional(),
+  browserValidationChatByUrl: z.record(z.string(), z.string()).optional(),
+  browserValidationStatusByUrl: z.record(z.string(), z.custom<BrowserPageValidationStatusRecord>()).optional(),
 })
 
 export const projectRouter = createTRPCRouter({
@@ -695,7 +988,25 @@ export const projectRouter = createTRPCRouter({
       return {
         chatId: chat.id,
         chats: toChatSummaries(store.chats),
-        state: normalizeChatState(chat.state),
+        state: buildChatStateForClient(chat.state, store.chats),
+      }
+    }),
+  readChatState: baseProcedure
+    .input(
+      z.object({
+        path: z.string(),
+        chatId: z.string().min(1),
+      }),
+    )
+    .mutation(async ({ input }) => {
+      const store = await loadProjectStoreState(input.path)
+      const chat = store.chats.find((item) => item.id === input.chatId)
+      if (!chat) {
+        throw new Error('Chat not found')
+      }
+      return {
+        chatId: chat.id,
+        state: buildChatStateForClient(chat.state, store.chats),
       }
     }),
   createChat: baseProcedure
@@ -705,6 +1016,7 @@ export const projectRouter = createTRPCRouter({
         firstQuestion: z.string().min(1),
         settings: RuntimeSettingsSchema.optional(),
         state: chatStateSchema,
+        activate: z.boolean().optional(),
       }),
     )
     .mutation(async ({ input }) => {
@@ -724,16 +1036,21 @@ export const projectRouter = createTRPCRouter({
           chat: input.state.chat ?? [],
           autoLayoutLocked: input.state.autoLayoutLocked,
           browserValidationByUrl: input.state.browserValidationByUrl,
+          browserValidationChatByUrl: input.state.browserValidationChatByUrl,
+          browserValidationStatusByUrl: input.state.browserValidationStatusByUrl,
         }),
       }
       store.chats = [...store.chats, nextChat]
-      store.activeChatId = nextChat.id
+      const shouldActivate = input.activate ?? true
+      if (shouldActivate) {
+        store.activeChatId = nextChat.id
+      }
       store.updatedAt = now
       await saveProjectStore(input.path, store)
       return {
         chat: toChatSummary(nextChat),
         chats: toChatSummaries(store.chats),
-        activeChatId: nextChat.id,
+        activeChatId: store.activeChatId,
       }
     }),
   renameChat: baseProcedure
@@ -794,7 +1111,10 @@ export const projectRouter = createTRPCRouter({
         deletedChatId: input.chatId,
         activeChatId: activeChat?.id ?? null,
         chats: toChatSummaries(store.chats),
-        state: activeChat?.state ?? createEmptyChatState(),
+        state: buildChatStateForClient(
+          activeChat?.state ?? createEmptyChatState(),
+          store.chats,
+        ),
       }
     }),
   open: baseProcedure
@@ -805,6 +1125,7 @@ export const projectRouter = createTRPCRouter({
       z.object({
         path: z.string(),
         chatId: z.string().nullable().optional(),
+        activate: z.boolean().optional(),
         settings: RuntimeSettingsSchema.optional(),
         state: chatStateSchema,
       }),
@@ -821,6 +1142,8 @@ export const projectRouter = createTRPCRouter({
         chat: input.state.chat ?? [],
         autoLayoutLocked: input.state.autoLayoutLocked,
         browserValidationByUrl: input.state.browserValidationByUrl,
+        browserValidationChatByUrl: input.state.browserValidationChatByUrl,
+        browserValidationStatusByUrl: input.state.browserValidationStatusByUrl,
       })
       let chat = store.chats.find((item) => item.id === input.chatId)
       if (!chat) {
@@ -852,7 +1175,10 @@ export const projectRouter = createTRPCRouter({
           }
         }
       }
-      store.activeChatId = chat.id
+      const shouldActivate = input.activate ?? true
+      if (shouldActivate) {
+        store.activeChatId = chat.id
+      }
       store.updatedAt = now
       await saveProjectStore(input.path, store)
       return { ok: true, chat: toChatSummary(chat) }
