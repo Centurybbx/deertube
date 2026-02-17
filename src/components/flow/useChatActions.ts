@@ -114,8 +114,10 @@ export function useChatActions({
   const asyncValidationAbortControllersRef = useRef<
     Map<string, AbortController>
   >(new Map());
+  const validationResponseByRunJobIdRef = useRef<Map<string, string>>(
+    new Map(),
+  );
   const lastSubmittedPromptRef = useRef("");
-  const mountedRef = useRef(true);
   const [asyncValidationBusy, setAsyncValidationBusy] = useState(false);
 
   const markAsyncValidationBusy = useCallback(() => {
@@ -125,11 +127,21 @@ export function useChatActions({
   }, []);
 
   const handleValidationRunStart = useCallback(
-    (runJobId: string, abortController: AbortController) => {
+    (
+      runJobId: string,
+      abortController: AbortController,
+      context: {
+        responseId: string;
+        toolCallId: string;
+      },
+    ) => {
       asyncValidationAbortControllersRef.current.set(runJobId, abortController);
+      validationResponseByRunJobIdRef.current.set(runJobId, context.responseId);
       logChatValidateManager("run-start", {
         chatId,
         runJobId,
+        responseId: context.responseId,
+        toolCallId: context.toolCallId,
         activeRuns: asyncValidationAbortControllersRef.current.size,
       });
       markAsyncValidationBusy();
@@ -138,11 +150,20 @@ export function useChatActions({
   );
 
   const handleValidationRunFinish = useCallback(
-    (runJobId: string) => {
+    (
+      runJobId: string,
+      context: {
+        responseId: string;
+        toolCallId: string;
+      },
+    ) => {
       asyncValidationAbortControllersRef.current.delete(runJobId);
+      validationResponseByRunJobIdRef.current.delete(runJobId);
       logChatValidateManager("run-finish", {
         chatId,
         runJobId,
+        responseId: context.responseId,
+        toolCallId: context.toolCallId,
         activeRuns: asyncValidationAbortControllersRef.current.size,
       });
       markAsyncValidationBusy();
@@ -160,19 +181,48 @@ export function useChatActions({
       controller.abort();
     });
     asyncValidationAbortControllersRef.current.clear();
+    validationResponseByRunJobIdRef.current.clear();
     markAsyncValidationBusy();
   }, [chatId, markAsyncValidationBusy]);
 
-  useEffect(
-    () => () => {
-      mountedRef.current = false;
-      asyncValidationAbortControllersRef.current.forEach((controller) => {
+  const stopValidationForResponse = useCallback(
+    (responseId: string): boolean => {
+      let stopped = false;
+      asyncValidationAbortControllersRef.current.forEach((controller, runJobId) => {
+        const mappedResponseId =
+          validationResponseByRunJobIdRef.current.get(runJobId);
+        if (mappedResponseId !== responseId) {
+          return;
+        }
+        controller.abort();
+        asyncValidationAbortControllersRef.current.delete(runJobId);
+        validationResponseByRunJobIdRef.current.delete(runJobId);
+        stopped = true;
+      });
+      if (stopped) {
+        logChatValidateManager("manual-stop-response", {
+          chatId,
+          responseId,
+          activeRuns: asyncValidationAbortControllersRef.current.size,
+        });
+        markAsyncValidationBusy();
+      }
+      return stopped;
+    },
+    [chatId, markAsyncValidationBusy],
+  );
+
+  useEffect(() => {
+    const abortControllers = asyncValidationAbortControllersRef.current;
+    const responseByRunJob = validationResponseByRunJobIdRef.current;
+    return () => {
+      abortControllers.forEach((controller) => {
         controller.abort();
       });
-      asyncValidationAbortControllersRef.current.clear();
-    },
-    [],
-  );
+      abortControllers.clear();
+      responseByRunJob.clear();
+    };
+  }, []);
 
   useEffect(() => {
     setDeepResearchConfig(loadDeepResearchConfig(projectPath));
@@ -310,7 +360,6 @@ export function useChatActions({
         runtimeSettings,
         queryOverride: options?.queryOverride ?? lastSubmittedPromptRef.current,
         force: options?.force ?? false,
-        isMounted: () => mountedRef.current,
         setAsyncSubagentEventMessages,
         setAsyncDeepSearchEventMessages,
         onValidationRunStart: handleValidationRunStart,
@@ -371,16 +420,28 @@ export function useChatActions({
     return null;
   }, [messages]);
 
+  const assistantValidationTargetsById = useMemo(() => {
+    const targets = new Map<string, { responseText: string }>();
+    messages.forEach((message) => {
+      if (message.role !== "assistant") {
+        return;
+      }
+      const responseText = extractUiMessageText(message).trim();
+      if (!responseText) {
+        return;
+      }
+      targets.set(message.id, { responseText });
+    });
+    return targets;
+  }, [messages]);
+
   const latestUserValidationQuery = useMemo(() => {
     for (let index = messages.length - 1; index >= 0; index -= 1) {
       const message = messages[index];
       if (message.role !== "user") {
         continue;
       }
-      if (!("content" in message) || typeof message.content !== "string") {
-        continue;
-      }
-      const query = message.content.trim();
+      const query = extractUiMessageText(message).trim();
       if (query.length > 0) {
         return query;
       }
@@ -388,7 +449,79 @@ export function useChatActions({
     return lastSubmittedPromptRef.current.trim();
   }, [messages]);
 
+  const resolveValidationQueryForResponse = useCallback(
+    (responseId: string, responseText: string): string => {
+      const responseIndex = messages.findIndex(
+        (message) => message.id === responseId,
+      );
+      if (responseIndex >= 0) {
+        for (let index = responseIndex - 1; index >= 0; index -= 1) {
+          const message = messages[index];
+          if (message.role !== "user") {
+            continue;
+          }
+          const query = extractUiMessageText(message).trim();
+          if (query.length > 0) {
+            return query;
+          }
+        }
+      }
+      return latestUserValidationQuery.trim() || responseText.trim();
+    },
+    [latestUserValidationQuery, messages],
+  );
+
   const canValidateCurrentChat = latestAssistantValidationTarget !== null;
+  const canGenerateGraphCurrentChat = latestAssistantValidationTarget !== null;
+
+  const toggleValidateResponse = useCallback(
+    (responseId: string) => {
+      const target = assistantValidationTargetsById.get(responseId);
+      if (!target) {
+        logChatValidateManager("manual-skip-missing-response", {
+          chatId,
+          responseId,
+        });
+        return;
+      }
+      const stopped = stopValidationForResponse(responseId);
+      if (stopped) {
+        return;
+      }
+      const queryOverride = resolveValidationQueryForResponse(
+        responseId,
+        target.responseText,
+      );
+      logChatValidateManager("manual-start-response", {
+        chatId,
+        responseId,
+        queryLength: queryOverride.length,
+        answerLength: target.responseText.length,
+      });
+      void runPostAnswerValidation(responseId, target.responseText, {
+        force: true,
+        queryOverride,
+      });
+    },
+    [
+      assistantValidationTargetsById,
+      chatId,
+      resolveValidationQueryForResponse,
+      runPostAnswerValidation,
+      stopValidationForResponse,
+    ],
+  );
+
+  const generateGraphResponse = useCallback(
+    (responseId: string) => {
+      const target = assistantValidationTargetsById.get(responseId);
+      if (!target || graphBusy) {
+        return;
+      }
+      void runGraphTools(responseId, target.responseText);
+    },
+    [assistantValidationTargetsById, graphBusy, runGraphTools],
+  );
 
   const validateCurrentChat = useCallback(() => {
     const target = latestAssistantValidationTarget;
@@ -398,24 +531,16 @@ export function useChatActions({
       });
       return;
     }
-    const queryOverride =
-      latestUserValidationQuery.trim() || target.responseText.trim();
-    logChatValidateManager("manual-start", {
-      chatId,
-      responseId: target.responseId,
-      queryLength: queryOverride.length,
-      answerLength: target.responseText.length,
-    });
-    void runPostAnswerValidation(target.responseId, target.responseText, {
-      force: true,
-      queryOverride,
-    });
-  }, [
-    chatId,
-    latestAssistantValidationTarget,
-    latestUserValidationQuery,
-    runPostAnswerValidation,
-  ]);
+    toggleValidateResponse(target.responseId);
+  }, [chatId, latestAssistantValidationTarget, toggleValidateResponse]);
+
+  const generateGraphCurrentChat = useCallback(() => {
+    const target = latestAssistantValidationTarget;
+    if (!target) {
+      return;
+    }
+    generateGraphResponse(target.responseId);
+  }, [generateGraphResponse, latestAssistantValidationTarget]);
   useEffect(() => {
     if (!chatId) {
       return;
@@ -561,6 +686,10 @@ export function useChatActions({
     asyncTaskBusy: asyncValidationBusy,
     canValidateCurrentChat,
     validateCurrentChat,
+    toggleValidateResponse,
+    canGenerateGraphCurrentChat,
+    generateGraphCurrentChat,
+    generateGraphResponse,
     handleSendFromHistory,
     handleSendFromPanel,
     stopChatGeneration,

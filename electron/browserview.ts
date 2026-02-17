@@ -899,6 +899,21 @@ class BrowserViewController {
     this.pendingHighlights.delete(tabId);
   }
 
+  closeAll() {
+    const window = this.window;
+    this.views.forEach((view, tabId) => {
+      view.setVisible(false);
+      if (window) {
+        window.contentView.removeChildView(view);
+      }
+      this.senderToTab.delete(view.webContents.id);
+      this.pendingHighlights.delete(tabId);
+    });
+    this.views.clear();
+    this.viewState.clear();
+    this.pendingHighlights.clear();
+  }
+
   openExternal(url: string) {
     if (isAllowedUrl(url)) {
       void shell.openExternal(url);

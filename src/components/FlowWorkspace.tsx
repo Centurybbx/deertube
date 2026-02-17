@@ -71,6 +71,7 @@ import { buildValidationGraphInsertion } from "./flow/validate-graph";
 import {
   buildCompletedValidationEvent,
   buildFailedValidationEvent,
+  buildPageValidationSummaryMessage,
   createPageValidationChatSeed,
   upsertChatMessage,
 } from "./flow/page-validation-chat";
@@ -116,6 +117,7 @@ import {
   startRunningChatJob,
   subscribeRunningChatJobs,
 } from "@/lib/running-chat-jobs";
+import { browserTabHistoryStoreApi } from "@/lib/browser-tab-history-store";
 import {
   BROWSER_TAB_PREFIX,
   CHAT_TABSET_ID,
@@ -421,6 +423,7 @@ const applyRunningStatusToSummaries = (
 
 interface FlowWorkspaceInnerProps extends FlowWorkspaceProps {
   sessionSlotId: string;
+  isActive: boolean;
   activeChatId: string | null;
   pendingBrowserTransfer: BrowserTabTransferRequest | null;
   chatSummaries: ProjectChatSummary[];
@@ -444,6 +447,7 @@ interface FlowWorkspaceInnerProps extends FlowWorkspaceProps {
 }
 
 function FlowWorkspaceLoader(props: FlowWorkspaceProps) {
+  const workspaceVisible = props.isVisible ?? true;
   const [sessions, setSessions] = useState<FlowWorkspaceSession[]>([]);
   const [activeSlotId, setActiveSlotId] = useState<string | null>(null);
   const [chatSummaries, setChatSummaries] = useState<ProjectChatSummary[]>([]);
@@ -480,9 +484,13 @@ function FlowWorkspaceLoader(props: FlowWorkspaceProps) {
   useEffect(() => {
     let cancelled = false;
     const samePath = lastPathRef.current === props.project.path;
+    const previousPath = lastPathRef.current;
     lastPathRef.current = props.project.path;
     setLoading(true);
     if (!samePath) {
+      if (previousPath) {
+        void trpc.browserView.closeAll.mutate();
+      }
       setSessions([]);
       setActiveSlotId(null);
       setChatSummaries([]);
@@ -874,6 +882,7 @@ function FlowWorkspaceLoader(props: FlowWorkspaceProps) {
           <FlowWorkspaceInner
             {...props}
             sessionSlotId={session.slotId}
+            isActive={workspaceVisible && session.slotId === activeSlotId}
             initialState={session.initialState}
             activeChatId={session.chatId}
             pendingBrowserTransfer={session.pendingBrowserTransfer}
@@ -903,6 +912,7 @@ function FlowWorkspaceLoader(props: FlowWorkspaceProps) {
 function FlowWorkspaceInner({
   project,
   sessionSlotId,
+  isActive,
   initialState,
   activeChatId,
   pendingBrowserTransfer,
@@ -994,7 +1004,53 @@ function FlowWorkspaceInner({
   >(null);
   const autoLayoutLastCountRef = useRef<number | null>(null);
   const viewportRef = useRef<Viewport>({ x: 0, y: 0, zoom: 1 });
+  const browserHistorySessionId = useMemo(
+    () => `${project.path}::${sessionSlotId}`,
+    [project.path, sessionSlotId],
+  );
+  const getBrowserNavigationState = useCallback(
+    (tabId: string) =>
+      browserTabHistoryStoreApi
+        .getState()
+        .getNavigationState(browserHistorySessionId, tabId),
+    [browserHistorySessionId],
+  );
+  const pushBrowserHistoryUrl = useCallback(
+    (tabId: string, url: string) =>
+      browserTabHistoryStoreApi
+        .getState()
+        .pushUrl(browserHistorySessionId, tabId, url),
+    [browserHistorySessionId],
+  );
+  const stepBrowserHistoryBack = useCallback(
+    (tabId: string) =>
+      browserTabHistoryStoreApi.getState().stepBack(browserHistorySessionId, tabId),
+    [browserHistorySessionId],
+  );
+  const stepBrowserHistoryForward = useCallback(
+    (tabId: string) =>
+      browserTabHistoryStoreApi
+        .getState()
+        .stepForward(browserHistorySessionId, tabId),
+    [browserHistorySessionId],
+  );
+  const removeBrowserHistoryTab = useCallback(
+    (tabId: string) =>
+      browserTabHistoryStoreApi.getState().removeTab(browserHistorySessionId, tabId),
+    [browserHistorySessionId],
+  );
   const { getNode } = useReactFlow();
+
+  const syncBrowserHistoryForUrl = useCallback(
+    (tabId: string, url: string) => {
+      const normalized = normalizeHttpUrl(url);
+      if (!normalized) {
+        return getBrowserNavigationState(tabId);
+      }
+      return pushBrowserHistoryUrl(tabId, normalized);
+    },
+    [getBrowserNavigationState, pushBrowserHistoryUrl],
+  );
 
   const setValidationStatusForUrls = useCallback(
     ({
@@ -1152,15 +1208,13 @@ function FlowWorkspaceInner({
     setPanelInput,
     deepResearchConfig,
     setDeepResearchConfig,
-    graphGenerationEnabled,
-    setGraphGenerationEnabled,
     messages: chatMessages,
     busy,
     chatBusy,
     graphBusy,
     asyncTaskBusy,
-    canValidateCurrentChat,
-    validateCurrentChat,
+    toggleValidateResponse,
+    generateGraphResponse,
     retryMessage,
     handleSendFromHistory,
     handleSendFromPanel,
@@ -1403,9 +1457,10 @@ function FlowWorkspaceInner({
       tabs.forEach((tab) => {
         void trpc.browserView.close.mutate({ tabId: tab.id });
       });
+      browserTabHistoryStoreApi.getState().clearSession(browserHistorySessionId);
       void trpc.browserView.hide.mutate();
     };
-  }, []);
+  }, [browserHistorySessionId]);
 
   const selectedResponseId = useMemo(() => {
     const selectedNode = nodes.find((node) => node.id === selectedId);
@@ -1428,13 +1483,16 @@ function FlowWorkspaceInner({
   useEffect(() => {
     const layout = layoutModel.layout as FlexLayoutNode | undefined;
     const existingIds = collectBrowserTabIds(layout);
-    const visibleIds = collectVisibleBrowserTabIds(layout);
+    const visibleIds = isActive
+      ? collectVisibleBrowserTabIds(layout)
+      : new Set<string>();
     visibleBrowserTabsRef.current = visibleIds;
     const previousIds = previousBrowserTabIdsRef.current;
     previousIds.forEach((tabId) => {
       if (!existingIds.has(tabId)) {
         void trpc.browserView.close.mutate({ tabId });
         openedBrowserTabsRef.current.delete(tabId);
+        removeBrowserHistoryTab(tabId);
       }
     });
     previousBrowserTabIdsRef.current = existingIds;
@@ -1448,6 +1506,12 @@ function FlowWorkspaceInner({
       });
       return next;
     });
+    if (!isActive) {
+      existingIds.forEach((tabId) => {
+        void trpc.browserView.hideTab.mutate({ tabId });
+      });
+      return;
+    }
     const boundsMap = browserBoundsRef.current;
     const tabs = browserTabsRef.current;
     const tabLookup = new Map(tabs.map((tab) => [tab.id, tab]));
@@ -1478,7 +1542,7 @@ function FlowWorkspaceInner({
         bounds,
       });
     });
-  }, [layoutModel]);
+  }, [isActive, layoutModel, removeBrowserHistoryTab]);
 
   useEffect(() => {
     const ipc = window.ipcRenderer;
@@ -1493,28 +1557,27 @@ function FlowWorkspaceInner({
         return;
       }
       setBrowserTabs((prev) =>
-        prev.map((tab) =>
-          {
-            if (tab.id !== payload.tabId) {
-              return tab;
-            }
-            const nextUrl = payload.url ?? tab.url;
-            const urlChanged = nextUrl !== tab.url;
-            return {
-              ...tab,
-              url: nextUrl,
-              title: payload.title ?? tab.title,
-              canGoBack: payload.canGoBack ?? tab.canGoBack,
-              canGoForward: payload.canGoForward ?? tab.canGoForward,
-              isLoading: payload.isLoading ?? tab.isLoading,
-              validationStatus: urlChanged ? undefined : tab.validationStatus,
-              validationError: urlChanged ? undefined : tab.validationError,
-              validationFailureReason: urlChanged
-                ? undefined
-                : tab.validationFailureReason,
-            };
-          },
-        ),
+        prev.map((tab) => {
+          if (tab.id !== payload.tabId) {
+            return tab;
+          }
+          const nextUrl = payload.url ?? tab.url;
+          const urlChanged = nextUrl !== tab.url;
+          const navigation = syncBrowserHistoryForUrl(tab.id, nextUrl);
+          return {
+            ...tab,
+            url: nextUrl,
+            title: payload.title ?? tab.title,
+            canGoBack: navigation.canGoBack,
+            canGoForward: navigation.canGoForward,
+            isLoading: payload.isLoading ?? tab.isLoading,
+            validationStatus: urlChanged ? undefined : tab.validationStatus,
+            validationError: urlChanged ? undefined : tab.validationError,
+            validationFailureReason: urlChanged
+              ? undefined
+              : tab.validationFailureReason,
+          };
+        }),
       );
     };
     const handleSelection = (
@@ -1538,7 +1601,7 @@ function FlowWorkspaceInner({
       ipc.off("browserview-state", handleState);
       ipc.off("browserview-selection", handleSelection);
     };
-  }, []);
+  }, [syncBrowserHistoryForUrl]);
 
   const persistCurrentChatStateNow = useCallback(async () => {
     if (!saveEnabled) {
@@ -1971,9 +2034,14 @@ function FlowWorkspaceInner({
           sources: normalizedSources,
           references: normalizedReferences,
         });
+        const summaryMessage = buildPageValidationSummaryMessage({
+          toolCallId: seed.toolCallId,
+          query,
+          references: normalizedReferences,
+        });
         const completedMessages = upsertChatMessage(
-          runningMessages,
-          completedEvent,
+          upsertChatMessage(runningMessages, completedEvent),
+          summaryMessage,
         );
         const pageMapping: Record<string, string> = {
           [normalizedTabUrl]: chatId,
@@ -2362,12 +2430,15 @@ function FlowWorkspaceInner({
       }
       const existing = browserTabs.find((tab) => tab.url === normalized);
       if (existing) {
+        const navigation = pushBrowserHistoryUrl(existing.id, normalized);
         setBrowserTabs((prev) =>
           prev.map((tab) =>
             tab.id === existing.id
               ? {
                   ...tab,
                   referenceHighlight,
+                  canGoBack: navigation.canGoBack,
+                  canGoForward: navigation.canGoForward,
                 }
               : tab,
           ),
@@ -2378,10 +2449,13 @@ function FlowWorkspaceInner({
 
       const tabId = `browser-${crypto.randomUUID()}`;
       const resolvedLabel = normalizeBrowserLabel(label);
+      const navigation = pushBrowserHistoryUrl(tabId, normalized);
       const nextTab: BrowserViewTabState = {
         id: tabId,
         url: normalized,
         title: resolvedLabel,
+        canGoBack: navigation.canGoBack,
+        canGoForward: navigation.canGoForward,
         isLoading: true,
         referenceHighlight,
       };
@@ -2422,7 +2496,13 @@ function FlowWorkspaceInner({
       handleLayoutChange(model.toJson());
       return tabId;
     },
-    [browserTabs, handleLayoutChange, layoutModel, selectBrowserTab],
+    [
+      browserTabs,
+      handleLayoutChange,
+      layoutModel,
+      pushBrowserHistoryUrl,
+      selectBrowserTab,
+    ],
   );
 
   const scheduleBrowserReferenceHighlight = useCallback(
@@ -2580,6 +2660,9 @@ function FlowWorkspaceInner({
   );
 
   useEffect(() => {
+    if (!isActive) {
+      return;
+    }
     if (!pendingBrowserTransfer) {
       return;
     }
@@ -2604,6 +2687,7 @@ function FlowWorkspaceInner({
     }
     onConsumePendingBrowserTransfer(sessionSlotId, requestId);
   }, [
+    isActive,
     onConsumePendingBrowserTransfer,
     openBrowserUrl,
     openCdpUrl,
@@ -2616,6 +2700,10 @@ function FlowWorkspaceInner({
   const handleBrowserBoundsChange = useCallback(
     (tabId: string, bounds: BrowserViewBounds) => {
       setBrowserBounds((prev) => ({ ...prev, [tabId]: bounds }));
+      if (!isActive) {
+        void trpc.browserView.hideTab.mutate({ tabId });
+        return;
+      }
       if (bounds.width <= 1 || bounds.height <= 1) {
         void trpc.browserView.hideTab.mutate({ tabId });
         return;
@@ -2638,16 +2726,80 @@ function FlowWorkspaceInner({
         bounds,
       });
     },
-    [browserTabMap],
+    [browserTabMap, isActive],
   );
 
-  const handleBrowserBack = useCallback((tabId: string) => {
-    void trpc.browserView.back.mutate({ tabId });
-  }, []);
+  const handleBrowserBack = useCallback(
+    (tabId: string) => {
+      const { targetUrl, navigation } = stepBrowserHistoryBack(tabId);
+      if (!targetUrl) {
+        return;
+      }
+      setBrowserTabs((prev) =>
+        prev.map((tab) =>
+          tab.id === tabId
+            ? {
+                ...tab,
+                url: targetUrl,
+                canGoBack: navigation.canGoBack,
+                canGoForward: navigation.canGoForward,
+                isLoading: true,
+              }
+            : tab,
+        ),
+      );
+      if (!isActive) {
+        return;
+      }
+      const bounds = browserBoundsRef.current[tabId];
+      if (!bounds) {
+        return;
+      }
+      void trpc.browserView.open.mutate({
+        tabId,
+        url: targetUrl,
+        bounds,
+      });
+      openedBrowserTabsRef.current.add(tabId);
+    },
+    [isActive, stepBrowserHistoryBack],
+  );
 
-  const handleBrowserForward = useCallback((tabId: string) => {
-    void trpc.browserView.forward.mutate({ tabId });
-  }, []);
+  const handleBrowserForward = useCallback(
+    (tabId: string) => {
+      const { targetUrl, navigation } = stepBrowserHistoryForward(tabId);
+      if (!targetUrl) {
+        return;
+      }
+      setBrowserTabs((prev) =>
+        prev.map((tab) =>
+          tab.id === tabId
+            ? {
+                ...tab,
+                url: targetUrl,
+                canGoBack: navigation.canGoBack,
+                canGoForward: navigation.canGoForward,
+                isLoading: true,
+              }
+            : tab,
+        ),
+      );
+      if (!isActive) {
+        return;
+      }
+      const bounds = browserBoundsRef.current[tabId];
+      if (!bounds) {
+        return;
+      }
+      void trpc.browserView.open.mutate({
+        tabId,
+        url: targetUrl,
+        bounds,
+      });
+      openedBrowserTabsRef.current.add(tabId);
+    },
+    [isActive, stepBrowserHistoryForward],
+  );
 
   const handleBrowserReload = useCallback((tabId: string) => {
     void trpc.browserView.reload.mutate({ tabId });
@@ -2832,12 +2984,15 @@ function FlowWorkspaceInner({
       if (!normalizedUrl) {
         return;
       }
+      const navigation = pushBrowserHistoryUrl(tabId, normalizedUrl);
       setBrowserTabs((prev) =>
         prev.map((tab) =>
           tab.id === tabId
             ? {
                 ...tab,
                 url: normalizedUrl,
+                canGoBack: navigation.canGoBack,
+                canGoForward: navigation.canGoForward,
                 title: undefined,
                 isLoading: true,
                 referenceHighlight: undefined,
@@ -2848,7 +3003,10 @@ function FlowWorkspaceInner({
             : tab,
         ),
       );
-      const bounds = browserBounds[tabId];
+      if (!isActive) {
+        return;
+      }
+      const bounds = browserBoundsRef.current[tabId];
       if (bounds) {
         void trpc.browserView.open.mutate({
           tabId,
@@ -2858,7 +3016,7 @@ function FlowWorkspaceInner({
         openedBrowserTabsRef.current.add(tabId);
       }
     },
-    [browserBounds],
+    [isActive, pushBrowserHistoryUrl],
   );
 
   const handleInsertBrowserSelection = useCallback(
@@ -3223,13 +3381,11 @@ function FlowWorkspaceInner({
           input={historyInput}
           deepResearchConfig={deepResearchConfig}
           onDeepResearchConfigChange={setDeepResearchConfig}
-          graphGenerationEnabled={graphGenerationEnabled}
-          onGraphGenerationEnabledChange={setGraphGenerationEnabled}
           busy={chatBusy}
           asyncBusy={asyncTaskBusy}
-          canValidateChat={canValidateCurrentChat}
-          onValidateChat={validateCurrentChat}
           graphBusy={graphBusy}
+          onToggleValidateResponse={toggleValidateResponse}
+          onGenerateGraphResponse={generateGraphResponse}
           onInputChange={setHistoryInput}
           onSend={handleSendFromHistory}
           onStop={stopChatGeneration}

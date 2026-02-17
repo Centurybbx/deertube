@@ -61,6 +61,11 @@ export const browserViewRouter = createTRPCRouter({
       controller.close(input.tabId);
       return { ok: true };
     }),
+  closeAll: baseProcedure.mutation(() => {
+    const controller = getBrowserViewController();
+    controller.closeAll();
+    return { ok: true };
+  }),
   reload: baseProcedure
     .input(z.object({ tabId: z.string() }))
     .mutation(({ input }) => {

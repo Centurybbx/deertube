@@ -16,6 +16,25 @@ const normalizeLine = (value: string | undefined): string | undefined => {
 const clampText = (value: string, limit: number): string =>
   value.length > limit ? `${value.slice(0, limit)}...` : value;
 
+const normalizeInline = (value: string | undefined): string | undefined => {
+  const trimmed = value?.replace(/\s+/g, " ").trim();
+  return trimmed && trimmed.length > 0 ? trimmed : undefined;
+};
+
+const formatAccuracy = (
+  accuracy: DeepSearchReferencePayload["accuracy"],
+): string | undefined => {
+  if (!accuracy) {
+    return undefined;
+  }
+  if (accuracy === "high") return "High";
+  if (accuracy === "medium") return "Medium";
+  if (accuracy === "low") return "Low";
+  if (accuracy === "conflicting") return "Conflicting";
+  if (accuracy === "insufficient") return "Insufficient";
+  return undefined;
+};
+
 const buildValidationPrompt = ({
   pageUrl,
   pageTitle,
@@ -171,6 +190,46 @@ export const buildFailedValidationEvent = ({
     toolStatus: "failed",
     toolOutput: payload,
     error: errorMessage,
+  };
+};
+
+export const buildPageValidationSummaryMessage = ({
+  toolCallId,
+  query,
+  references,
+}: {
+  toolCallId: string;
+  query: string;
+  references: DeepSearchReferencePayload[];
+}): ChatMessage => {
+  const summaryId = `validate-page-summary-${toolCallId}`;
+  const header = `Validation claims for: ${clampText(query, 180)}`;
+  const claimLines = references.slice(0, 12).map((reference, index) => {
+    const uri = normalizeInline(reference.uri);
+    const refLabel =
+      typeof reference.refId === "number" ? `Ref ${reference.refId}` : `Ref ${index + 1}`;
+    const marker = uri ? `[${refLabel}](${uri})` : undefined;
+    const viewpoint =
+      normalizeInline(reference.viewpoint) ??
+      normalizeInline(reference.title) ??
+      `Claim ${index + 1}`;
+    const accuracy = formatAccuracy(reference.accuracy);
+    if (!marker) {
+      return accuracy ? `- ${viewpoint} (${accuracy})` : `- ${viewpoint}`;
+    }
+    return accuracy ? `- ${viewpoint} ${marker} (${accuracy})` : `- ${viewpoint} ${marker}`;
+  });
+  const content =
+    claimLines.length > 0
+      ? [header, "", ...claimLines].join("\n")
+      : `${header}\n\nNo validated references were returned.`;
+  return {
+    id: summaryId,
+    role: "assistant",
+    content,
+    createdAt: new Date().toISOString(),
+    status: "complete",
+    kind: "text",
   };
 };
 

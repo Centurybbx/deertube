@@ -1,10 +1,11 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 import type { FlowEdge, FlowNode } from './types/flow'
 import type { ChatMessage } from './types/chat'
 import ProjectPicker, { type ProjectOpenResult } from './components/ProjectPicker'
 import FlowWorkspace from './components/FlowWorkspace'
 import { applyTheme, getInitialTheme, THEME_STORAGE_KEY, type Theme } from './lib/theme'
 import { trpc } from './lib/trpc'
+import { listRunningChatIds, subscribeRunningChatJobs } from './lib/running-chat-jobs'
 
 interface ProjectInfo {
   path: string
@@ -36,6 +37,9 @@ const toProjectState = (result: ProjectOpenResult): ProjectState => ({
 function App() {
   const [projectSessions, setProjectSessions] = useState<WorkspaceSession[]>([])
   const [activeProjectPath, setActiveProjectPath] = useState<string | null>(null)
+  const [runningProjectPaths, setRunningProjectPaths] = useState<Set<string>>(
+    () => new Set(),
+  )
   const [initializing, setInitializing] = useState(true)
   const [theme, setTheme] = useState<Theme>(() => getInitialTheme())
 
@@ -88,6 +92,32 @@ function App() {
     }
   }, [handleOpen])
 
+  useEffect(() => {
+    const refresh = () => {
+      setRunningProjectPaths(() => {
+        const next = new Set<string>()
+        projectSessions.forEach((session) => {
+          if (listRunningChatIds(session.project.path).size > 0) {
+            next.add(session.project.path)
+          }
+        })
+        return next
+      })
+    }
+    refresh()
+    return subscribeRunningChatJobs(refresh)
+  }, [projectSessions])
+
+  const mountedProjectSessions = useMemo(
+    () =>
+      projectSessions.filter(
+        (session) =>
+          session.project.path === activeProjectPath ||
+          runningProjectPaths.has(session.project.path),
+      ),
+    [activeProjectPath, projectSessions, runningProjectPaths],
+  )
+
   if (initializing && projectSessions.length === 0) {
     return (
       <div className="flex h-screen w-screen items-center justify-center bg-gradient-to-br from-[var(--surface-1)] via-[var(--surface-2)] to-[var(--surface-3)] text-foreground">
@@ -100,24 +130,28 @@ function App() {
 
   return (
     <div className="h-screen w-screen">
-      {projectSessions.map((session) => (
-        <div
-          key={session.project.path}
-          className={session.project.path === activeProjectPath ? 'h-full w-full' : 'hidden'}
-        >
-          <FlowWorkspace
-            project={session.project}
-            initialState={session.initialState}
-            theme={theme}
-            onToggleTheme={() =>
-              setTheme((prev) => (prev === 'dark' ? 'light' : 'dark'))
-            }
-            onExit={() => {
-              setActiveProjectPath(null)
-            }}
-          />
-        </div>
-      ))}
+      {mountedProjectSessions.map((session) => {
+        const isProjectVisible = session.project.path === activeProjectPath
+        return (
+          <div
+            key={session.project.path}
+            className={isProjectVisible ? 'h-full w-full' : 'hidden'}
+          >
+            <FlowWorkspace
+              project={session.project}
+              initialState={session.initialState}
+              isVisible={isProjectVisible}
+              theme={theme}
+              onToggleTheme={() =>
+                setTheme((prev) => (prev === 'dark' ? 'light' : 'dark'))
+              }
+              onExit={() => {
+                setActiveProjectPath(null)
+              }}
+            />
+          </div>
+        )
+      })}
       {activeProjectPath ? null : (
         <ProjectPicker onOpen={handleOpen} />
       )}

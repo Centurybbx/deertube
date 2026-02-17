@@ -13,7 +13,10 @@ import type {
   SubagentStreamPayload,
 } from "../../../src/modules/ai/tools/types";
 import { createTools } from "../../../src/modules/ai/tools";
-import { createDeepResearchPersistenceAdapter } from "../../deepresearch/store";
+import {
+  createDeepResearchPersistenceAdapter,
+  resolveDeepResearchReference,
+} from "../../deepresearch/store";
 import {
   buildMainAgentSystemPrompt,
   DeepResearchConfigSchema,
@@ -160,6 +163,90 @@ const trimOrUndefined = (value?: string): string | undefined => {
   return trimmed && trimmed.length > 0 ? trimmed : undefined;
 };
 
+const clampText = (value: string, maxLength: number): string =>
+  value.length > maxLength ? `${value.slice(0, maxLength - 3)}...` : value;
+
+const DEERTUBE_URI_PATTERN = /deertube:\/\/[^\s)\]]+/gi;
+const MARKDOWN_DEERTUBE_URI_PATTERN = /\[[^\]]+\]\((deertube:\/\/[^)\s]+)\)/gi;
+const VALIDATE_CONTEXT_REF_LIMIT = 8;
+const VALIDATE_CONTEXT_VIEWPOINT_MAX = 240;
+const VALIDATE_CONTEXT_EXCERPT_MAX = 360;
+
+const extractDeertubeUrisFromText = (input: string): string[] => {
+  const dedupe = new Set<string>();
+  for (const markdownMatch of input.matchAll(MARKDOWN_DEERTUBE_URI_PATTERN)) {
+    const normalized = trimOrUndefined(markdownMatch[1]);
+    if (normalized) {
+      dedupe.add(normalized);
+    }
+  }
+  for (const rawMatch of input.matchAll(DEERTUBE_URI_PATTERN)) {
+    const normalized = trimOrUndefined(rawMatch[0]);
+    if (normalized) {
+      dedupe.add(normalized);
+    }
+  }
+  return Array.from(dedupe.values());
+};
+
+const resolveReferencedContextForValidation = async (
+  projectPath: string,
+  answer: string,
+): Promise<{ context: string; resolvedCount: number }> => {
+  const uris = extractDeertubeUrisFromText(answer).slice(
+    0,
+    VALIDATE_CONTEXT_REF_LIMIT,
+  );
+  if (uris.length === 0) {
+    return { context: "", resolvedCount: 0 };
+  }
+  const resolvedReferences = (
+    await Promise.all(
+      uris.map(async (uri) => {
+        try {
+          return await resolveDeepResearchReference(projectPath, uri);
+        } catch (error) {
+          console.warn(VALIDATE_LOG_PREFIX, {
+            status: "resolve-reference-failed",
+            uri,
+            message: error instanceof Error ? error.message : String(error),
+          });
+          return null;
+        }
+      }),
+    )
+  ).filter(
+    (reference): reference is NonNullable<typeof reference> =>
+      reference !== null,
+  );
+  if (resolvedReferences.length === 0) {
+    return { context: "", resolvedCount: 0 };
+  }
+  const contextLines = [
+    "Answer-cited references (reuse before launching extra validation search):",
+    ...resolvedReferences.map((reference, index) => {
+      const title = trimOrUndefined(reference.title) ?? reference.url;
+      const excerpt = trimOrUndefined(
+        reference.validationRefContent ?? reference.text,
+      );
+      const excerptLine = excerpt
+        ? clampText(excerpt, VALIDATE_CONTEXT_EXCERPT_MAX)
+        : "No excerpt.";
+      return [
+        `[${index + 1}] ${title}`,
+        `URI: ${reference.uri}`,
+        `URL: ${reference.url}`,
+        `Viewpoint: ${clampText(reference.viewpoint, VALIDATE_CONTEXT_VIEWPOINT_MAX)}`,
+        `Excerpt: ${excerptLine}`,
+      ].join("\n");
+    }),
+  ];
+  return {
+    context: contextLines.join("\n\n"),
+    resolvedCount: resolvedReferences.length,
+  };
+};
+
 const buildLegacyModelSettings = (
   settings: RuntimeSettings | undefined,
 ): ModelSettings | undefined => {
@@ -290,12 +377,21 @@ const runValidateForInput = async (
       }
     : deepResearchConfig;
   const query = input.query.trim();
+  const answer = input.answer.trim();
+  const existingRefContext = await resolveReferencedContextForValidation(
+    input.projectPath,
+    answer,
+  );
+  const validateTargetAnswer = existingRefContext.context
+    ? `${answer}\n\n${existingRefContext.context}`
+    : answer;
   console.log(VALIDATE_LOG_PREFIX, {
     query: query.slice(0, 180),
     validateEnabled:
       deepResearchConfig.enabled && deepResearchConfig.validate.enabled,
     forced: forceValidate,
     aborted: Boolean(abortSignal?.aborted),
+    answerRefsResolved: existingRefContext.resolvedCount,
   });
   if (
     !forceValidate &&
@@ -347,7 +443,7 @@ const runValidateForInput = async (
     deepResearchConfig: effectiveDeepResearchConfig,
     externalSkills,
     mode: "validate",
-    validateTargetAnswer: input.answer,
+    validateTargetAnswer,
     onSubagentStream: (payload) => {
       onStreamEvent?.({
         type: "subagent-stream",

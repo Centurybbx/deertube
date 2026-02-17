@@ -49,7 +49,7 @@ const TOOLTIP_WIDTH = 320;
 const TOOLTIP_HEIGHT = 184;
 const TOOLTIP_MARGIN = 12;
 const TOOLTIP_GAP = 10;
-const TOOLTIP_HIDE_DELAY_MS = 220;
+const TOOLTIP_HIDE_DELAY_MS = 160;
 
 const resolveReferenceTitle = (reference: MarkdownReferencePreview): string => {
   const trimmed = reference.title?.trim();
@@ -94,6 +94,7 @@ interface MarkdownRendererProps {
   source: string;
   className?: string;
   highlightExcerpt?: string;
+  referenceAccuracyHints?: Record<string, MarkdownReferencePreview["accuracy"]>;
   onNodeLinkClick?: (nodeId: string) => void;
   onReferenceClick?: (url: string, label?: string) => void;
   resolveReferencePreview?: (
@@ -108,6 +109,7 @@ export const MarkdownRenderer = memo(
     source,
     className,
     highlightExcerpt,
+    referenceAccuracyHints,
     onNodeLinkClick,
     onReferenceClick,
     resolveReferencePreview,
@@ -123,11 +125,22 @@ export const MarkdownRenderer = memo(
     const tooltipScrollRafRef = useRef<number | null>(null);
     const tooltipHideTimerRef = useRef<number | null>(null);
     const hoveredReferenceUriRef = useRef<string | null>(null);
+    const lastReferenceActivationRef = useRef<{
+      href: string;
+      timestamp: number;
+    } | null>(null);
     const [referenceTooltip, setReferenceTooltip] =
       useState<ReferenceTooltipState | null>(null);
     const [referenceAccuracyByUri, setReferenceAccuracyByUri] = useState<
       Record<string, MarkdownReferencePreview["accuracy"]>
     >({});
+    const mergedReferenceAccuracyByUri = useMemo(
+      () => ({
+        ...(referenceAccuracyHints ?? {}),
+        ...referenceAccuracyByUri,
+      }),
+      [referenceAccuracyByUri, referenceAccuracyHints],
+    );
 
     const clearTooltipHideTimer = useCallback(() => {
       if (tooltipHideTimerRef.current !== null) {
@@ -224,19 +237,17 @@ export const MarkdownRenderer = memo(
       };
     }, [referenceTooltip, stopTooltipScrollAnimation]);
 
-    const resolveTooltipPosition = useCallback((clientX: number, clientY: number) => {
-      let left = clientX - TOOLTIP_WIDTH - TOOLTIP_GAP;
-      if (left < TOOLTIP_MARGIN) {
-        left = clientX + TOOLTIP_GAP;
-      }
-      const maxLeft = window.innerWidth - TOOLTIP_WIDTH - TOOLTIP_MARGIN;
-      if (left > maxLeft) {
-        left = maxLeft;
+    const resolveTooltipPosition = useCallback((anchor: HTMLElement) => {
+      const rect = anchor.getBoundingClientRect();
+      const centerY = rect.top + rect.height / 2;
+      let left = rect.right + TOOLTIP_GAP;
+      if (left + TOOLTIP_WIDTH > window.innerWidth - TOOLTIP_MARGIN) {
+        left = rect.left - TOOLTIP_WIDTH - TOOLTIP_GAP;
       }
       if (left < TOOLTIP_MARGIN) {
         left = TOOLTIP_MARGIN;
       }
-      let top = clientY - TOOLTIP_HEIGHT / 2;
+      let top = centerY - TOOLTIP_HEIGHT / 2;
       const maxTop = window.innerHeight - TOOLTIP_HEIGHT - TOOLTIP_MARGIN;
       if (top > maxTop) {
         top = maxTop;
@@ -264,12 +275,12 @@ export const MarkdownRenderer = memo(
     }, [clearTooltipHideTimer, stopTooltipScrollAnimation]);
 
     const showReferenceTooltip = useCallback(
-      async (uri: string, clientX: number, clientY: number) => {
+      async (uri: string, anchor: HTMLElement) => {
         if (!resolveReferencePreview) {
           return;
         }
         clearTooltipHideTimer();
-        const { left, top } = resolveTooltipPosition(clientX, clientY);
+        const { left, top } = resolveTooltipPosition(anchor);
         const cached = referencePreviewCacheRef.current.get(uri);
         if (cached !== undefined) {
           if (!cached) {
@@ -450,6 +461,25 @@ export const MarkdownRenderer = memo(
 
       const markdownLinkClassName = "markdown-link";
       const nodeLinkClassName = "markdown-link markdown-node-link";
+      const activateReference = (
+        normalizedHref: string,
+        labelText: string,
+      ) => {
+        const now = Date.now();
+        const last = lastReferenceActivationRef.current;
+        if (
+          last &&
+          last.href === normalizedHref &&
+          now - last.timestamp < 260
+        ) {
+          return;
+        }
+        lastReferenceActivationRef.current = {
+          href: normalizedHref,
+          timestamp: now,
+        };
+        onReferenceClick?.(normalizedHref, labelText);
+      };
 
       return {
         ...mdxComponents,
@@ -498,7 +528,7 @@ export const MarkdownRenderer = memo(
             const labelText = flattenText(children);
             const referenceAccuracy =
               normalizedHref && isDeertubeReference
-                ? referenceAccuracyByUri[normalizedHref]
+                ? mergedReferenceAccuracyByUri[normalizedHref]
                 : undefined;
             return (
               <a
@@ -510,7 +540,15 @@ export const MarkdownRenderer = memo(
                   if (!normalizedHref) {
                     return;
                   }
-                  onReferenceClick(normalizedHref, labelText);
+                  activateReference(normalizedHref, labelText);
+                }}
+                onDoubleClick={(event) => {
+                  event.preventDefault();
+                  event.stopPropagation();
+                  if (!normalizedHref) {
+                    return;
+                  }
+                  activateReference(normalizedHref, labelText);
                 }}
                 onMouseEnter={(event) => {
                   if (!normalizedHref || !isDeertubeReference || !resolveReferencePreview) {
@@ -518,13 +556,15 @@ export const MarkdownRenderer = memo(
                   }
                   hoveredReferenceUriRef.current = normalizedHref;
                   clearTooltipHideTimer();
-                  void showReferenceTooltip(
-                    normalizedHref,
-                    event.clientX,
-                    event.clientY,
-                  );
+                  void showReferenceTooltip(normalizedHref, event.currentTarget);
                 }}
                 onMouseLeave={() => {
+                  if (isDeertubeReference) {
+                    hoveredReferenceUriRef.current = null;
+                    scheduleHideReferenceTooltip();
+                  }
+                }}
+                onBlur={() => {
                   if (isDeertubeReference) {
                     hoveredReferenceUriRef.current = null;
                     scheduleHideReferenceTooltip();
@@ -560,7 +600,7 @@ export const MarkdownRenderer = memo(
       clearTooltipHideTimer,
       resolveNodeLabel,
       resolveReferencePreview,
-      referenceAccuracyByUri,
+      mergedReferenceAccuracyByUri,
       scheduleHideReferenceTooltip,
       showReferenceTooltip,
     ]);
@@ -658,8 +698,6 @@ export const MarkdownRenderer = memo(
                   left: `${referenceTooltip.left}px`,
                   top: `${referenceTooltip.top}px`,
                 }}
-                onMouseEnter={clearTooltipHideTimer}
-                onMouseLeave={scheduleHideReferenceTooltip}
               >
                 {referenceTooltip.status === "loading" ? (
                   <div className="flex h-full items-center justify-center text-xs text-muted-foreground">

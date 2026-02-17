@@ -57,7 +57,6 @@ interface RunPostAnswerValidationForResponseOptions {
   runtimeSettings: RuntimeSettingsPayload | undefined;
   queryOverride: string;
   force?: boolean;
-  isMounted: () => boolean;
   setAsyncSubagentEventMessages: (
     updater: (prev: ChatMessage[]) => ChatMessage[],
   ) => void;
@@ -67,8 +66,18 @@ interface RunPostAnswerValidationForResponseOptions {
   onValidationRunStart?: (
     runJobId: string,
     abortController: AbortController,
+    context: {
+      responseId: string;
+      toolCallId: string;
+    },
   ) => void;
-  onValidationRunFinish?: (runJobId: string) => void;
+  onValidationRunFinish?: (
+    runJobId: string,
+    context: {
+      responseId: string;
+      toolCallId: string;
+    },
+  ) => void;
 }
 
 const VALIDATE_ASYNC_LOG_PREFIX = "[validate][chat.async]";
@@ -441,7 +450,6 @@ export const runPostAnswerValidationForResponse = async ({
   runtimeSettings,
   queryOverride,
   force = false,
-  isMounted,
   setAsyncSubagentEventMessages,
   setAsyncDeepSearchEventMessages,
   onValidationRunStart,
@@ -492,7 +500,10 @@ export const runPostAnswerValidationForResponse = async ({
   });
 
   const abortController = new AbortController();
-  onValidationRunStart?.(runningJobId, abortController);
+  onValidationRunStart?.(runningJobId, abortController, {
+    responseId,
+    toolCallId,
+  });
   try {
     const result = await runValidateStream(
       {
@@ -506,13 +517,6 @@ export const runPostAnswerValidationForResponse = async ({
       },
       abortController.signal,
       (event) => {
-        if (!isMounted()) {
-          logValidateAsync("progress-ignored-unmounted", {
-            runningJobId,
-            type: event.type,
-          });
-          return;
-        }
         logValidateAsync("progress", {
           runningJobId,
           type: event.type,
@@ -546,12 +550,6 @@ export const runPostAnswerValidationForResponse = async ({
         });
       },
     );
-    if (!isMounted()) {
-      logValidateAsync("done-ignored-unmounted", {
-        runningJobId,
-      });
-      return;
-    }
     setValidationEventResolved({
       eventId,
       toolCallId,
@@ -566,29 +564,21 @@ export const runPostAnswerValidationForResponse = async ({
     });
   } catch (error) {
     if (isAbortError(error)) {
-      if (isMounted()) {
-        setValidationEventFailed({
-          eventId,
-          toolCallId,
-          query,
-          errorMessage: "Validation stopped by user.",
-          setAsyncDeepSearchEventMessages,
-        });
-        setSubagentStatusForToolCall({
-          toolCallId,
-          status: "failed",
-          setAsyncSubagentEventMessages,
-        });
-      }
+      setValidationEventFailed({
+        eventId,
+        toolCallId,
+        query,
+        errorMessage: "Validation stopped by user.",
+        setAsyncDeepSearchEventMessages,
+      });
+      setSubagentStatusForToolCall({
+        toolCallId,
+        status: "failed",
+        setAsyncSubagentEventMessages,
+      });
       logValidateAsync("aborted", {
         runningJobId,
         toolCallId,
-      });
-      return;
-    }
-    if (!isMounted()) {
-      logValidateAsync("failed-ignored-unmounted", {
-        runningJobId,
       });
       return;
     }
@@ -608,7 +598,10 @@ export const runPostAnswerValidationForResponse = async ({
     });
     throw error instanceof Error ? error : new Error(errorMessage);
   } finally {
-    onValidationRunFinish?.(runningJobId);
+    onValidationRunFinish?.(runningJobId, {
+      responseId,
+      toolCallId,
+    });
     if (chatId) {
       finishRunningChatJob(projectPath, chatId, runningJobId);
     }

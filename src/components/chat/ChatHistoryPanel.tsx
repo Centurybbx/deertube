@@ -3,6 +3,7 @@ import type { DeertubeUIMessage } from "@/modules/ai/tools";
 import { isJsonObject } from "@/types/json";
 import type {
   ChatMessage,
+  DeepSearchReferencePayload,
   DeepSearchStreamPayload,
   GraphToolInput,
   GraphToolOutput,
@@ -47,8 +48,10 @@ import {
   ArrowDown,
   Bot,
   Check,
+  CircleHelp,
   CircleCheck,
   ChevronDown,
+  Copy,
   FolderOpen,
   Loader2,
   MessageSquare,
@@ -131,17 +134,15 @@ interface ChatHistoryPanelProps {
   input: string;
   deepResearchConfig: DeepResearchConfig;
   onDeepResearchConfigChange: (next: DeepResearchConfig) => void;
-  graphGenerationEnabled: boolean;
-  onGraphGenerationEnabledChange: (enabled: boolean) => void;
   busy: boolean;
   asyncBusy?: boolean;
-  canValidateChat?: boolean;
   graphBusy?: boolean;
   onInputChange: (value: string) => void;
   onSend: () => void;
   onStop?: () => void;
   onStopAsync?: () => void;
-  onValidateChat?: () => void;
+  onToggleValidateResponse?: (responseId: string) => void;
+  onGenerateGraphResponse?: (responseId: string) => void;
   onRetry?: (messageId: string) => void;
   lastFailedMessageId?: string | null;
 }
@@ -189,6 +190,13 @@ type ChatItem =
   | { kind: "primary"; id: string; message: ChatMessage }
   | { kind: "additional"; id: string; message: ChatMessage }
   | ToolChatItem;
+
+interface ValidateRunDetails {
+  responseId: string;
+  toolCallId: string;
+  deepSearchMessage?: ChatMessage;
+  subagentMessage?: ChatMessage;
+}
 
 interface SearchSkillOption {
   name: string;
@@ -292,6 +300,57 @@ const indexToSearchPolicy = (index: number): DeepResearchStrictness =>
   SEARCH_POLICY_OPTIONS[Math.min(2, Math.max(0, index))]?.value ??
   "uncertain-claims";
 
+const MARKDOWN_DEERTUBE_REF_LINK_PATTERN = /\[[^\]]+\]\((deertube:\/\/[^)\s]+)\)/gi;
+const VALIDATE_REFERENCE_INLINE_LIMIT = 16;
+const VALIDATE_LINE_TOKEN_MIN_LENGTH = 3;
+
+const extractReferencedUrisFromMarkdown = (source: string): Set<string> => {
+  const uriSet = new Set<string>();
+  for (const match of source.matchAll(MARKDOWN_DEERTUBE_REF_LINK_PATTERN)) {
+    const normalized = match[1]?.trim();
+    if (normalized) {
+      uriSet.add(normalized);
+    }
+  }
+  return uriSet;
+};
+
+const normalizeTextForMatch = (value: string): string =>
+  value
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}\s]/gu, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+const extractTokensForMatch = (value: string): string[] => {
+  const normalized = normalizeTextForMatch(value);
+  if (!normalized) {
+    return [];
+  }
+  const dedupe = new Set<string>();
+  normalized.split(" ").forEach((token) => {
+    if (token.length < VALIDATE_LINE_TOKEN_MIN_LENGTH) {
+      return;
+    }
+    dedupe.add(token);
+  });
+  return Array.from(dedupe.values());
+};
+
+const resolveValidateMarkerLabel = (
+  reference: DeepSearchReferencePayload,
+  fallbackIndex: number,
+): string => {
+  if (
+    typeof reference.refId === "number" &&
+    Number.isFinite(reference.refId) &&
+    reference.refId > 0
+  ) {
+    return String(reference.refId);
+  }
+  return String(fallbackIndex + 1);
+};
+
 const truncateInline = (value: string, maxChars = TOOL_DETAIL_MAX_CHARS): string => {
   const singleLine = value.replace(/\s+/g, " ").trim();
   if (singleLine.length <= maxChars) {
@@ -340,6 +399,156 @@ const formatAccuracyLabel = (
   if (accuracy === "conflicting") return "Conflicting";
   if (accuracy === "insufficient") return "Insufficient";
   return null;
+};
+
+const mergeValidateReferencesInline = ({
+  source,
+  references,
+}: {
+  source: string;
+  references: DeepSearchReferencePayload[];
+}): {
+  content: string;
+  accuracyHints: Record<string, DeepSearchReferencePayload["accuracy"]>;
+} => {
+  const accuracyHints: Record<
+    string,
+    DeepSearchReferencePayload["accuracy"]
+  > = {};
+  references.forEach((reference) => {
+    const uri =
+      typeof reference.uri === "string" && reference.uri.trim().length > 0
+        ? reference.uri.trim()
+        : "";
+    if (!uri || !reference.accuracy) {
+      return;
+    }
+    accuracyHints[uri] = reference.accuracy;
+  });
+  if (references.length === 0) {
+    return { content: source, accuracyHints };
+  }
+  const existingUris = extractReferencedUrisFromMarkdown(source);
+  const dedupe = new Set<string>();
+  const inlineReferences = references
+    .map((reference, index) => {
+      const uri =
+        typeof reference.uri === "string" && reference.uri.trim().length > 0
+          ? reference.uri.trim()
+          : "";
+      if (!uri || dedupe.has(uri)) {
+        return null;
+      }
+      dedupe.add(uri);
+      return {
+        reference,
+        uri,
+        label: resolveValidateMarkerLabel(reference, index),
+        marker: `[${resolveValidateMarkerLabel(reference, index)}](${uri})`,
+        tokens: extractTokensForMatch(
+          [
+            reference.viewpoint,
+            reference.validationRefContent,
+            reference.text,
+            reference.title,
+          ]
+            .filter((item): item is string => typeof item === "string")
+            .join(" "),
+        ),
+      };
+    })
+    .filter(
+      (item): item is NonNullable<typeof item> =>
+        item !== null && !existingUris.has(item.uri),
+    )
+    .slice(0, VALIDATE_REFERENCE_INLINE_LIMIT);
+  if (inlineReferences.length === 0) {
+    return { content: source, accuracyHints };
+  }
+
+  const lines = source.split("\n");
+  const codeFenceRanges: { start: number; end: number }[] = [];
+  let openFenceStart: number | null = null;
+  lines.forEach((line, index) => {
+    if (!line.trimStart().startsWith("```")) {
+      return;
+    }
+    if (openFenceStart === null) {
+      openFenceStart = index;
+      return;
+    }
+    codeFenceRanges.push({ start: openFenceStart, end: index });
+    openFenceStart = null;
+  });
+  const isInCodeFence = (index: number): boolean =>
+    codeFenceRanges.some((range) => index >= range.start && index <= range.end);
+  const candidateLineIndexes = lines
+    .map((line, index) => ({ line, index }))
+    .filter(({ line, index }) => line.trim().length > 0 && !isInCodeFence(index))
+    .map(({ index }) => index);
+  if (candidateLineIndexes.length === 0) {
+    return { content: source, accuracyHints };
+  }
+
+  const lineTokenMap = new Map<number, Set<string>>();
+  candidateLineIndexes.forEach((index) => {
+    lineTokenMap.set(index, new Set(extractTokensForMatch(lines[index])));
+  });
+  const markersByLine = new Map<number, string[]>();
+  const chooseLineIndex = (tokens: string[]): number => {
+    if (tokens.length === 0) {
+      return candidateLineIndexes[candidateLineIndexes.length - 1];
+    }
+    let bestIndex = candidateLineIndexes[candidateLineIndexes.length - 1];
+    let bestScore = -1;
+    candidateLineIndexes.forEach((index) => {
+      const lineTokens = lineTokenMap.get(index);
+      if (!lineTokens || lineTokens.size === 0) {
+        return;
+      }
+      let score = 0;
+      tokens.forEach((token) => {
+        if (lineTokens.has(token)) {
+          score += 1;
+        }
+      });
+      if (score > bestScore) {
+        bestScore = score;
+        bestIndex = index;
+      }
+    });
+    return bestIndex;
+  };
+
+  inlineReferences.forEach((item) => {
+    const targetIndex = chooseLineIndex(item.tokens);
+    const currentLine = lines[targetIndex];
+    if (
+      currentLine.includes(`(${item.uri})`) ||
+      currentLine.includes(`[${item.label}](`)
+    ) {
+      return;
+    }
+    const markers = markersByLine.get(targetIndex) ?? [];
+    markers.push(item.marker);
+    markersByLine.set(targetIndex, markers);
+  });
+
+  if (markersByLine.size === 0) {
+    return { content: source, accuracyHints };
+  }
+  const nextLines = lines.map((line, index) => {
+    const markers = markersByLine.get(index);
+    if (!markers || markers.length === 0) {
+      return line;
+    }
+    const suffix = markers.join(" ");
+    return `${line.trimEnd()} ${suffix}`.trimEnd();
+  });
+  return {
+    content: nextLines.join("\n"),
+    accuracyHints,
+  };
 };
 
 const getValidateAccuracyToneClasses = (
@@ -469,6 +678,24 @@ const shouldPreferDeepSearchMessage = (
     return false;
   }
   if (isTerminalToolStatus(nextStatus) && currentStatus === "running") {
+    return true;
+  }
+  const currentTimestamp = Date.parse(current.createdAt);
+  const nextTimestamp = Date.parse(next.createdAt);
+  if (!Number.isFinite(currentTimestamp)) {
+    return true;
+  }
+  if (!Number.isFinite(nextTimestamp)) {
+    return false;
+  }
+  return nextTimestamp >= currentTimestamp;
+};
+
+const shouldPreferLatestRunMessage = (
+  current: ChatMessage | undefined,
+  next: ChatMessage,
+): boolean => {
+  if (!current) {
     return true;
   }
   const currentTimestamp = Date.parse(current.createdAt);
@@ -664,8 +891,37 @@ const readToolCallId = (value: ChatMessage["toolInput"]): string | null => {
   return typeof value.toolCallId === "string" ? value.toolCallId : null;
 };
 
+const readResponseId = (value: ChatMessage["toolInput"]): string | null => {
+  if (!value || !isRecord(value)) {
+    return null;
+  }
+  if (typeof value.responseId !== "string" || value.responseId.trim().length === 0) {
+    return null;
+  }
+  return value.responseId;
+};
+
 const isToolChatItem = (item: ChatItem): item is ToolChatItem =>
   item.kind === "graph" || item.kind === "subagent" || item.kind === "deepsearch";
+
+const isToolEventMessage = (message: ChatMessage): boolean =>
+  message.kind === "graph-event" ||
+  message.kind === "subagent-event" ||
+  message.kind === "deepsearch-event";
+
+const isValidateDeepSearchEvent = (message: ChatMessage): boolean => {
+  if (message.kind !== "deepsearch-event") {
+    return false;
+  }
+  if (message.toolName === "validate.run") {
+    return true;
+  }
+  const outputPayload = parseToolPayload(message.toolOutput);
+  if (!isDeepSearchPayload(outputPayload)) {
+    return false;
+  }
+  return outputPayload.mode === "validate";
+};
 
 export default function ChatHistoryPanel({
   developerMode = false,
@@ -684,17 +940,15 @@ export default function ChatHistoryPanel({
   input,
   deepResearchConfig,
   onDeepResearchConfigChange,
-  graphGenerationEnabled,
-  onGraphGenerationEnabledChange,
   busy,
   asyncBusy = false,
-  canValidateChat = false,
   graphBusy = false,
   onInputChange,
   onSend,
   onStop,
   onStopAsync,
-  onValidateChat,
+  onToggleValidateResponse,
+  onGenerateGraphResponse,
   onRetry,
   lastFailedMessageId: lastFailedMessageIdProp,
 }: ChatHistoryPanelProps) {
@@ -729,6 +983,10 @@ export default function ChatHistoryPanel({
   >({});
   const stickyCollapseTimeoutRef = useRef<number | null>(null);
   const stickyPostClickCollapseTimeoutRef = useRef<number | null>(null);
+  const copyFeedbackTimeoutRef = useRef<number | null>(null);
+  const validateDetailsPopoverTimerRef = useRef<number | null>(null);
+  const [validateDetailsPopoverMessageId, setValidateDetailsPopoverMessageId] =
+    useState<string | null>(null);
   const stickyQuestionAnchorByIdRef = useRef<Map<string, HTMLDivElement>>(
     new Map(),
   );
@@ -742,9 +1000,11 @@ export default function ChatHistoryPanel({
   const searchPolicy = resolvedDeepResearchConfig.strictness;
   const searchPolicyIndex = searchPolicyToIndex(searchPolicy);
   const searchEnabled = searchPolicy !== "no-search";
+  const searchAllClaimsEnabled = searchPolicy === "all-claims";
   const validatePolicy = resolvedDeepResearchConfig.validate.strictness;
   const validatePolicyIndex = searchPolicyToIndex(validatePolicy);
   const validateEnabled = validatePolicy !== "no-search";
+  const validateAllClaimsEnabled = validatePolicy === "all-claims";
   const deepResearchSwitchEnabled = resolvedDeepResearchConfig.enabled;
   const deepResearchActive =
     deepResearchSwitchEnabled && (searchEnabled || validateEnabled);
@@ -817,7 +1077,133 @@ export default function ChatHistoryPanel({
     return map;
   }, [nodes]);
   const [isAtBottom, setIsAtBottom] = useState(true);
-  const sortedMessages = useMemo(() => messages, [messages]);
+  const [copyFeedbackState, setCopyFeedbackState] = useState<
+    "idle" | "copied" | "failed"
+  >("idle");
+  const [copyFeedbackMessageId, setCopyFeedbackMessageId] = useState<string | null>(
+    null,
+  );
+  const rawMessages = useMemo(() => messages, [messages]);
+  const {
+    hiddenValidateToolCallIds,
+    latestValidateRunByResponseId,
+    graphMessageByResponseId,
+  } = useMemo(() => {
+    const assistantResponseIds = new Set(
+      rawMessages
+        .filter(
+          (message) =>
+            message.role === "assistant" &&
+            message.kind !== "graph-event" &&
+            message.kind !== "subagent-event" &&
+            message.kind !== "deepsearch-event",
+        )
+        .map((message) => message.id),
+    );
+    const allValidateToolCallIds = new Set<string>();
+    const hiddenToolCallIds = new Set<string>();
+    const responseIdByToolCall = new Map<string, string>();
+    const deepSearchByToolCall = new Map<string, ChatMessage>();
+    const subagentByToolCall = new Map<string, ChatMessage>();
+    rawMessages.forEach((message) => {
+      if (!isValidateDeepSearchEvent(message)) {
+        return;
+      }
+      const toolCallId = readToolCallId(message.toolInput);
+      const responseId = readResponseId(message.toolInput);
+      if (!toolCallId || !responseId) {
+        return;
+      }
+      allValidateToolCallIds.add(toolCallId);
+      responseIdByToolCall.set(toolCallId, responseId);
+      if (assistantResponseIds.has(responseId)) {
+        hiddenToolCallIds.add(toolCallId);
+      }
+      const current = deepSearchByToolCall.get(toolCallId);
+      if (shouldPreferDeepSearchMessage(current, message)) {
+        deepSearchByToolCall.set(toolCallId, message);
+      }
+    });
+    rawMessages.forEach((message) => {
+      if (message.kind !== "subagent-event") {
+        return;
+      }
+      const toolCallId = readToolCallId(message.toolInput);
+      if (!toolCallId || !allValidateToolCallIds.has(toolCallId)) {
+        return;
+      }
+      const current = subagentByToolCall.get(toolCallId);
+      if (shouldPreferDeepSearchMessage(current, message)) {
+        subagentByToolCall.set(toolCallId, message);
+      }
+    });
+    const latestByResponseId = new Map<string, ValidateRunDetails>();
+    allValidateToolCallIds.forEach((toolCallId) => {
+      const responseId = responseIdByToolCall.get(toolCallId);
+      if (!responseId) {
+        return;
+      }
+      const nextRun: ValidateRunDetails = {
+        responseId,
+        toolCallId,
+        deepSearchMessage: deepSearchByToolCall.get(toolCallId),
+        subagentMessage: subagentByToolCall.get(toolCallId),
+      };
+      const currentRun = latestByResponseId.get(responseId);
+      const currentMessage =
+        currentRun?.deepSearchMessage ?? currentRun?.subagentMessage;
+      const nextMessage = nextRun.deepSearchMessage ?? nextRun.subagentMessage;
+      if (!nextMessage) {
+        return;
+      }
+      if (shouldPreferLatestRunMessage(currentMessage, nextMessage)) {
+        latestByResponseId.set(responseId, nextRun);
+      }
+    });
+
+    const graphByResponseId = new Map<string, ChatMessage>();
+    rawMessages.forEach((message) => {
+      if (message.kind !== "graph-event") {
+        return;
+      }
+      const graphToolInput = parseGraphToolInput(message.toolInput);
+      const responseId = graphToolInput?.responseId;
+      if (!responseId) {
+        return;
+      }
+      const current = graphByResponseId.get(responseId);
+      if (shouldPreferLatestRunMessage(current, message)) {
+        graphByResponseId.set(responseId, message);
+      }
+    });
+
+    return {
+      hiddenValidateToolCallIds: hiddenToolCallIds,
+      latestValidateRunByResponseId: latestByResponseId,
+      graphMessageByResponseId: graphByResponseId,
+    };
+  }, [rawMessages]);
+  const sortedMessages = useMemo(
+    () =>
+      rawMessages.filter((message) => {
+        if (isValidateDeepSearchEvent(message)) {
+          const toolCallId = readToolCallId(message.toolInput);
+          if (!toolCallId) {
+            return true;
+          }
+          return !hiddenValidateToolCallIds.has(toolCallId);
+        }
+        if (message.kind !== "subagent-event") {
+          return true;
+        }
+        const toolCallId = readToolCallId(message.toolInput);
+        if (!toolCallId) {
+          return true;
+        }
+        return !hiddenValidateToolCallIds.has(toolCallId);
+      }),
+    [hiddenValidateToolCallIds, rawMessages],
+  );
   const selectedSummary = useMemo(() => {
     if (!selectedNode) {
       return null;
@@ -902,6 +1288,14 @@ export default function ChatHistoryPanel({
         window.clearTimeout(stickyPostClickCollapseTimeoutRef.current);
         stickyPostClickCollapseTimeoutRef.current = null;
       }
+      if (copyFeedbackTimeoutRef.current !== null) {
+        window.clearTimeout(copyFeedbackTimeoutRef.current);
+        copyFeedbackTimeoutRef.current = null;
+      }
+      if (validateDetailsPopoverTimerRef.current !== null) {
+        window.clearTimeout(validateDetailsPopoverTimerRef.current);
+        validateDetailsPopoverTimerRef.current = null;
+      }
     },
     [],
   );
@@ -910,7 +1304,7 @@ export default function ChatHistoryPanel({
       const next = { ...previous };
       const activeIds = new Set<string>();
       let changed = false;
-      messages.forEach((message) => {
+      sortedMessages.forEach((message) => {
         if (
           message.kind !== "graph-event" &&
           message.kind !== "subagent-event" &&
@@ -936,7 +1330,7 @@ export default function ChatHistoryPanel({
       }
       return next;
     });
-  }, [messages]);
+  }, [sortedMessages]);
 
   const handleNodeLinkClick = useCallback(
     (nodeId: string) => {
@@ -1554,11 +1948,11 @@ export default function ChatHistoryPanel({
 
   const hasPendingAssistant = useMemo(
     () =>
-      messages.some(
+      sortedMessages.some(
         (message) =>
           message.role === "assistant" && message.status === "pending",
       ),
-    [messages],
+    [sortedMessages],
   );
   const hasBrowserSelection = Boolean(
     browserSelection && browserSelection.text.trim().length > 0,
@@ -1573,35 +1967,96 @@ export default function ChatHistoryPanel({
     }
     return text.length > 80 ? `${text.slice(0, 80)}...` : text;
   }, [browserSelection]);
+  const latestAssistantMessage = useMemo(() => {
+    for (let index = sortedMessages.length - 1; index >= 0; index -= 1) {
+      const message = sortedMessages[index];
+      if (isToolEventMessage(message) || message.role !== "assistant") {
+        continue;
+      }
+      if (message.content.trim().length === 0) {
+        continue;
+      }
+      return message;
+    }
+    return null;
+  }, [sortedMessages]);
   const lastFailedMessageId = useMemo(() => {
     if (lastFailedMessageIdProp !== undefined) {
       return lastFailedMessageIdProp;
     }
-    for (let index = messages.length - 1; index >= 0; index -= 1) {
-      const message = messages[index];
-      if (
-        message.kind === "graph-event" ||
-        message.kind === "subagent-event" ||
-        message.kind === "deepsearch-event"
-      ) {
+    for (let index = sortedMessages.length - 1; index >= 0; index -= 1) {
+      const message = sortedMessages[index];
+      if (isToolEventMessage(message)) {
         continue;
       }
       return message.status === "failed" ? message.id : null;
     }
     return null;
-  }, [lastFailedMessageIdProp, messages]);
+  }, [lastFailedMessageIdProp, sortedMessages]);
   const showRetry = Boolean(lastFailedMessageId && onRetry);
   const hasInput = input.trim().length > 0;
   const retryOnly = showRetry && !hasInput;
   const canStop = busy && Boolean(onStop);
   const canStopAsync = asyncBusy && Boolean(onStopAsync);
-  const canRunManualValidate = !asyncBusy && canValidateChat && Boolean(onValidateChat);
   const primaryActionLabel = canStop
     ? "Stop generation"
     : retryOnly
       ? "Retry request"
       : "Send message";
   const asyncActionLabel = "Stop async tasks";
+  const handleCopyAssistantMessage = useCallback(async (message: ChatMessage) => {
+    const text = message.content.trim();
+    if (!text) {
+      return;
+    }
+    try {
+      await navigator.clipboard.writeText(text);
+      setCopyFeedbackState("copied");
+      setCopyFeedbackMessageId(message.id);
+    } catch {
+      setCopyFeedbackState("failed");
+      setCopyFeedbackMessageId(message.id);
+    }
+    if (copyFeedbackTimeoutRef.current !== null) {
+      window.clearTimeout(copyFeedbackTimeoutRef.current);
+    }
+    copyFeedbackTimeoutRef.current = window.setTimeout(() => {
+      copyFeedbackTimeoutRef.current = null;
+      setCopyFeedbackState("idle");
+      setCopyFeedbackMessageId(null);
+    }, 1400);
+  }, []);
+  const clearValidateDetailsPopoverTimer = useCallback(() => {
+    if (validateDetailsPopoverTimerRef.current !== null) {
+      window.clearTimeout(validateDetailsPopoverTimerRef.current);
+      validateDetailsPopoverTimerRef.current = null;
+    }
+  }, []);
+  const openValidateDetailsPopover = useCallback(
+    (messageId: string) => {
+      clearValidateDetailsPopoverTimer();
+      setValidateDetailsPopoverMessageId(messageId);
+    },
+    [clearValidateDetailsPopoverTimer],
+  );
+  const scheduleCloseValidateDetailsPopover = useCallback(() => {
+    clearValidateDetailsPopoverTimer();
+    validateDetailsPopoverTimerRef.current = window.setTimeout(() => {
+      validateDetailsPopoverTimerRef.current = null;
+      setValidateDetailsPopoverMessageId(null);
+    }, 140);
+  }, [clearValidateDetailsPopoverTimer]);
+  useEffect(() => {
+    if (!validateDetailsPopoverMessageId) {
+      return;
+    }
+    const exists = sortedMessages.some(
+      (message) => message.id === validateDetailsPopoverMessageId,
+    );
+    if (!exists) {
+      setValidateDetailsPopoverMessageId(null);
+    }
+  }, [sortedMessages, validateDetailsPopoverMessageId]);
   const handlePrimaryAction = useCallback(() => {
     if (canStop) {
       onStop?.();
@@ -1651,6 +2106,42 @@ export default function ChatHistoryPanel({
       });
     },
     [patchDeepResearchConfig, resolvedDeepResearchConfig],
+  );
+  const handleSearchEnabledSwitchChange = useCallback(
+    (checked: boolean) => {
+      if (!checked) {
+        setSearchPolicy("no-search");
+        return;
+      }
+      setSearchPolicy(
+        searchPolicy === "all-claims" ? "all-claims" : "uncertain-claims",
+      );
+    },
+    [searchPolicy, setSearchPolicy],
+  );
+  const handleSearchAllClaimsSwitchChange = useCallback(
+    (checked: boolean) => {
+      setSearchPolicy(checked ? "all-claims" : "uncertain-claims");
+    },
+    [setSearchPolicy],
+  );
+  const handleValidateEnabledSwitchChange = useCallback(
+    (checked: boolean) => {
+      if (!checked) {
+        setValidatePolicy("no-search");
+        return;
+      }
+      setValidatePolicy(
+        validatePolicy === "all-claims" ? "all-claims" : "uncertain-claims",
+      );
+    },
+    [setValidatePolicy, validatePolicy],
+  );
+  const handleValidateAllClaimsSwitchChange = useCallback(
+    (checked: boolean) => {
+      setValidatePolicy(checked ? "all-claims" : "uncertain-claims");
+    },
+    [setValidatePolicy],
   );
   const handleToggleDeepResearchMaster = useCallback(() => {
     patchDeepResearchConfig({
@@ -3116,40 +3607,383 @@ export default function ChatHistoryPanel({
                 !isUser && isFailed && !displayContent?.trim()
                   ? message.error ?? "Request failed"
                   : displayContent;
-              const content = (
-                <div
-                  className={cn(
-                    "rounded-md px-3 py-2",
-                    isUser
-                      ? "bg-muted text-foreground"
-                      : "bg-secondary text-foreground",
-                    isFailed &&
-                      "border border-destructive/40 bg-destructive/10 text-destructive",
-                    isHighlighted && "ring-2 ring-amber-400/60",
-                  )}
-                >
-                  {stickyQuestionOrder ? (
-                    <div className="mb-1 text-[10px] font-semibold uppercase tracking-[0.12em] text-muted-foreground">
-                      {`Q${stickyQuestionOrder}`}
-                    </div>
+              const isLatestAssistantMessage =
+                !isUser && latestAssistantMessage?.id === message.id;
+              const latestValidateRun = !isUser
+                ? latestValidateRunByResponseId.get(message.id)
+                : undefined;
+              const validateDeepSearchMessage = latestValidateRun?.deepSearchMessage;
+              const validateSubagentMessage = latestValidateRun?.subagentMessage;
+              const validateDeepSearchPayloadRaw = parseToolPayload(
+                validateDeepSearchMessage?.toolOutput,
+              );
+              const validateDeepSearchPayload = isDeepSearchPayload(
+                validateDeepSearchPayloadRaw,
+              )
+                ? validateDeepSearchPayloadRaw
+                : null;
+              const validateSubagentPayloadRaw = parseToolPayload(
+                validateSubagentMessage?.toolOutput,
+              );
+              const validateSubagentPayload = isSubagentPayload(
+                validateSubagentPayloadRaw,
+              )
+                ? validateSubagentPayloadRaw
+                : null;
+              const validateSubagentEntries = validateSubagentPayload
+                ? buildSubagentEntries(validateSubagentPayload)
+                : [];
+              const validateStatus = latestValidateRun
+                ? toExecutionStatus(
+                    validateDeepSearchMessage?.toolStatus ??
+                      validateSubagentMessage?.toolStatus ??
+                      "running",
+                  )
+                : null;
+              const validateError =
+                validateDeepSearchMessage?.error ?? validateSubagentMessage?.error;
+              const validateQuery =
+                typeof validateDeepSearchPayload?.query === "string"
+                  ? validateDeepSearchPayload.query
+                  : undefined;
+              const validateSourcesCount = Array.isArray(validateDeepSearchPayload?.sources)
+                ? validateDeepSearchPayload.sources.length
+                : 0;
+              const validateReferences = Array.isArray(
+                validateDeepSearchPayload?.references,
+              )
+                ? validateDeepSearchPayload.references
+                : [];
+              const validateReferencesCount = validateReferences.length;
+              const validateCallDetail = stringifyToolDetail(
+                validateDeepSearchMessage?.toolInput,
+              );
+              const validateResultDetail = stringifyToolDetail(
+                validateDeepSearchMessage?.toolOutput,
+              );
+              const validateInlineMerge =
+                !isUser && typeof resolvedContent === "string"
+                  ? mergeValidateReferencesInline({
+                      source: resolvedContent,
+                      references: validateReferences,
+                    })
+                  : {
+                      content: resolvedContent ?? "",
+                      accuracyHints: {},
+                    };
+              const assistantRenderedContent = validateInlineMerge.content;
+              const assistantReferenceAccuracyHints =
+                validateInlineMerge.accuracyHints;
+              const validationRunning = validateStatus === "running";
+              const validationPopoverVisible = Boolean(
+                latestValidateRun && validateStatus,
+              );
+              const validationPopoverOpen =
+                validationPopoverVisible &&
+                validateDetailsPopoverMessageId === message.id;
+              const copyStateForMessage =
+                copyFeedbackMessageId === message.id ? copyFeedbackState : "idle";
+              const canCopyMessage =
+                !isUser && typeof resolvedContent === "string"
+                  ? resolvedContent.trim().length > 0
+                  : false;
+              const graphMessage = !isUser
+                ? graphMessageByResponseId.get(message.id)
+                : undefined;
+              const graphStatus = graphMessage?.toolStatus;
+              const showRegenerateForMessage =
+                isLatestAssistantMessage &&
+                Boolean(onRetry) &&
+                graphStatus !== "complete";
+              const canRegenerateForMessage = showRegenerateForMessage && !busy;
+              const showGraphGenerateForMessage =
+                isLatestAssistantMessage &&
+                Boolean(onGenerateGraphResponse) &&
+                graphStatus !== "complete";
+              const canRunGraphGenerateForMessage =
+                showGraphGenerateForMessage &&
+                !graphBusy &&
+                graphStatus !== "running";
+              const actionRow = !isUser ? (
+                <div className="mt-1 inline-flex items-center gap-1">
+                  {showRegenerateForMessage ? (
+                    <Button
+                      type="button"
+                      size="icon"
+                      variant="ghost"
+                      className="h-6 w-6 rounded-md bg-transparent text-muted-foreground hover:bg-muted/35 hover:text-foreground"
+                      onClick={() => {
+                        onRetry?.(message.id);
+                      }}
+                      disabled={!canRegenerateForMessage}
+                      title="Regenerate this response"
+                      aria-label="Regenerate this response"
+                    >
+                      <RotateCw className="h-3.5 w-3.5" />
+                    </Button>
                   ) : null}
-                  {isUser ? (
-                    <div className="whitespace-pre-wrap text-sm leading-relaxed">
-                      {renderUserContent(displayContent ?? "")}
-                    </div>
-                  ) : (
-                    <MarkdownRenderer
-                      source={resolvedContent ?? ""}
-                      highlightExcerpt={
-                        shouldHighlightExcerpt ? selectedExcerpt : undefined
+                  <Button
+                    type="button"
+                    size="icon"
+                    variant="ghost"
+                    className={cn(
+                      "h-6 w-6 rounded-md bg-transparent text-muted-foreground hover:bg-muted/35 hover:text-foreground",
+                      copyStateForMessage === "copied" && "text-emerald-500",
+                      copyStateForMessage === "failed" && "text-destructive",
+                    )}
+                    onClick={() => {
+                      void handleCopyAssistantMessage(message);
+                    }}
+                    disabled={!canCopyMessage}
+                    title={
+                      copyStateForMessage === "copied"
+                        ? "Copied"
+                        : copyStateForMessage === "failed"
+                          ? "Copy failed"
+                          : "Copy this response"
+                    }
+                    aria-label="Copy this response"
+                  >
+                    {copyStateForMessage === "copied" ? (
+                      <Check className="h-3.5 w-3.5" />
+                    ) : copyStateForMessage === "failed" ? (
+                      <AlertCircle className="h-3.5 w-3.5" />
+                    ) : (
+                      <Copy className="h-3.5 w-3.5" />
+                    )}
+                  </Button>
+                  <Popover
+                    open={validationPopoverOpen}
+                    onOpenChange={(nextOpen) => {
+                      if (nextOpen) {
+                        setValidateDetailsPopoverMessageId(message.id);
+                        return;
                       }
-                      onNodeLinkClick={handleNodeLinkClick}
-                      onReferenceClick={onReferenceClick}
-                      resolveReferencePreview={onResolveReferencePreview}
-                      resolveNodeLabel={resolveNodeLabel}
-                      nodeExcerptRefs={nodeExcerptRefs}
-                    />
-                  )}
+                      setValidateDetailsPopoverMessageId((previous) =>
+                        previous === message.id ? null : previous,
+                      );
+                    }}
+                  >
+                    <PopoverTrigger asChild>
+                      <Button
+                        type="button"
+                        size="icon"
+                        variant="ghost"
+                        className={cn(
+                          "group relative h-6 w-6 rounded-md bg-transparent",
+                          validationRunning
+                            ? "animate-pulse text-sky-600 hover:bg-red-500/20 hover:text-red-600 dark:text-sky-300"
+                            : validateStatus === "failed"
+                              ? "text-red-600 hover:bg-red-500/15 hover:text-red-600 dark:text-red-300"
+                              : validateStatus === "complete"
+                                ? "text-emerald-600 hover:bg-emerald-500/15 hover:text-emerald-600 dark:text-emerald-300"
+                                : "text-muted-foreground hover:bg-muted/35 hover:text-foreground",
+                        )}
+                        onClick={() => {
+                          onToggleValidateResponse?.(message.id);
+                        }}
+                        onMouseEnter={() => {
+                          if (!validationPopoverVisible) {
+                            return;
+                          }
+                          openValidateDetailsPopover(message.id);
+                        }}
+                        onMouseLeave={() => {
+                          if (!validationPopoverVisible) {
+                            return;
+                          }
+                          scheduleCloseValidateDetailsPopover();
+                        }}
+                        disabled={!onToggleValidateResponse}
+                        title={
+                          validationRunning
+                            ? "Stop validation"
+                            : validateStatus === "failed"
+                              ? "Validation failed, click to retry"
+                              : validateStatus === "complete"
+                                ? "Validate again"
+                                : "Validate this response"
+                        }
+                        aria-label={
+                          validationRunning
+                            ? "Stop validation"
+                            : "Validate this response"
+                        }
+                      >
+                        {validationRunning ? (
+                          <>
+                            <Loader2 className="h-3.5 w-3.5 animate-spin transition-opacity duration-150 group-hover:opacity-0" />
+                            <Square className="absolute opacity-0 transition-opacity duration-150 group-hover:opacity-100" />
+                          </>
+                        ) : validateStatus === "failed" ? (
+                          <AlertCircle className="h-3.5 w-3.5" />
+                        ) : (
+                          <ShieldCheck className="h-3.5 w-3.5" />
+                        )}
+                      </Button>
+                    </PopoverTrigger>
+                    {validationPopoverVisible ? (
+                      <PopoverContent
+                        side={validationRunning ? "bottom" : "top"}
+                        align="start"
+                        className="w-[380px] p-3"
+                        onMouseEnter={() => {
+                          openValidateDetailsPopover(message.id);
+                        }}
+                        onMouseLeave={() => {
+                          scheduleCloseValidateDetailsPopover();
+                        }}
+                      >
+                        <div className="max-h-[280px] space-y-2 overflow-y-auto pr-1">
+                          <div className="flex items-center gap-2 text-xs text-muted-foreground">
+                            {validationRunning ? (
+                              <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                            ) : validateStatus === "complete" ? (
+                              <Check className="h-3.5 w-3.5 text-emerald-500" />
+                            ) : (
+                              <AlertCircle className="h-3.5 w-3.5 text-red-500" />
+                            )}
+                            <span>
+                              {validationRunning
+                                ? "Validate running"
+                                : validateStatus === "complete"
+                                  ? "Validate complete"
+                                  : "Validate failed"}
+                            </span>
+                          </div>
+                          {validateQuery ? (
+                            <div className="rounded border border-border/60 bg-card/40 px-2 py-1 text-[11px] text-muted-foreground">
+                              Query: {validateQuery}
+                            </div>
+                          ) : null}
+                          {validateError ? (
+                            <div className="rounded border border-red-400/40 bg-red-500/10 px-2 py-1 text-[11px] text-red-700 dark:text-red-300">
+                              {validateError}
+                            </div>
+                          ) : null}
+                          {validateSubagentEntries.length > 0 ? (
+                            <div className="space-y-1">
+                              {validateSubagentEntries.map((entry, index) => (
+                                <div
+                                  key={`${message.id}-validate-entry-${index}`}
+                                  className="flex items-center justify-between gap-2 rounded border border-border/60 bg-card/40 px-2 py-1 text-[11px]"
+                                >
+                                  <span
+                                    className="min-w-0 flex-1 truncate text-muted-foreground"
+                                    title={entry.compactDetail ?? entry.label}
+                                  >
+                                    {entry.compactDetail
+                                      ? `${entry.label}: ${entry.compactDetail}`
+                                      : entry.label}
+                                  </span>
+                                  <span className="shrink-0 text-[10px] uppercase tracking-[0.12em] text-foreground/70">
+                                    {getExecutionStatusLabel(entry.status)}
+                                  </span>
+                                </div>
+                              ))}
+                            </div>
+                          ) : null}
+                          {validateSourcesCount > 0 || validateReferencesCount > 0 ? (
+                            <div className="rounded border border-border/60 bg-card/40 px-2 py-1 text-[11px] text-muted-foreground">
+                              {`Sources: ${validateSourcesCount} · References: ${validateReferencesCount}`}
+                            </div>
+                          ) : null}
+                          {validateCallDetail ? (
+                            <div className="rounded border border-border/60 bg-card/40 p-2">
+                              <div className="mb-1 text-[10px] uppercase tracking-[0.12em] text-muted-foreground">
+                                Call
+                              </div>
+                              <pre className="max-h-28 overflow-auto whitespace-pre-wrap break-words text-[11px] text-foreground/90">
+                                {validateCallDetail}
+                              </pre>
+                            </div>
+                          ) : null}
+                          {validateResultDetail ? (
+                            <div className="rounded border border-border/60 bg-card/40 p-2">
+                              <div className="mb-1 text-[10px] uppercase tracking-[0.12em] text-muted-foreground">
+                                Result
+                              </div>
+                              <pre className="max-h-36 overflow-auto whitespace-pre-wrap break-words text-[11px] text-foreground/90">
+                                {validateResultDetail}
+                              </pre>
+                            </div>
+                          ) : null}
+                        </div>
+                      </PopoverContent>
+                    ) : null}
+                  </Popover>
+                  {showGraphGenerateForMessage ? (
+                    <Button
+                      type="button"
+                      size="icon"
+                      variant="ghost"
+                      className={cn(
+                        "h-6 w-6 rounded-md bg-transparent",
+                        canRunGraphGenerateForMessage
+                          ? "text-sky-600 hover:bg-sky-500/15 hover:text-sky-600 dark:text-sky-300"
+                          : "text-muted-foreground",
+                      )}
+                      onClick={() => {
+                        onGenerateGraphResponse?.(message.id);
+                      }}
+                      disabled={!canRunGraphGenerateForMessage}
+                      title={
+                        graphStatus === "running"
+                          ? "Graph generation is running"
+                          : "Generate graph from this response"
+                      }
+                      aria-label="Generate graph from this response"
+                    >
+                      {graphStatus === "running" ? (
+                        <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                      ) : (
+                        <Network className="h-3.5 w-3.5" />
+                      )}
+                    </Button>
+                  ) : null}
+                </div>
+              ) : null;
+              const content = (
+                <div>
+                  <div
+                    className={cn(
+                      "rounded-md px-3 py-2",
+                      isUser
+                        ? "bg-muted text-foreground"
+                        : "bg-secondary text-foreground",
+                      isFailed &&
+                        "border border-destructive/40 bg-destructive/10 text-destructive",
+                      !isUser &&
+                        validationRunning &&
+                        "animate-pulse ring-1 ring-sky-400/45 bg-sky-500/10",
+                      isHighlighted && "ring-2 ring-amber-400/60",
+                    )}
+                  >
+                    {stickyQuestionOrder ? (
+                      <div className="mb-1 text-[10px] font-semibold uppercase tracking-[0.12em] text-muted-foreground">
+                        {`Q${stickyQuestionOrder}`}
+                      </div>
+                    ) : null}
+                    {isUser ? (
+                      <div className="whitespace-pre-wrap text-sm leading-relaxed">
+                        {renderUserContent(displayContent ?? "")}
+                      </div>
+                    ) : (
+                      <MarkdownRenderer
+                        source={assistantRenderedContent}
+                        referenceAccuracyHints={assistantReferenceAccuracyHints}
+                        highlightExcerpt={
+                          shouldHighlightExcerpt ? selectedExcerpt : undefined
+                        }
+                        onNodeLinkClick={handleNodeLinkClick}
+                        onReferenceClick={onReferenceClick}
+                        resolveReferencePreview={onResolveReferencePreview}
+                        resolveNodeLabel={resolveNodeLabel}
+                        nodeExcerptRefs={nodeExcerptRefs}
+                      />
+                    )}
+                  </div>
+                  {actionRow}
                 </div>
               );
               const renderMessageCard = (messageBody: React.ReactNode) => (
@@ -3428,46 +4262,42 @@ export default function ChatHistoryPanel({
                     <TabsContent value="search" className="space-y-2.5">
                       <div
                         className={cn(
-                          "space-y-1.5 rounded-md border border-border/70 bg-muted/20 p-2",
+                          "space-y-2 rounded-md border border-border/70 bg-muted/20 p-2",
                           (fullPromptOverrideEnabled ||
                             !deepResearchSwitchEnabled) &&
                             "opacity-45",
                         )}
                       >
-                        <div className="text-xs font-medium text-foreground/90">
-                          Search strategy
+                        <div className="flex items-center justify-between gap-3">
+                          <div className="text-xs text-foreground/90">
+                            Search during answer
+                          </div>
+                          <Switch
+                            checked={searchEnabled}
+                            disabled={
+                              fullPromptOverrideEnabled || !deepResearchSwitchEnabled
+                            }
+                            onCheckedChange={handleSearchEnabledSwitchChange}
+                          />
                         </div>
-                        <input
-                          type="range"
-                          min={0}
-                          max={2}
-                          step={1}
-                          value={searchPolicyIndex}
-                          disabled={
-                            fullPromptOverrideEnabled || !deepResearchSwitchEnabled
-                          }
-                          onChange={(event) =>
-                            setSearchPolicy(
-                              indexToSearchPolicy(
-                                Number.parseInt(event.target.value, 10),
-                              ),
-                            )
-                          }
-                          className="h-1.5 w-full cursor-pointer accent-primary"
-                        />
-                        <div className="grid grid-cols-3 gap-1 text-[10px] text-muted-foreground">
-                          {SEARCH_POLICY_OPTIONS.map((option) => (
-                            <div
-                              key={option.value}
-                              className={cn(
-                                "truncate text-center",
-                                option.value === searchPolicy && "text-foreground",
-                              )}
-                              title={option.description}
-                            >
-                              {option.label}
-                            </div>
-                          ))}
+                        <div
+                          className={cn(
+                            "flex items-center justify-between gap-3",
+                            !searchEnabled && "opacity-45",
+                          )}
+                        >
+                          <div className="text-xs text-foreground/90">
+                            Search all claims
+                          </div>
+                          <Switch
+                            checked={searchAllClaimsEnabled}
+                            disabled={
+                              fullPromptOverrideEnabled ||
+                              !deepResearchSwitchEnabled ||
+                              !searchEnabled
+                            }
+                            onCheckedChange={handleSearchAllClaimsSwitchChange}
+                          />
                         </div>
                       </div>
                       <div
@@ -3479,8 +4309,15 @@ export default function ChatHistoryPanel({
                             "opacity-45",
                         )}
                       >
-                        <div className="text-xs text-foreground/90">
-                          Deeper Search
+                        <div className="flex items-center gap-1.5 text-xs text-foreground/90">
+                          <span>Deeper Search</span>
+                          <span
+                            className="inline-flex h-4 w-4 items-center justify-center rounded-full text-muted-foreground"
+                            title="Deeper Search increases search breadth and cross-checking for difficult factual claims."
+                            aria-label="Deeper Search explanation"
+                          >
+                            <CircleHelp className="h-3.5 w-3.5" />
+                          </span>
                         </div>
                         <Switch
                           checked={highSearchComplexity}
@@ -3500,47 +4337,42 @@ export default function ChatHistoryPanel({
                     <TabsContent value="validate" className="space-y-2.5">
                       <div
                         className={cn(
-                          "space-y-1.5 rounded-md border border-border/70 bg-muted/20 p-2",
+                          "space-y-2 rounded-md border border-border/70 bg-muted/20 p-2",
                           (fullPromptOverrideEnabled ||
                             !deepResearchSwitchEnabled) &&
                             "opacity-45",
                         )}
                       >
-                        <div className="text-xs font-medium text-foreground/90">
-                          Search strategy
+                        <div className="flex items-center justify-between gap-3">
+                          <div className="text-xs text-foreground/90">
+                            Auto validate after answer
+                          </div>
+                          <Switch
+                            checked={validateEnabled}
+                            disabled={
+                              fullPromptOverrideEnabled || !deepResearchSwitchEnabled
+                            }
+                            onCheckedChange={handleValidateEnabledSwitchChange}
+                          />
                         </div>
-                        <input
-                          type="range"
-                          min={0}
-                          max={2}
-                          step={1}
-                          value={validatePolicyIndex}
-                          disabled={
-                            fullPromptOverrideEnabled || !deepResearchSwitchEnabled
-                          }
-                          onChange={(event) =>
-                            setValidatePolicy(
-                              indexToSearchPolicy(
-                                Number.parseInt(event.target.value, 10),
-                              ),
-                            )
-                          }
-                          className="h-1.5 w-full cursor-pointer accent-primary"
-                        />
-                        <div className="grid grid-cols-3 gap-1 text-[10px] text-muted-foreground">
-                          {SEARCH_POLICY_OPTIONS.map((option) => (
-                            <div
-                              key={option.value}
-                              className={cn(
-                                "truncate text-center",
-                                option.value === validatePolicy &&
-                                  "text-foreground",
-                              )}
-                              title={option.description}
-                            >
-                              {option.label}
-                            </div>
-                          ))}
+                        <div
+                          className={cn(
+                            "flex items-center justify-between gap-3",
+                            !validateEnabled && "opacity-45",
+                          )}
+                        >
+                          <div className="text-xs text-foreground/90">
+                            Validate all claims
+                          </div>
+                          <Switch
+                            checked={validateAllClaimsEnabled}
+                            disabled={
+                              fullPromptOverrideEnabled ||
+                              !deepResearchSwitchEnabled ||
+                              !validateEnabled
+                            }
+                            onCheckedChange={handleValidateAllClaimsSwitchChange}
+                          />
                         </div>
                       </div>
                       <div
@@ -3552,8 +4384,15 @@ export default function ChatHistoryPanel({
                             "opacity-45",
                         )}
                       >
-                        <div className="text-xs text-foreground/90">
-                          Deeper Search
+                        <div className="flex items-center gap-1.5 text-xs text-foreground/90">
+                          <span>Deeper Search</span>
+                          <span
+                            className="inline-flex h-4 w-4 items-center justify-center rounded-full text-muted-foreground"
+                            title="Deeper Search increases search breadth and cross-checking when validation evidence is weak or conflicting."
+                            aria-label="Deeper Search explanation"
+                          >
+                            <CircleHelp className="h-3.5 w-3.5" />
+                          </span>
                         </div>
                         <Switch
                           checked={highValidateSearchComplexity}
@@ -3677,44 +4516,6 @@ export default function ChatHistoryPanel({
                 </PopoverContent>
               </Popover>
             </div>
-            <button
-              type="button"
-              className={cn(
-                "h-7 rounded-md border px-2 text-[11px] font-medium transition",
-                graphGenerationEnabled
-                  ? "border-emerald-500/45 bg-emerald-500/12 text-emerald-700 shadow-sm dark:text-emerald-300"
-                  : "border-border/70 bg-muted/40 text-muted-foreground hover:text-foreground",
-              )}
-              aria-pressed={graphGenerationEnabled}
-              onClick={() =>
-                onGraphGenerationEnabledChange(!graphGenerationEnabled)
-              }
-            >
-              Graph Generate
-            </button>
-            <button
-              type="button"
-              className={cn(
-                "h-7 rounded-md border px-2 text-[11px] font-medium transition inline-flex items-center gap-1.5",
-                asyncBusy
-                  ? "border-red-400/50 bg-red-500/10 text-red-700 hover:bg-red-500/20 dark:text-red-300"
-                  : canRunManualValidate
-                    ? "border-emerald-400/50 bg-emerald-500/10 text-emerald-700 hover:bg-emerald-500/20 dark:text-emerald-300"
-                    : "border-border/70 bg-muted/40 text-muted-foreground",
-              )}
-              onClick={() => {
-                if (asyncBusy) {
-                  onStopAsync?.();
-                  return;
-                }
-                onValidateChat?.();
-              }}
-              disabled={!asyncBusy && !canRunManualValidate}
-              title={asyncBusy ? "Stop chat validation" : "Validate this chat"}
-            >
-              <ShieldCheck className="h-3.5 w-3.5" />
-              {asyncBusy ? "Stop Validate" : "Validate Chat"}
-            </button>
           </ChatToolbarUnderInput>
           <ChatToolbarAddonEnd>
             {canStopAsync ? (
