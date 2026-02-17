@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { DeertubeUIMessage } from "@/modules/ai/tools";
 import { isJsonObject } from "@/types/json";
 import type {
@@ -58,6 +58,7 @@ import {
   Search as SearchIcon,
   Send,
   Settings,
+  ShieldCheck,
   Square,
   UserRound,
   Wrench,
@@ -133,10 +134,14 @@ interface ChatHistoryPanelProps {
   graphGenerationEnabled: boolean;
   onGraphGenerationEnabledChange: (enabled: boolean) => void;
   busy: boolean;
+  asyncBusy?: boolean;
+  canValidateChat?: boolean;
   graphBusy?: boolean;
   onInputChange: (value: string) => void;
   onSend: () => void;
   onStop?: () => void;
+  onStopAsync?: () => void;
+  onValidateChat?: () => void;
   onRetry?: (messageId: string) => void;
   lastFailedMessageId?: string | null;
 }
@@ -192,8 +197,20 @@ interface SearchSkillOption {
   relativePath?: string;
 }
 
+interface StickyQuestionItem {
+  messageId: string;
+  order: number;
+}
+
 const TOOL_DETAIL_MAX_CHARS = 120;
 const HIGHLIGHT_SCROLL_MAX_RETRIES = 18;
+const STICKY_COLLAPSE_DELAY_MS = 80;
+const STICKY_STACK_COLLAPSED_OFFSET_PX = 6;
+const STICKY_STACK_EXPANDED_GAP_PX = 8;
+const STICKY_STACK_EXPANDED_FALLBACK_HEIGHT_PX = 84;
+const STICKY_STACK_COLLAPSED_VISIBLE_COUNT = 6;
+const STICKY_FOCUS_SAFETY_GAP_PX = 14;
+const STICKY_POST_CLICK_COLLAPSE_DELAY_MS = 1150;
 const SKILL_PROFILE_OPTIONS: {
   value: AgentSkillProfile;
   label: string;
@@ -285,11 +302,18 @@ const truncateInline = (value: string, maxChars = TOOL_DETAIL_MAX_CHARS): string
 
 const parseToolPayload = (value: unknown): unknown => {
   if (typeof value === "string") {
-    try {
-      return JSON.parse(value) as unknown;
-    } catch {
+    const trimmed = value.trim();
+    if (!trimmed) {
       return null;
     }
+    if (
+      !trimmed.startsWith("{") &&
+      !trimmed.startsWith("[") &&
+      !trimmed.startsWith("\"")
+    ) {
+      return trimmed;
+    }
+    return JSON.parse(trimmed) as unknown;
   }
   return value ?? null;
 };
@@ -548,12 +572,8 @@ const stringifyToolDetail = (value: unknown): string | undefined => {
     }
     return trimmed;
   }
-  try {
-    const serialized = JSON.stringify(value, null, 2);
-    return serialized ?? String(value);
-  } catch {
-    return String(value);
-  }
+  const serialized = JSON.stringify(value, null, 2);
+  return serialized ?? String(value);
 };
 
 const buildSubagentEntries = (payload: SubagentStreamPayload): SubagentEntry[] => {
@@ -667,16 +687,21 @@ export default function ChatHistoryPanel({
   graphGenerationEnabled,
   onGraphGenerationEnabledChange,
   busy,
+  asyncBusy = false,
+  canValidateChat = false,
   graphBusy = false,
   onInputChange,
   onSend,
   onStop,
+  onStopAsync,
+  onValidateChat,
   onRetry,
   lastFailedMessageId: lastFailedMessageIdProp,
 }: ChatHistoryPanelProps) {
   const { scrollRef, contentRef } = useStickToBottom();
   const highlightedId = selectedResponseId;
   const ignoreHighlightRef = useRef(false);
+  const stickyManualFocusLockUntilRef = useRef(0);
   const [advancedPanelOpen, setAdvancedPanelOpen] = useState(false);
   const [deepResearchQuickOpen, setDeepResearchQuickOpen] = useState(false);
   const [quickConfigTab, setQuickConfigTab] = useState<"search" | "validate">(
@@ -695,6 +720,21 @@ export default function ChatHistoryPanel({
   const [toolGroupOpenById, setToolGroupOpenById] = useState<
     Record<string, boolean>
   >({});
+  const [stickyQuestionsExpanded, setStickyQuestionsExpanded] = useState(false);
+  const [activeStickyQuestionById, setActiveStickyQuestionById] = useState<
+    Record<string, boolean>
+  >({});
+  const [stickyQuestionHeightById, setStickyQuestionHeightById] = useState<
+    Record<string, number>
+  >({});
+  const stickyCollapseTimeoutRef = useRef<number | null>(null);
+  const stickyPostClickCollapseTimeoutRef = useRef<number | null>(null);
+  const stickyQuestionAnchorByIdRef = useRef<Map<string, HTMLDivElement>>(
+    new Map(),
+  );
+  const stickyQuestionElementByIdRef = useRef<Map<string, HTMLDivElement>>(
+    new Map(),
+  );
   const resolvedDeepResearchConfig = useMemo(
     () => resolveDeepResearchConfig(deepResearchConfig),
     [deepResearchConfig],
@@ -852,6 +892,19 @@ export default function ChatHistoryPanel({
         .filter((item) => item.text.trim().length > 0),
     [nodes],
   );
+  useEffect(
+    () => () => {
+      if (stickyCollapseTimeoutRef.current !== null) {
+        window.clearTimeout(stickyCollapseTimeoutRef.current);
+        stickyCollapseTimeoutRef.current = null;
+      }
+      if (stickyPostClickCollapseTimeoutRef.current !== null) {
+        window.clearTimeout(stickyPostClickCollapseTimeoutRef.current);
+        stickyPostClickCollapseTimeoutRef.current = null;
+      }
+    },
+    [],
+  );
   useEffect(() => {
     setToolOpenById((previous) => {
       const next = { ...previous };
@@ -968,6 +1021,50 @@ export default function ChatHistoryPanel({
     [scrollRef],
   );
 
+  const recomputeActiveStickyQuestions = useCallback(() => {
+    const container = scrollRef.current;
+    if (!container) {
+      setActiveStickyQuestionById((previous) =>
+        Object.keys(previous).length > 0 ? {} : previous,
+      );
+      return;
+    }
+    setActiveStickyQuestionById((previous) => {
+      const next: Record<string, boolean> = {};
+      for (const [messageId, anchor] of stickyQuestionAnchorByIdRef.current) {
+        if (container.scrollTop >= anchor.offsetTop - 1) {
+          next[messageId] = true;
+        }
+      }
+      const previousKeys = Object.keys(previous);
+      const nextKeys = Object.keys(next);
+      if (previousKeys.length !== nextKeys.length) {
+        return next;
+      }
+      for (const key of nextKeys) {
+        if (next[key] !== previous[key]) {
+          return next;
+        }
+      }
+      return previous;
+    });
+  }, [scrollRef]);
+
+  const registerStickyQuestionAnchor = useCallback(
+    (messageId: string, element: HTMLDivElement | null) => {
+      const map = stickyQuestionAnchorByIdRef.current;
+      if (element) {
+        map.set(messageId, element);
+      } else {
+        map.delete(messageId);
+      }
+      window.requestAnimationFrame(() => {
+        recomputeActiveStickyQuestions();
+      });
+    },
+    [recomputeActiveStickyQuestions],
+  );
+
   const handleScroll = useCallback(() => {
     if (!scrollRef.current) {
       return;
@@ -977,10 +1074,186 @@ export default function ChatHistoryPanel({
     const atBottom =
       el.scrollTop + el.clientHeight >= el.scrollHeight - threshold;
     setIsAtBottom(atBottom);
+    recomputeActiveStickyQuestions();
+  }, [recomputeActiveStickyQuestions, scrollRef]);
+
+  const registerStickyQuestionElement = useCallback(
+    (messageId: string, element: HTMLDivElement | null) => {
+      const map = stickyQuestionElementByIdRef.current;
+      if (element) {
+        map.set(messageId, element);
+        return;
+      }
+      map.delete(messageId);
+    },
+    [],
+  );
+
+  const measureStickyQuestionHeights = useCallback(() => {
+    setStickyQuestionHeightById((previous) => {
+      const next: Record<string, number> = {};
+      for (const [messageId, element] of stickyQuestionElementByIdRef.current) {
+        const height = Math.ceil(element.getBoundingClientRect().height);
+        if (height > 0) {
+          next[messageId] = height;
+        }
+      }
+      const previousKeys = Object.keys(previous);
+      const nextKeys = Object.keys(next);
+      if (previousKeys.length !== nextKeys.length) {
+        return next;
+      }
+      for (const key of nextKeys) {
+        if (next[key] !== previous[key]) {
+          return next;
+        }
+      }
+      return previous;
+    });
+  }, []);
+
+  const expandStickyQuestions = useCallback(() => {
+    if (stickyCollapseTimeoutRef.current !== null) {
+      window.clearTimeout(stickyCollapseTimeoutRef.current);
+      stickyCollapseTimeoutRef.current = null;
+    }
+    if (stickyPostClickCollapseTimeoutRef.current !== null) {
+      window.clearTimeout(stickyPostClickCollapseTimeoutRef.current);
+      stickyPostClickCollapseTimeoutRef.current = null;
+    }
+    measureStickyQuestionHeights();
+    setStickyQuestionsExpanded(true);
+    window.requestAnimationFrame(() => {
+      measureStickyQuestionHeights();
+    });
+  }, [measureStickyQuestionHeights]);
+
+  const collapseStickyQuestions = useCallback(() => {
+    if (stickyCollapseTimeoutRef.current !== null) {
+      window.clearTimeout(stickyCollapseTimeoutRef.current);
+    }
+    if (stickyPostClickCollapseTimeoutRef.current !== null) {
+      window.clearTimeout(stickyPostClickCollapseTimeoutRef.current);
+      stickyPostClickCollapseTimeoutRef.current = null;
+    }
+    const now = Date.now();
+    const remainingLockMs = Math.max(
+      0,
+      stickyManualFocusLockUntilRef.current - now,
+    );
+    stickyCollapseTimeoutRef.current = window.setTimeout(() => {
+      setStickyQuestionsExpanded(false);
+      stickyCollapseTimeoutRef.current = null;
+    }, STICKY_COLLAPSE_DELAY_MS + remainingLockMs);
+  }, []);
+
+  const scheduleStickyPostClickCollapse = useCallback(() => {
+    if (stickyPostClickCollapseTimeoutRef.current !== null) {
+      window.clearTimeout(stickyPostClickCollapseTimeoutRef.current);
+      stickyPostClickCollapseTimeoutRef.current = null;
+    }
+    stickyPostClickCollapseTimeoutRef.current = window.setTimeout(() => {
+      const container = scrollRef.current;
+      if (!container) {
+        setStickyQuestionsExpanded(false);
+        stickyPostClickCollapseTimeoutRef.current = null;
+        return;
+      }
+      const hoveringSticky = container.querySelector(
+        '[data-sticky-card="true"]:hover',
+      );
+      if (!hoveringSticky) {
+        setStickyQuestionsExpanded(false);
+      }
+      stickyPostClickCollapseTimeoutRef.current = null;
+    }, STICKY_POST_CLICK_COLLAPSE_DELAY_MS);
   }, [scrollRef]);
+
+  const handleStickyQuestionFocus = useCallback(
+    (messageId: string) => {
+      const container = scrollRef.current;
+      if (!container) {
+        return;
+      }
+      if (stickyCollapseTimeoutRef.current !== null) {
+        window.clearTimeout(stickyCollapseTimeoutRef.current);
+        stickyCollapseTimeoutRef.current = null;
+      }
+      stickyManualFocusLockUntilRef.current = Date.now() + 900;
+      setStickyQuestionsExpanded(true);
+      setIsAtBottom(false);
+      scheduleStickyPostClickCollapse();
+      window.requestAnimationFrame(() => {
+        window.requestAnimationFrame(() => {
+          measureStickyQuestionHeights();
+          const cardTarget = container.querySelector<HTMLElement>(
+            `[data-message-id="${messageId}"]`,
+          );
+          if (!cardTarget) {
+            return;
+          }
+          const orderRaw = cardTarget.dataset.stickyOrder;
+          const parsedOrder = orderRaw ? Number.parseInt(orderRaw, 10) : 1;
+          const stickyOrder =
+            Number.isFinite(parsedOrder) && parsedOrder > 0 ? parsedOrder : 1;
+          const stickyEntries = Array.from(
+            stickyQuestionElementByIdRef.current.entries(),
+          )
+            .map(([id, element]) => {
+              const entryOrderRaw = element.dataset.stickyOrder;
+              const entryOrder = entryOrderRaw
+                ? Number.parseInt(entryOrderRaw, 10)
+                : 0;
+              return {
+                id,
+                order:
+                  Number.isFinite(entryOrder) && entryOrder > 0 ? entryOrder : 0,
+                height:
+                  Math.ceil(element.getBoundingClientRect().height) ||
+                  stickyQuestionHeightById[id] ||
+                  STICKY_STACK_EXPANDED_FALLBACK_HEIGHT_PX,
+              };
+            })
+            .filter((entry) => entry.order > 0)
+            .sort((left, right) => left.order - right.order);
+          let expandedTopOffset = 0;
+          for (const entry of stickyEntries) {
+            if (entry.order >= stickyOrder) {
+              break;
+            }
+            expandedTopOffset += entry.height + STICKY_STACK_EXPANDED_GAP_PX;
+          }
+          const safeTopInset = expandedTopOffset + STICKY_FOCUS_SAFETY_GAP_PX;
+
+          const anchorTarget =
+            container.querySelector<HTMLElement>(
+              `[data-scroll-anchor-id="${messageId}"]`,
+            ) ?? cardTarget;
+          const containerRect = container.getBoundingClientRect();
+          const targetRect = anchorTarget.getBoundingClientRect();
+          const anchorTop =
+            container.scrollTop + (targetRect.top - containerRect.top);
+          const nextTop = Math.max(0, anchorTop - safeTopInset);
+          container.scrollTo({
+            top: nextTop,
+            behavior: "smooth",
+          });
+        });
+      });
+    },
+    [
+      measureStickyQuestionHeights,
+      scheduleStickyPostClickCollapse,
+      scrollRef,
+      stickyQuestionHeightById,
+    ],
+  );
 
   useEffect(() => {
     if (!scrollRef.current) {
+      return;
+    }
+    if (Date.now() < stickyManualFocusLockUntilRef.current) {
       return;
     }
     let frameId: number | null = null;
@@ -1054,6 +1327,9 @@ export default function ChatHistoryPanel({
 
   useEffect(() => {
     if (scrollToBottomSignal === 0) {
+      return;
+    }
+    if (Date.now() < stickyManualFocusLockUntilRef.current) {
       return;
     }
     setIsAtBottom(true);
@@ -1152,6 +1428,86 @@ export default function ChatHistoryPanel({
     return items;
   }, [sortedMessages]);
 
+  const stickyQuestionItems = useMemo(() => {
+    const items: StickyQuestionItem[] = [];
+    let order = 1;
+    sortedMessages.forEach((message) => {
+      if (
+        message.kind === "graph-event" ||
+        message.kind === "subagent-event" ||
+        message.kind === "deepsearch-event" ||
+        message.role !== "user"
+      ) {
+        return;
+      }
+      items.push({
+        messageId: message.id,
+        order,
+      });
+      order += 1;
+    });
+    return items;
+  }, [sortedMessages]);
+
+  const stickyQuestionOrderByMessageId = useMemo(() => {
+    const map = new Map<string, number>();
+    stickyQuestionItems.forEach((item) => {
+      map.set(item.messageId, item.order);
+    });
+    return map;
+  }, [stickyQuestionItems]);
+
+  const stickyQuestionExpandedTopOffsetById = useMemo(() => {
+    const map = new Map<string, number>();
+    let offset = 0;
+    stickyQuestionItems.forEach((item) => {
+      map.set(item.messageId, offset);
+      const height =
+        stickyQuestionHeightById[item.messageId] ??
+        STICKY_STACK_EXPANDED_FALLBACK_HEIGHT_PX;
+      offset += height + STICKY_STACK_EXPANDED_GAP_PX;
+    });
+    return map;
+  }, [stickyQuestionHeightById, stickyQuestionItems]);
+
+  useEffect(() => {
+    if (stickyQuestionItems.length > 1) {
+      return;
+    }
+    if (stickyCollapseTimeoutRef.current !== null) {
+      window.clearTimeout(stickyCollapseTimeoutRef.current);
+      stickyCollapseTimeoutRef.current = null;
+    }
+    if (stickyQuestionsExpanded) {
+      setStickyQuestionsExpanded(false);
+    }
+    setActiveStickyQuestionById((previous) =>
+      Object.keys(previous).length > 0 ? {} : previous,
+    );
+  }, [stickyQuestionItems.length, stickyQuestionsExpanded]);
+
+  useEffect(() => {
+    if (!stickyQuestionsExpanded) {
+      return;
+    }
+    const rafId = window.requestAnimationFrame(() => {
+      measureStickyQuestionHeights();
+    });
+    return () => {
+      window.cancelAnimationFrame(rafId);
+    };
+  }, [measureStickyQuestionHeights, stickyQuestionsExpanded, sortedMessages.length]);
+
+  useEffect(() => {
+    if (stickyQuestionItems.length === 0) {
+      setActiveStickyQuestionById((previous) =>
+        Object.keys(previous).length > 0 ? {} : previous,
+      );
+      return;
+    }
+    recomputeActiveStickyQuestions();
+  }, [recomputeActiveStickyQuestions, stickyQuestionItems.length, sortedMessages.length]);
+
   const toolGroupIds = useMemo(() => {
     const ids: string[] = [];
     chatItems.forEach((item, index) => {
@@ -1238,11 +1594,14 @@ export default function ChatHistoryPanel({
   const hasInput = input.trim().length > 0;
   const retryOnly = showRetry && !hasInput;
   const canStop = busy && Boolean(onStop);
+  const canStopAsync = asyncBusy && Boolean(onStopAsync);
+  const canRunManualValidate = !asyncBusy && canValidateChat && Boolean(onValidateChat);
   const primaryActionLabel = canStop
     ? "Stop generation"
     : retryOnly
       ? "Retry request"
       : "Send message";
+  const asyncActionLabel = "Stop async tasks";
   const handlePrimaryAction = useCallback(() => {
     if (canStop) {
       onStop?.();
@@ -1442,6 +1801,7 @@ export default function ChatHistoryPanel({
             ? error.message
             : "Failed to scan skills directory.";
         setSkillsError(message);
+        throw error instanceof Error ? error : new Error(message);
       } finally {
         setSkillsLoading(false);
       }
@@ -1464,6 +1824,7 @@ export default function ChatHistoryPanel({
           ? error.message
           : "Failed to open skills directory.";
       setSkillsError(message);
+      throw error instanceof Error ? error : new Error(message);
     }
   }, [refreshSkillCatalog]);
 
@@ -2387,6 +2748,7 @@ export default function ChatHistoryPanel({
                   outputPayload?.toolName ??
                   "DeepSearch";
                 const isValidateMode = outputPayload?.mode === "validate";
+                const shouldShowFullDetails = developerMode || isValidateMode;
                 const hasDetails =
                   !!query ||
                   sources.length > 0 ||
@@ -2450,7 +2812,7 @@ export default function ChatHistoryPanel({
                         {!toolOpen &&
                           renderToolProgress(deepSearchProgress, eventMessage.toolStatus)}
                         <CollapsibleContent className="mt-2 min-w-0">
-                          {developerMode ? (
+                          {shouldShowFullDetails ? (
                             hasDetails ? (
                               <ChatEventContent className="min-w-0 space-y-2">
                                 <div className="space-y-1 break-words text-[11px] text-muted-foreground">
@@ -2697,6 +3059,53 @@ export default function ChatHistoryPanel({
               const isUser = message.role === "user";
               const isHighlighted = message.id === highlightedId;
               const isFailed = message.status === "failed";
+              const stickyQuestionOrder =
+                stickyQuestionOrderByMessageId.get(message.id);
+              const stickyQuestionCount = stickyQuestionItems.length;
+              const stickyQuestionExpandable =
+                isUser && stickyQuestionCount > 1;
+              const stickyQuestionActive =
+                isUser && Boolean(activeStickyQuestionById[message.id]);
+              const stickyQuestionStackIndex =
+                stickyQuestionOrder !== undefined ? stickyQuestionOrder - 1 : 0;
+              const stickyQuestionCollapsedDepth = Math.min(
+                stickyQuestionStackIndex,
+                STICKY_STACK_COLLAPSED_VISIBLE_COUNT - 1,
+              );
+              const stickyQuestionExpandedTopOffset =
+                stickyQuestionExpandedTopOffsetById.get(message.id) ??
+                stickyQuestionStackIndex *
+                  (STICKY_STACK_EXPANDED_FALLBACK_HEIGHT_PX +
+                    STICKY_STACK_EXPANDED_GAP_PX);
+              const stickyQuestionTopOffset = stickyQuestionExpandable
+                ? stickyQuestionsExpanded && stickyQuestionActive
+                  ? stickyQuestionExpandedTopOffset
+                  : 0
+                : 0;
+              const stickyQuestionTransform = stickyQuestionExpandable
+                ? stickyQuestionActive
+                  ? stickyQuestionsExpanded
+                    ? "translateY(0px) scale(1)"
+                    : `translateY(${stickyQuestionCollapsedDepth * STICKY_STACK_COLLAPSED_OFFSET_PX}px) scale(${Math.max(0.9, 1 - stickyQuestionCollapsedDepth * 0.015)})`
+                  : undefined
+                : undefined;
+              const stickyQuestionInteractive =
+                stickyQuestionExpandable && stickyQuestionActive;
+              const stickyQuestionZIndex = stickyQuestionOrder
+                ? 60 + stickyQuestionCount - stickyQuestionOrder
+                : undefined;
+              const handleStickyQuestionEnter = () => {
+                if (!stickyQuestionInteractive) {
+                  return;
+                }
+                expandStickyQuestions();
+              };
+              const handleStickyQuestionLeave = () => {
+                if (!stickyQuestionExpandable) {
+                  return;
+                }
+                collapseStickyQuestions();
+              };
               const shouldHighlightExcerpt =
                 message.id === selectedResponseId && !!selectedExcerpt;
               const displayContent =
@@ -2719,6 +3128,11 @@ export default function ChatHistoryPanel({
                     isHighlighted && "ring-2 ring-amber-400/60",
                   )}
                 >
+                  {stickyQuestionOrder ? (
+                    <div className="mb-1 text-[10px] font-semibold uppercase tracking-[0.12em] text-muted-foreground">
+                      {`Q${stickyQuestionOrder}`}
+                    </div>
+                  ) : null}
                   {isUser ? (
                     <div className="whitespace-pre-wrap text-sm leading-relaxed">
                       {renderUserContent(displayContent ?? "")}
@@ -2738,42 +3152,112 @@ export default function ChatHistoryPanel({
                   )}
                 </div>
               );
+              const renderMessageCard = (messageBody: React.ReactNode) => (
+                <div
+                  data-message-id={message.id}
+                  data-sticky-card={isUser ? "true" : undefined}
+                  data-sticky-order={
+                    stickyQuestionOrder !== undefined
+                      ? String(stickyQuestionOrder)
+                      : undefined
+                  }
+                  ref={
+                    isUser
+                      ? (element) => {
+                          registerStickyQuestionElement(message.id, element);
+                        }
+                      : undefined
+                  }
+                  className={cn(
+                    isUser &&
+                      "sticky rounded-md bg-background/95 px-1 py-1 shadow-sm backdrop-blur transition-[top,transform,box-shadow] duration-200 ease-out supports-[backdrop-filter]:bg-background/80",
+                    stickyQuestionInteractive && "cursor-pointer",
+                    stickyQuestionsExpanded &&
+                      stickyQuestionInteractive &&
+                      "shadow-md",
+                  )}
+                  style={
+                    isUser
+                      ? {
+                          top: stickyQuestionTopOffset,
+                          transform: stickyQuestionTransform,
+                          zIndex:
+                            stickyQuestionActive ? stickyQuestionZIndex : undefined,
+                        }
+                      : undefined
+                  }
+                  onMouseEnter={isUser ? handleStickyQuestionEnter : undefined}
+                  onMouseLeave={isUser ? handleStickyQuestionLeave : undefined}
+                  onClick={
+                    isUser
+                      ? () => {
+                          if (!stickyQuestionInteractive) {
+                            return;
+                          }
+                          handleStickyQuestionFocus(message.id);
+                        }
+                      : undefined
+                  }
+                >
+                  {messageBody}
+                </div>
+              );
               if (item.kind === "primary") {
+                const messageBody = (
+                  <PrimaryMessage
+                    senderName={isUser ? "You" : "Assistant"}
+                    avatarFallback={
+                      isUser ? (
+                        <UserRound className="h-4 w-4" />
+                      ) : (
+                        <Bot className="h-4 w-4" />
+                      )
+                    }
+                    content={content}
+                    timestamp={timestamp}
+                  />
+                );
+                if (!isUser) {
+                  return (
+                    <div key={item.id}>
+                      {renderMessageCard(messageBody)}
+                    </div>
+                  );
+                }
                 return (
-                  <div
-                    key={item.id}
-                    data-message-id={message.id}
-                    className={cn(
-                      isUser &&
-                        "sticky top-0 z-20 rounded-md bg-background/95 px-1 py-1 shadow-sm backdrop-blur supports-[backdrop-filter]:bg-background/80",
-                    )}
-                  >
-                    <PrimaryMessage
-                      senderName={isUser ? "You" : "Assistant"}
-                      avatarFallback={
-                        isUser ? (
-                          <UserRound className="h-4 w-4" />
-                        ) : (
-                          <Bot className="h-4 w-4" />
-                        )
-                      }
-                      content={content}
-                      timestamp={timestamp}
+                  <Fragment key={item.id}>
+                    <div
+                      ref={(element) => {
+                        registerStickyQuestionAnchor(message.id, element);
+                      }}
+                      data-scroll-anchor-id={message.id}
+                      className="h-0"
                     />
+                    {renderMessageCard(messageBody)}
+                  </Fragment>
+                );
+              }
+              const messageBody = (
+                <AdditionalMessage content={content} timestamp={timestamp} />
+              );
+              if (!isUser) {
+                return (
+                  <div key={item.id}>
+                    {renderMessageCard(messageBody)}
                   </div>
                 );
               }
               return (
-                <div
-                  key={item.id}
-                  data-message-id={message.id}
-                  className={cn(
-                    isUser &&
-                      "sticky top-0 z-20 rounded-md bg-background/95 px-1 py-1 shadow-sm backdrop-blur supports-[backdrop-filter]:bg-background/80",
-                  )}
-                >
-                  <AdditionalMessage content={content} timestamp={timestamp} />
-                </div>
+                <Fragment key={item.id}>
+                  <div
+                    ref={(element) => {
+                      registerStickyQuestionAnchor(message.id, element);
+                    }}
+                    data-scroll-anchor-id={message.id}
+                    className="h-0"
+                  />
+                  {renderMessageCard(messageBody)}
+                </Fragment>
               );
               })
             )}
@@ -3208,8 +3692,51 @@ export default function ChatHistoryPanel({
             >
               Graph Generate
             </button>
+            <button
+              type="button"
+              className={cn(
+                "h-7 rounded-md border px-2 text-[11px] font-medium transition inline-flex items-center gap-1.5",
+                asyncBusy
+                  ? "border-red-400/50 bg-red-500/10 text-red-700 hover:bg-red-500/20 dark:text-red-300"
+                  : canRunManualValidate
+                    ? "border-emerald-400/50 bg-emerald-500/10 text-emerald-700 hover:bg-emerald-500/20 dark:text-emerald-300"
+                    : "border-border/70 bg-muted/40 text-muted-foreground",
+              )}
+              onClick={() => {
+                if (asyncBusy) {
+                  onStopAsync?.();
+                  return;
+                }
+                onValidateChat?.();
+              }}
+              disabled={!asyncBusy && !canRunManualValidate}
+              title={asyncBusy ? "Stop chat validation" : "Validate this chat"}
+            >
+              <ShieldCheck className="h-3.5 w-3.5" />
+              {asyncBusy ? "Stop Validate" : "Validate Chat"}
+            </button>
           </ChatToolbarUnderInput>
           <ChatToolbarAddonEnd>
+            {canStopAsync ? (
+              <Button
+                size="icon"
+                variant="outline"
+                className="group relative h-8 w-8 rounded-md hover:border-destructive hover:text-destructive"
+                onClick={() => {
+                  onStopAsync?.();
+                }}
+                aria-label={asyncActionLabel}
+                title={asyncActionLabel}
+              >
+                <>
+                  <Loader2
+                    className="animate-spin transition-opacity duration-150 group-hover:opacity-0"
+                    style={{ animationDuration: "2.8s" }}
+                  />
+                  <Square className="absolute opacity-0 transition-opacity duration-150 group-hover:opacity-100" />
+                </>
+              </Button>
+            ) : null}
             <Button
               size="icon"
               variant={retryOnly ? "destructive" : "default"}
