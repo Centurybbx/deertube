@@ -176,22 +176,24 @@ export function createTools(
               .positive()
               .describe("Inclusive 1-based end line for highlighted reference."),
             text: z.string().describe("Reference text shown to end users."),
+            mode: z
+              .enum(["search", "validate"])
+              .optional()
+              .describe("Reference origin mode: search evidence or validation."),
             validationRefContent: z
               .string()
               .optional()
               .describe(
-                "Validate-mode only: concise support/refutation note for this reference.",
+                "Optional concise support/refutation note for this reference (especially useful in validate mode).",
               ),
             accuracy: z
               .enum(["high", "medium", "low", "conflicting", "insufficient"])
               .optional()
-              .describe("Validate-mode only: evidence accuracy grade."),
+              .describe("Evidence accuracy grade for this reference."),
             sourceAuthority: z
               .enum(["high", "medium", "low", "unknown"])
               .optional()
-              .describe(
-                "Validate-mode only: source-authority grade for this reference.",
-              ),
+              .describe("Source-authority grade for this reference."),
             issueReason: z
               .string()
               .optional()

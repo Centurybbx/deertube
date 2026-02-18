@@ -14,6 +14,16 @@ const highlightSchema = z.object({
   text: z.string().min(1),
   startLine: z.number().int().positive().optional(),
   endLine: z.number().int().positive().optional(),
+  uri: z.string().optional(),
+  url: z.string().optional(),
+  title: z.string().optional(),
+  validationRefContent: z.string().optional(),
+  accuracy: z
+    .enum(["high", "medium", "low", "conflicting", "insufficient"])
+    .optional(),
+  sourceAuthority: z.enum(["high", "medium", "low", "unknown"]).optional(),
+  issueReason: z.string().optional(),
+  correctFact: z.string().optional(),
 });
 
 export const browserViewRouter = createTRPCRouter({

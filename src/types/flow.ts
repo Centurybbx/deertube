@@ -10,6 +10,8 @@ export interface SourceNodeData {
   title: string
   url: string
   snippet?: string
+  referenceUri?: string
+  disableHoverPreview?: boolean
 }
 
 export interface InsightNodeData {

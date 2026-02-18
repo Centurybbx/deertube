@@ -481,6 +481,25 @@ export const dedupeSearchResults = (
 ): SearchResult[] => {
   const normalizeViewpointKey = (viewpoint: string): string =>
     viewpoint.replace(/\s+/g, " ").trim().toLowerCase();
+  const resolveSourceAuthorityScore = (
+    sourceAuthority: SearchResult["sourceAuthority"],
+  ): number => {
+    if (sourceAuthority === "high") return 4;
+    if (sourceAuthority === "medium") return 3;
+    if (sourceAuthority === "unknown") return 2;
+    if (sourceAuthority === "low") return 1;
+    return 0;
+  };
+  const resolveAccuracyScore = (
+    accuracy: SearchResult["accuracy"],
+  ): number => {
+    if (accuracy === "high") return 5;
+    if (accuracy === "medium") return 4;
+    if (accuracy === "insufficient") return 3;
+    if (accuracy === "low") return 2;
+    if (accuracy === "conflicting") return 1;
+    return 0;
+  };
   const score = (item: SearchResult): number => {
     const hasUsableEvidence =
       !(item.broken ?? false) &&
@@ -490,6 +509,8 @@ export const dedupeSearchResults = (
     let value = hasUsableEvidence ? 10 : 0;
     value += Math.min(item.selections.length, 5);
     if (item.content && item.content.trim().length > 0) value += 1;
+    value += resolveSourceAuthorityScore(item.sourceAuthority) * 3;
+    value += resolveAccuracyScore(item.accuracy) * 2;
     return value;
   };
   const mergeSelectionSets = (
@@ -787,9 +808,10 @@ export const buildDeepSearchReferences = (
   results: SearchResult[],
   projectId: string | undefined,
   searchId: string,
-  options?: { includeValidationFields?: boolean },
+  options?: { includeValidationFields?: boolean; mode?: "search" | "validate" },
 ): DeepSearchReference[] => {
   const includeValidationFields = options?.includeValidationFields ?? false;
+  const referenceMode = options?.mode;
   const references: DeepSearchReference[] = [];
   const dedupe = new Set<string>();
 
@@ -827,13 +849,12 @@ export const buildDeepSearchReferences = (
         startLine: candidate.start,
         endLine: candidate.end,
         text: candidate.text,
+        mode: referenceMode,
         validationRefContent: includeValidationFields
           ? result.validationRefContent
           : undefined,
-        accuracy: includeValidationFields ? result.accuracy : undefined,
-        sourceAuthority: includeValidationFields
-          ? result.sourceAuthority
-          : undefined,
+        accuracy: result.accuracy,
+        sourceAuthority: result.sourceAuthority,
         issueReason: includeValidationFields ? result.issueReason : undefined,
         correctFact: includeValidationFields ? result.correctFact : undefined,
       });

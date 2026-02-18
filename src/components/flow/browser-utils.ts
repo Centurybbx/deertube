@@ -51,6 +51,14 @@ export const toReferenceHighlightPayload = (
   text: reference.text,
   startLine: reference.startLine,
   endLine: reference.endLine,
+  uri: reference.uri,
+  url: reference.url,
+  title: reference.title,
+  validationRefContent: reference.validationRefContent,
+  accuracy: reference.accuracy,
+  sourceAuthority: reference.sourceAuthority,
+  issueReason: reference.issueReason,
+  correctFact: reference.correctFact,
 });
 
 const getValidationAccuracyPriority = (
@@ -179,6 +187,11 @@ export const buildBrowserValidationRecord = ({
     endLine,
     referenceTitle: selected.title,
     referenceUrl: selected.url,
+    referenceUri: selected.uri,
+    referenceRefId:
+      typeof selected.refId === "number" && selected.refId > 0
+        ? selected.refId
+        : undefined,
     accuracy: selected.accuracy,
     sourceAuthority: selected.sourceAuthority,
     validationRefContent: selected.validationRefContent,
@@ -186,5 +199,31 @@ export const buildBrowserValidationRecord = ({
     correctFact: selected.correctFact,
     sourceCount,
     referenceCount: references.length,
+  };
+};
+
+export const toValidationHighlightPayload = (
+  validation: BrowserPageValidationRecord,
+): BrowserViewReferenceHighlight | null => {
+  const text = validation.text.trim();
+  if (!text) {
+    return null;
+  }
+  return {
+    refId:
+      typeof validation.referenceRefId === "number" && validation.referenceRefId > 0
+        ? validation.referenceRefId
+        : 1,
+    text,
+    startLine: validation.startLine,
+    endLine: validation.endLine,
+    uri: validation.referenceUri,
+    url: validation.referenceUrl ?? validation.url,
+    title: validation.referenceTitle ?? validation.title,
+    validationRefContent: validation.validationRefContent,
+    accuracy: validation.accuracy,
+    sourceAuthority: validation.sourceAuthority,
+    issueReason: validation.issueReason,
+    correctFact: validation.correctFact,
   };
 };

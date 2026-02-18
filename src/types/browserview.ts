@@ -44,6 +44,8 @@ export interface BrowserPageValidationRecord {
   endLine: number;
   referenceTitle?: string;
   referenceUrl?: string;
+  referenceUri?: string;
+  referenceRefId?: number;
   accuracy?: ReferenceAccuracy;
   sourceAuthority?: ReferenceSourceAuthority;
   validationRefContent?: string;
@@ -94,4 +96,12 @@ export interface BrowserViewReferenceHighlight {
   text: string;
   startLine?: number;
   endLine?: number;
+  uri?: string;
+  url?: string;
+  title?: string;
+  validationRefContent?: string;
+  accuracy?: ReferenceAccuracy;
+  sourceAuthority?: ReferenceSourceAuthority;
+  issueReason?: string;
+  correctFact?: string;
 }

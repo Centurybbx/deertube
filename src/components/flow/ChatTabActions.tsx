@@ -205,12 +205,12 @@ export function ChatTabActions({
                   <SelectItem
                     value={chat.id}
                     className={cn(
-                      "pr-2 [&_.select-item-indicator]:hidden [&[data-state=checked]_.chat-updated-time]:hidden [&[data-state=checked]_.chat-current-indicator]:inline-flex",
+                      "pr-2 [&_.select-item-indicator]:hidden [&[data-state=checked]_.chat-updated-time]:hidden [&[data-state=checked]_.chat-current-indicator]:inline-flex [&>*:last-child]:flex-1 [&>*:last-child]:w-full",
                     )}
                     title={chat.title}
                   >
                     <div className="flex w-full min-w-0 items-center gap-2">
-                      <span className="min-w-0 flex-1 truncate text-sm text-foreground">
+                      <span className="min-w-0 w-full flex-1 truncate text-sm text-foreground">
                         {chat.title}
                       </span>
                       <div className="ml-auto flex h-5 shrink-0 items-center gap-1">

@@ -22,6 +22,7 @@ export interface MarkdownReferencePreview {
   text: string;
   startLine: number;
   endLine: number;
+  mode?: "search" | "validate";
   validationRefContent?: string;
   accuracy?: "high" | "medium" | "low" | "conflicting" | "insufficient";
   sourceAuthority?: "high" | "medium" | "low" | "unknown";
@@ -129,6 +130,7 @@ interface MarkdownRendererProps {
   className?: string;
   highlightExcerpt?: string;
   referenceAccuracyHints?: Record<string, MarkdownReferencePreview["accuracy"]>;
+  referenceModeHints?: Record<string, MarkdownReferencePreview["mode"]>;
   referenceSourceAuthorityHints?: Record<
     string,
     MarkdownReferencePreview["sourceAuthority"]
@@ -148,6 +150,7 @@ export const MarkdownRenderer = memo(
     className,
     highlightExcerpt,
     referenceAccuracyHints,
+    referenceModeHints,
     referenceSourceAuthorityHints,
     onNodeLinkClick,
     onReferenceClick,
@@ -174,6 +177,9 @@ export const MarkdownRenderer = memo(
     const [referenceAccuracyByUri, setReferenceAccuracyByUri] = useState<
       Record<string, MarkdownReferencePreview["accuracy"]>
     >({});
+    const [referenceModeByUri, setReferenceModeByUri] = useState<
+      Record<string, MarkdownReferencePreview["mode"]>
+    >({});
     const [referenceSourceAuthorityByUri, setReferenceSourceAuthorityByUri] =
       useState<Record<string, MarkdownReferencePreview["sourceAuthority"]>>({});
     const mergedReferenceAccuracyByUri = useMemo(
@@ -182,6 +188,13 @@ export const MarkdownRenderer = memo(
         ...referenceAccuracyByUri,
       }),
       [referenceAccuracyByUri, referenceAccuracyHints],
+    );
+    const mergedReferenceModeByUri = useMemo(
+      () => ({
+        ...(referenceModeHints ?? {}),
+        ...referenceModeByUri,
+      }),
+      [referenceModeByUri, referenceModeHints],
     );
     const mergedReferenceSourceAuthorityByUri = useMemo(
       () => ({
@@ -290,26 +303,43 @@ export const MarkdownRenderer = memo(
       };
     }, [referenceTooltip, stopTooltipScrollAnimation]);
 
-    const resolveTooltipPosition = useCallback((anchor: HTMLElement) => {
-      const rect = anchor.getBoundingClientRect();
-      const centerY = rect.top + rect.height / 2;
-      let left = rect.right + TOOLTIP_GAP;
-      if (left + TOOLTIP_WIDTH > window.innerWidth - TOOLTIP_MARGIN) {
-        left = rect.left - TOOLTIP_WIDTH - TOOLTIP_GAP;
-      }
-      if (left < TOOLTIP_MARGIN) {
-        left = TOOLTIP_MARGIN;
-      }
-      let top = centerY - TOOLTIP_HEIGHT / 2;
-      const maxTop = window.innerHeight - TOOLTIP_HEIGHT - TOOLTIP_MARGIN;
-      if (top > maxTop) {
-        top = maxTop;
-      }
-      if (top < TOOLTIP_MARGIN) {
-        top = TOOLTIP_MARGIN;
-      }
-      return { left, top };
-    }, []);
+    const resolveTooltipPosition = useCallback(
+      (anchor: HTMLElement, options?: { preferLeft?: boolean }) => {
+        const rect = anchor.getBoundingClientRect();
+        const centerY = rect.top + rect.height / 2;
+        const leftCandidate = rect.left - TOOLTIP_WIDTH - TOOLTIP_GAP;
+        const rightCandidate = rect.right + TOOLTIP_GAP;
+        const fitsHorizontally = (candidate: number) =>
+          candidate >= TOOLTIP_MARGIN &&
+          candidate + TOOLTIP_WIDTH <= window.innerWidth - TOOLTIP_MARGIN;
+        const preferLeft = options?.preferLeft === true;
+        let left = preferLeft ? leftCandidate : rightCandidate;
+        if (!fitsHorizontally(left)) {
+          const fallback = preferLeft ? rightCandidate : leftCandidate;
+          if (fitsHorizontally(fallback)) {
+            left = fallback;
+          } else {
+            left = Math.max(
+              TOOLTIP_MARGIN,
+              Math.min(
+                window.innerWidth - TOOLTIP_WIDTH - TOOLTIP_MARGIN,
+                fallback,
+              ),
+            );
+          }
+        }
+        let top = centerY - TOOLTIP_HEIGHT / 2;
+        const maxTop = window.innerHeight - TOOLTIP_HEIGHT - TOOLTIP_MARGIN;
+        if (top > maxTop) {
+          top = maxTop;
+        }
+        if (top < TOOLTIP_MARGIN) {
+          top = TOOLTIP_MARGIN;
+        }
+        return { left, top };
+      },
+      [],
+    );
 
     const scheduleHideReferenceTooltip = useCallback(() => {
       clearTooltipHideTimer();
@@ -361,12 +391,16 @@ export const MarkdownRenderer = memo(
     }, [clearTooltipHideTimer, stopTooltipScrollAnimation]);
 
     const showReferenceTooltip = useCallback(
-      async (uri: string, anchor: HTMLElement) => {
+      async (
+        uri: string,
+        anchor: HTMLElement,
+        options?: { preferLeft?: boolean },
+      ) => {
         if (!resolveReferencePreview) {
           return;
         }
         clearTooltipHideTimer();
-        const { left, top } = resolveTooltipPosition(anchor);
+        const { left, top } = resolveTooltipPosition(anchor, options);
         const cached = referencePreviewCacheRef.current.get(uri);
         if (cached !== undefined) {
           if (!cached) {
@@ -377,6 +411,12 @@ export const MarkdownRenderer = memo(
             setReferenceAccuracyByUri((previous) => ({
               ...previous,
               [uri]: cached.accuracy,
+            }));
+          }
+          if (cached.mode) {
+            setReferenceModeByUri((previous) => ({
+              ...previous,
+              [uri]: cached.mode,
             }));
           }
           if (cached.sourceAuthority) {
@@ -417,6 +457,12 @@ export const MarkdownRenderer = memo(
           setReferenceAccuracyByUri((previous) => ({
             ...previous,
             [uri]: resolved.accuracy,
+          }));
+        }
+        if (resolved.mode) {
+          setReferenceModeByUri((previous) => ({
+            ...previous,
+            [uri]: resolved.mode,
           }));
         }
         if (resolved.sourceAuthority) {
@@ -628,6 +674,10 @@ export const MarkdownRenderer = memo(
               normalizedHref && isDeertubeReference
                 ? mergedReferenceAccuracyByUri[normalizedHref]
                 : undefined;
+            const referenceMode =
+              normalizedHref && isDeertubeReference
+                ? mergedReferenceModeByUri[normalizedHref]
+                : undefined;
             const referenceSourceAuthority =
               normalizedHref && isDeertubeReference
                 ? mergedReferenceSourceAuthorityByUri[normalizedHref]
@@ -660,7 +710,9 @@ export const MarkdownRenderer = memo(
                   }
                   hoveredReferenceUriRef.current = normalizedHref;
                   clearTooltipHideTimer();
-                  void showReferenceTooltip(normalizedHref, event.currentTarget);
+                  void showReferenceTooltip(normalizedHref, event.currentTarget, {
+                    preferLeft: true,
+                  });
                 }}
                 onMouseLeave={() => {
                   if (isDeertubeReference) {
@@ -676,6 +728,7 @@ export const MarkdownRenderer = memo(
                 }}
                 className={markdownLinkClassName}
                 data-ref-accuracy={referenceAccuracy ?? undefined}
+                data-ref-mode={referenceMode ?? undefined}
                 data-ref-source-authority={referenceSourceAuthority ?? undefined}
                 data-reference-uri={isDeertubeReference ? normalizedHref ?? undefined : undefined}
               >
@@ -707,6 +760,7 @@ export const MarkdownRenderer = memo(
       resolveNodeLabel,
       resolveReferencePreview,
       mergedReferenceAccuracyByUri,
+      mergedReferenceModeByUri,
       mergedReferenceSourceAuthorityByUri,
       scheduleHideReferenceTooltip,
       showReferenceTooltip,
@@ -824,6 +878,13 @@ export const MarkdownRenderer = memo(
                     <div className="mt-1 text-[10px] uppercase tracking-[0.12em] text-muted-foreground">
                       Lines {referenceTooltip.reference.startLine}-{referenceTooltip.reference.endLine}
                     </div>
+                    {referenceTooltip.reference.mode ? (
+                      <div className="mt-1 text-[10px] uppercase tracking-[0.12em] text-muted-foreground">
+                        {referenceTooltip.reference.mode === "validate"
+                          ? "Validation Reference"
+                          : "Search Reference"}
+                      </div>
+                    ) : null}
                     {referenceTooltip.reference.accuracy ? (
                       <div
                         className={cn(

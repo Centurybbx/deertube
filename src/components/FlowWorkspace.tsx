@@ -63,6 +63,7 @@ import { usePreviewHover } from "./flow/usePreviewHover";
 import { useProfileSettings } from "./flow/useProfileSettings";
 import { useChatActions } from "./flow/useChatActions";
 import { QuestionActionProvider } from "./flow/QuestionActionProvider";
+import { SourceActionProvider } from "./flow/SourceActionProvider";
 import {
   executeBrowserValidation,
   updateBrowserTabValidationState,
@@ -81,6 +82,7 @@ import {
   normalizeHttpUrl,
   stripLineNumberPrefix,
   toReferenceHighlightPayload,
+  toValidationHighlightPayload,
   truncateLabel,
 } from "./flow/browser-utils";
 import ChatHistoryPanel from "./chat/ChatHistoryPanel";
@@ -2577,6 +2579,7 @@ function FlowWorkspaceInner({
         text: stripLineNumberPrefix(reference.text),
         startLine: reference.startLine,
         endLine: reference.endLine,
+        mode: reference.mode,
         validationRefContent: reference.validationRefContent,
         accuracy: reference.accuracy,
         sourceAuthority: reference.sourceAuthority,
@@ -2922,13 +2925,25 @@ function FlowWorkspaceInner({
             }),
           );
         },
-        onComplete: () => {
+        onComplete: (record) => {
           logBrowserValidate("ui-complete", {
             tabId,
+            accuracy: record.accuracy,
           });
+          const validationHighlight = toValidationHighlightPayload(record);
+          if (validationHighlight) {
+            scheduleBrowserReferenceHighlight(tabId, validationHighlight);
+          }
           setBrowserTabs((prev) =>
             updateBrowserTabValidationState({
-              tabs: prev,
+              tabs: prev.map((item) =>
+                item.id === tabId
+                  ? {
+                      ...item,
+                      referenceHighlight: validationHighlight ?? item.referenceHighlight,
+                    }
+                  : item,
+              ),
               tabId,
               status: "complete",
             }),
@@ -2973,6 +2988,7 @@ function FlowWorkspaceInner({
     },
     [
       browserTabMap,
+      scheduleBrowserReferenceHighlight,
       setValidationStatusForUrls,
       startPageValidation,
       stopPageValidationRun,
@@ -3682,6 +3698,10 @@ function FlowWorkspaceInner({
     () => ({ retryQuestion, busy }),
     [retryQuestion, busy],
   );
+  const sourceActionValue = useMemo(
+    () => ({ openReference: openBrowserReference }),
+    [openBrowserReference],
+  );
   const handleOpenSettings = useCallback(() => {
     setSettingsOpen(true);
   }, []);
@@ -3729,40 +3749,42 @@ function FlowWorkspaceInner({
 
   return (
     <QuestionActionProvider value={questionActionValue}>
-      <div className="flex h-screen w-screen flex-col bg-gradient-to-br from-[var(--surface-1)] via-[var(--surface-2)] to-[var(--surface-3)] text-foreground">
-        <FlowHeader
-          projectName={project.name}
-          projectPath={project.path}
-          developerMode={developerMode}
-          busy={busy}
-          onProjectNameClick={handleProjectNameClick}
-          onOpenSettings={handleOpenSettings}
-          onFocusChat={handleFocusChat}
-          onFocusGraph={handleFocusGraph}
-          theme={theme}
-          onToggleTheme={onToggleTheme}
-          onExit={handleExit}
-        />
-        <div className="relative flex-1">
-          <FlowFlexLayout
-            model={layoutModel}
-            onModelChange={handleLayoutChange}
-            renderTab={renderTab}
-            renderTabLabel={renderTabLabel}
-            renderTabButtons={renderTabButtons}
+      <SourceActionProvider value={sourceActionValue}>
+        <div className="flex h-screen w-screen flex-col bg-gradient-to-br from-[var(--surface-1)] via-[var(--surface-2)] to-[var(--surface-3)] text-foreground">
+          <FlowHeader
+            projectName={project.name}
+            projectPath={project.path}
+            developerMode={developerMode}
+            busy={busy}
+            onProjectNameClick={handleProjectNameClick}
+            onOpenSettings={handleOpenSettings}
+            onFocusChat={handleFocusChat}
+            onFocusGraph={handleFocusGraph}
+            theme={theme}
+            onToggleTheme={onToggleTheme}
+            onExit={handleExit}
+          />
+          <div className="relative flex-1">
+            <FlowFlexLayout
+              model={layoutModel}
+              onModelChange={handleLayoutChange}
+              renderTab={renderTab}
+              renderTabLabel={renderTabLabel}
+              renderTabButtons={renderTabButtons}
+            />
+          </div>
+          <SettingsPanel
+            open={settingsOpen}
+            profiles={profiles}
+            activeProfileId={activeProfileId}
+            onClose={handleCloseSettings}
+            onActiveProfileChange={handleActiveProfileChange}
+            onProfileAdd={handleProfileAdd}
+            onProfileDelete={handleProfileDelete}
+            onProfileChange={handleProfileChange}
           />
         </div>
-        <SettingsPanel
-          open={settingsOpen}
-          profiles={profiles}
-          activeProfileId={activeProfileId}
-          onClose={handleCloseSettings}
-          onActiveProfileChange={handleActiveProfileChange}
-          onProfileAdd={handleProfileAdd}
-          onProfileDelete={handleProfileDelete}
-          onProfileChange={handleProfileChange}
-        />
-      </div>
+      </SourceActionProvider>
     </QuestionActionProvider>
   );
 }

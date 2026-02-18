@@ -485,6 +485,10 @@ export async function resolveDeepResearchReference(
     startLine: reference.startLine,
     endLine: reference.endLine,
     text: reference.text,
+    mode:
+      reference.mode === "search" || reference.mode === "validate"
+        ? reference.mode
+        : undefined,
     validationRefContent:
       typeof reference.validationRefContent === "string"
         ? reference.validationRefContent

@@ -430,6 +430,7 @@ export const buildMainAgentSystemPrompt = (
     "If `deepSearch` returns zero references, do not output any citation markers such as [1](deertube://...), [2](deertube://...), and do not output a `References` section.",
     "If `deepSearch` returns references, inline citations must use markdown links from `references[].uri`: format `[n](deertube://...)`.",
     "When citations are used, every marker [n](deertube://...) must map to an existing `refId` and its matching `uri` from the same `deepSearch` result.",
+    "When multiple references support equivalent content, prefer citing higher-accuracy and higher-source-authority references first.",
     "Only cite provided indices. Do not invent new indices and do not output footnotes.",
     "**Do not** merge citations like [1,2] or [1-2]. Only use separate markers: [1](deertube://...), [2](deertube://...).",
     "Every citation link must use the deertube URI for that reference ID. Do not use external URLs in citation links, only use deertube://... link",
@@ -597,6 +598,8 @@ export const buildSearchSubagentSystemPrompt = (
     "Source quality policy:",
     `- ${config.sourceSelectionPolicy}`,
     "- Avoid low-credibility or rumor-heavy sources unless they are necessary for contrast and clearly labeled.",
+    "- For duplicated/equivalent claims across sources, prefer high-authority and high-confidence sources first.",
+    "- Do not extract every duplicate source. Start with a minimal high-confidence set, and only expand to lower-confidence sources when extracted evidence is still insufficient or conflicting.",
     "Search strategy:",
     "- Start search in the original user-question language.",
     "- Only try English or other languages when single-language results are missing, weak, off-topic, or otherwise insufficient.",
@@ -608,6 +611,7 @@ export const buildSearchSubagentSystemPrompt = (
     "- Prefer serial search rounds: inspect each search result set before deciding the next search query.",
     "- Control extraction cost: extract only URLs that are likely to add new evidence.",
     "- If a page/source appears highly similar or redundant to already extracted evidence, skip extracting it unless it can add clearly new information.",
+    "- When multiple candidates share near-identical content, prioritize extraction on higher-authority candidates before lower-authority ones.",
     `- Search complexity mode: ${config.searchComplexity}. ${buildComplexityInstruction(config.searchComplexity)}`,
     `- Tavily search depth mode: ${config.tavilySearchDepth}.`,
     "- Respect the search/extract call limits provided in the runtime prompt.",
@@ -621,7 +625,7 @@ export const buildSearchSubagentSystemPrompt = (
     "5) Finalization is mandatory: call writeResults exactly once with { results, errors }.",
     isValidateMode
       ? "6) In writeResults input, each result item should include: url, viewpoint, content, selections, validationRefContent, accuracy, sourceAuthority, issueReason, correctFact."
-      : "6) In writeResults input, each result item should include: url, viewpoint, content, selections.",
+      : "6) In writeResults input, each result item should include: url, viewpoint, content, selections, accuracy, sourceAuthority.",
     "7) `extract` returns line-numbered selections. All chosen selections must map to those numbered lines.",
     "8) Prefer small precise spans (typically 2-12 lines). Avoid broad/full-page spans unless strictly necessary.",
     "9) The same source can support multiple claims: keep multiple selections for one URL when needed.",
@@ -632,8 +636,9 @@ export const buildSearchSubagentSystemPrompt = (
     "14) Fatal tool failure rule: if every search call fails (e.g. Tavily errors) or every extract call fails (e.g. Jina errors), include clear reasons in `errors` so the outer agent can surface the failure to the user.",
     "15) Strict final-step rule: your very last action must be exactly one writeResults call.",
     "16) If writeResults is omitted at the end, the run is treated as failed.",
+    "17) Score each item on two axes: `accuracy` (high|medium|low|conflicting|insufficient) and `sourceAuthority` (high|medium|low|unknown).",
     isValidateMode
-      ? "17) In validate mode, score each item on two axes: `accuracy` (high|medium|low|conflicting|insufficient) and `sourceAuthority` (high|medium|low|unknown). For low/conflicting/insufficient accuracy, include `issueReason` and `correctFact` when evidence allows."
+      ? "18) In validate mode, for low/conflicting/insufficient accuracy, include `issueReason` and `correctFact` when evidence allows."
       : "",
     "Output rule: finalize via writeResults only. Do not output final JSON in plain text.",
     skillRegistryPrompt,
@@ -685,9 +690,11 @@ export const buildSearchSubagentRuntimePrompt = ({
     `${config.splitStrategy}`,
     "Prefer serial search: run one search call, inspect its results, then decide the next query.",
     "Language fallback strategy: start in the user-question language; only try English/other languages when results are empty, weak, or off-topic.",
+    "When multiple sources provide equivalent content, prefer high-authority/high-confidence sources first.",
+    "Do not extract all duplicates. Extract the minimal high-confidence subset first; only then backfill with lower-confidence sources if evidence is still insufficient or conflicting.",
     isValidateMode
       ? "Each result item must include: url, viewpoint, content, selections, validationRefContent, accuracy, sourceAuthority, issueReason, correctFact."
-      : "Each result item must include: url, viewpoint, content, selections.",
+      : "Each result item must include: url, viewpoint, content, selections, accuracy, sourceAuthority.",
     "Selections must be precise and minimal. Avoid broad/full-page spans unless strictly necessary.",
     "When one source supports multiple points, keep multiple small selections under the same URL.",
     "Merge duplicate viewpoints into one consolidated result item; do not repeat equivalent viewpoints.",
@@ -702,8 +709,9 @@ export const buildSearchSubagentRuntimePrompt = ({
     `Do not extract the same URL more than ${config.maxRepeatExtractUrl} times.`,
     "Finalization rule (strict): your very last step must be exactly one `writeResults` call.",
     "If `writeResults` is not called at the end, the run is treated as failed.",
+    "Accuracy rubric: high (directly and strongly supported), medium (mostly supported with minor gaps), low (weakly supported), conflicting (evidence conflicts), insufficient (not enough evidence). Source authority rubric: high (primary official/peer-reviewed/high editorial accountability), medium (credible but secondary or partially indirect), low (weak provenance, rumor-prone, unverified), unknown (authority cannot be confidently determined).",
     isValidateMode
-      ? "Validation accuracy rubric: high (directly and strongly supported), medium (mostly supported with minor gaps), low (weakly supported), conflicting (evidence conflicts), insufficient (not enough evidence). Source authority rubric: high (primary official/peer-reviewed/high editorial accountability), medium (credible but secondary or partially indirect), low (weak provenance, rumor-prone, unverified), unknown (authority cannot be confidently determined). For low/conflicting/insufficient outcomes, provide `issueReason` and `correctFact` whenever the evidence is sufficient to state them."
+      ? "For low/conflicting/insufficient outcomes in validate mode, provide `issueReason` and `correctFact` whenever the evidence is sufficient to state them."
       : "",
     "When evidence is sufficient, call `writeResults` exactly once with { results, errors }.",
   ].join("\n");

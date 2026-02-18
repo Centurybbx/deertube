@@ -1026,8 +1026,21 @@ export async function runSearchSubagent({
       error: item.error ?? extractedMeta?.error,
     };
   });
+  const normalizedWithReliability = normalized.map((item) => {
+    const hasUsableEvidence =
+      !item.error &&
+      !(item.broken ?? false) &&
+      !(item.inrelavate ?? false) &&
+      item.selections.length > 0;
+    return {
+      ...item,
+      accuracy: item.accuracy ?? (hasUsableEvidence ? "insufficient" : undefined),
+      sourceAuthority:
+        item.sourceAuthority ?? (hasUsableEvidence ? "unknown" : undefined),
+    };
+  });
   const mergedResults = dedupeSearchResults([
-    ...normalized,
+    ...normalizedWithReliability,
     ...globalErrorResults,
   ]);
   const hasUsableEvidence = mergedResults.some(

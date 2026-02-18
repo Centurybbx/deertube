@@ -365,6 +365,13 @@ const normalizeBrowserValidationRecord = (
   const accuracy = isReferenceAccuracy(value.accuracy)
     ? value.accuracy
     : undefined
+  const referenceRefIdRaw = value.referenceRefId
+  const referenceRefId =
+    typeof referenceRefIdRaw === 'number'
+      && Number.isInteger(referenceRefIdRaw)
+      && referenceRefIdRaw > 0
+      ? referenceRefIdRaw
+      : undefined
   const sourceAuthority = isReferenceSourceAuthority(value.sourceAuthority)
     ? value.sourceAuthority
     : undefined
@@ -378,6 +385,8 @@ const normalizeBrowserValidationRecord = (
     endLine,
     referenceTitle: normalizeOptionalText(value.referenceTitle),
     referenceUrl: normalizeOptionalText(value.referenceUrl),
+    referenceUri: normalizeOptionalText(value.referenceUri),
+    referenceRefId,
     accuracy,
     sourceAuthority,
     validationRefContent: normalizeOptionalText(value.validationRefContent),

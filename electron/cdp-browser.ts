@@ -289,6 +289,31 @@ const sanitizeReferenceHighlight = (
   payload: BrowserViewReferenceHighlight,
 ): BrowserViewReferenceHighlight => {
   const text = payload.text.trim();
+  const title =
+    typeof payload.title === "string" && payload.title.trim().length > 0
+      ? payload.title.trim()
+      : undefined;
+  const url =
+    typeof payload.url === "string" && payload.url.trim().length > 0
+      ? payload.url.trim()
+      : undefined;
+  const uri =
+    typeof payload.uri === "string" && payload.uri.trim().length > 0
+      ? payload.uri.trim()
+      : undefined;
+  const validationRefContent =
+    typeof payload.validationRefContent === "string" &&
+    payload.validationRefContent.trim().length > 0
+      ? payload.validationRefContent.trim()
+      : undefined;
+  const issueReason =
+    typeof payload.issueReason === "string" && payload.issueReason.trim().length > 0
+      ? payload.issueReason.trim()
+      : undefined;
+  const correctFact =
+    typeof payload.correctFact === "string" && payload.correctFact.trim().length > 0
+      ? payload.correctFact.trim()
+      : undefined;
   return {
     refId: payload.refId,
     text:
@@ -297,6 +322,14 @@ const sanitizeReferenceHighlight = (
         : text,
     startLine: payload.startLine,
     endLine: payload.endLine,
+    uri,
+    url,
+    title,
+    validationRefContent,
+    accuracy: payload.accuracy,
+    sourceAuthority: payload.sourceAuthority,
+    issueReason,
+    correctFact,
   };
 };
 
@@ -454,12 +487,7 @@ const buildInPageControlsScript = (
   const applyStateFnName = "__deertubeApplyValidationState";
   const actionBindingName = ${JSON.stringify(CDP_ACTION_BINDING_NAME)};
   const refPayload = ${JSON.stringify(
-    reference
-      ? {
-          refId: reference.refId,
-          text: reference.text,
-        }
-      : null,
+    reference ?? null,
   )};
   const runHighlight = ${runReferenceHighlightScript.toString()};
   const log = (...args) => {
@@ -1388,12 +1416,7 @@ class CdpBrowserController {
       attempt,
     });
     const evaluateResult = await this.sendCommand(session, "Runtime.evaluate", {
-      expression: `(${runReferenceHighlightScript.toString()})(${JSON.stringify(
-        {
-          refId: payload.refId,
-          text: payload.text,
-        },
-      )})`,
+      expression: `(${runReferenceHighlightScript.toString()})(${JSON.stringify(payload)})`,
       awaitPromise: true,
       returnByValue: true,
     });

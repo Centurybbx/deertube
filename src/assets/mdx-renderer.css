@@ -130,6 +130,16 @@
   color: rgb(71 85 105);
 }
 
+.markdown-body a.markdown-link[data-reference-uri][data-ref-mode="search"] {
+  text-decoration-style: dotted;
+  text-decoration-thickness: 1.5px;
+}
+
+.markdown-body a.markdown-link[data-reference-uri][data-ref-mode="validate"] {
+  text-decoration-style: solid;
+  text-decoration-thickness: 2.5px;
+}
+
 .dark .markdown-body a.markdown-link[data-ref-accuracy="high"] {
   color: rgb(52 211 153);
 }

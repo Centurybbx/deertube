@@ -9,6 +9,7 @@ interface ValidateReferenceSeed {
   title: string;
   url: string;
   text: string;
+  uri?: string;
 }
 
 interface BuildValidationGraphInsertionOptions {
@@ -21,6 +22,14 @@ interface ValidationGraphInsertion {
   nodes: FlowNode[];
   edges: FlowEdge[];
 }
+
+const normalizeOptionalUri = (value?: string): string | undefined => {
+  const trimmed = value?.trim();
+  if (!trimmed) {
+    return undefined;
+  }
+  return trimmed;
+};
 
 const toReferenceSeeds = (
   validation: BrowserPageValidationRecord,
@@ -35,6 +44,7 @@ const toReferenceSeeds = (
       text: stripLineNumberPrefix(
         reference.validationRefContent?.trim() ?? reference.text?.trim() ?? "",
       ),
+      uri: normalizeOptionalUri(reference.uri),
     }));
   }
   return [
@@ -44,6 +54,7 @@ const toReferenceSeeds = (
       text: stripLineNumberPrefix(
         validation.validationRefContent?.trim() ?? validation.text?.trim() ?? "",
       ),
+      uri: normalizeOptionalUri(validation.referenceUri),
     },
   ];
 };
@@ -114,10 +125,13 @@ export const buildValidationGraphInsertion = ({
   const childNodes: FlowNode[] = supportSeeds.map((seed, index) => {
     const nodeId = `validate-source-${crypto.randomUUID()}`;
     const snippet = seed.text.trim();
+    const normalizedReferenceUri = seed.uri?.trim();
     const data: SourceNodeData = {
       title: seed.title,
       url: seed.url,
       snippet: snippet.length > 380 ? `${snippet.slice(0, 380)}...` : snippet,
+      referenceUri: normalizedReferenceUri,
+      disableHoverPreview: true,
     };
     return {
       id: nodeId,

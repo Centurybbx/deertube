@@ -22,6 +22,7 @@ export interface DeepResearchReferenceRecord {
   endLine: number;
   text: string;
   uri: string;
+  mode?: "search" | "validate";
   validationRefContent?: string;
   accuracy?: DeepResearchReferenceAccuracy;
   sourceAuthority?: DeepResearchSourceAuthority;
@@ -55,6 +56,7 @@ export interface DeepResearchResolvedReference {
   startLine: number;
   endLine: number;
   text: string;
+  mode?: "search" | "validate";
   validationRefContent?: string;
   accuracy?: DeepResearchReferenceAccuracy;
   sourceAuthority?: DeepResearchSourceAuthority;

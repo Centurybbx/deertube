@@ -130,20 +130,16 @@ export const SearchSubagentFinalItemSchema = z
       .string()
       .optional()
       .describe(
-        "Validate-mode only: concise reference-specific support/refutation summary for the answer being checked.",
+        "Optional concise reference-specific support/refutation summary (especially useful in validate mode).",
       ),
     accuracy: z
       .enum(["high", "medium", "low", "conflicting", "insufficient"])
       .optional()
-      .describe(
-        "Validate-mode only: evidence accuracy grade for this reference item.",
-      ),
+      .describe("Evidence accuracy grade for this reference item."),
     sourceAuthority: z
       .enum(["high", "medium", "low", "unknown"])
       .optional()
-      .describe(
-        "Validate-mode only: source-authority grade for this reference item.",
-      ),
+      .describe("Source-authority grade for this reference item."),
     issueReason: z
       .string()
       .optional()
@@ -194,6 +190,8 @@ export const SEARCH_SUBAGENT_SYSTEM = [
   "Source quality policy:",
   "- Prefer high-credibility sources: established media with strong editorial standards and low misinformation history, official institutions, peer-reviewed journals, top conferences, and expert domain publications.",
   "- Avoid low-credibility or rumor-heavy sources unless they are necessary for contrast and clearly labeled.",
+  "- For duplicated/equivalent claims across sources, prefer high-authority and high-confidence sources first.",
+  "- Do not extract every duplicate source. Start with a minimal high-confidence set, and only expand to lower-confidence sources when extracted evidence remains insufficient or conflicting.",
   "Search strategy:",
   "- Start search in the original user-question language.",
   "- Only try English or other languages when single-language results are missing, weak, off-topic, or otherwise insufficient.",
@@ -205,6 +203,7 @@ export const SEARCH_SUBAGENT_SYSTEM = [
   "- Prefer serial search rounds: inspect each search result set before deciding the next search query.",
   "- Control extraction cost: extract only URLs that are likely to add new evidence.",
   "- If a page/source appears highly similar or redundant to already extracted evidence, skip extracting it unless it can add clearly new information.",
+  "- When multiple candidates share near-identical content, prioritize extraction on higher-authority candidates before lower-authority ones.",
   "- Respect the search/extract call limits provided in the runtime prompt.",
   "Workflow:",
   "1) Decompose into distinct sub-tasks, then call search to gather candidates (<=6 per query, multiple query rounds allowed).",
@@ -212,7 +211,7 @@ export const SEARCH_SUBAGENT_SYSTEM = [
   "3) Extraction is mandatory. Do not stop after search-only results.",
   "4) First decide your answer claims; then choose only the smallest sufficient evidence for each claim.",
   "5) Finalization is mandatory: call writeResults exactly once with { results, errors }.",
-  "6) In writeResults input, each result item should include: url, viewpoint, content, selections.",
+  "6) In writeResults input, each result item should include: url, viewpoint, content, selections, accuracy, sourceAuthority.",
   "7) `extract` returns line-numbered selections. All chosen selections must map to those numbered lines.",
   "8) Prefer small precise spans (typically 2-12 lines). Avoid broad/full-page spans unless strictly necessary.",
   "9) The same source can support multiple claims: keep multiple selections for one URL when needed.",
@@ -223,6 +222,7 @@ export const SEARCH_SUBAGENT_SYSTEM = [
   "14) Fatal tool failure rule: if every search call fails (e.g. Tavily errors) or every extract call fails (e.g. Jina errors), include clear reasons in `errors` so the outer agent can surface the failure to the user.",
   "15) Strict final-step rule: your very last action must be exactly one writeResults call.",
   "16) If writeResults is omitted at the end, the run is treated as failed.",
+  "17) Score each item on two axes: accuracy (high|medium|low|conflicting|insufficient) and sourceAuthority (high|medium|low|unknown).",
   "Output rule: finalize via writeResults only. Do not output final JSON in plain text.",
 ].join("\n");
 

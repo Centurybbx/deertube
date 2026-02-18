@@ -53,6 +53,7 @@ export interface DeepSearchReferencePayload {
   startLine: number
   endLine: number
   text: string
+  mode?: 'search' | 'validate'
   validationRefContent?: string
   accuracy?: 'high' | 'medium' | 'low' | 'conflicting' | 'insufficient'
   sourceAuthority?: 'high' | 'medium' | 'low' | 'unknown'

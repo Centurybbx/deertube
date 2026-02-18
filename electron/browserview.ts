@@ -87,6 +87,31 @@ const sanitizeReferenceHighlight = (
   payload: BrowserViewReferenceHighlight,
 ): BrowserViewReferenceHighlight => {
   const text = payload.text.trim();
+  const title =
+    typeof payload.title === "string" && payload.title.trim().length > 0
+      ? payload.title.trim()
+      : undefined;
+  const url =
+    typeof payload.url === "string" && payload.url.trim().length > 0
+      ? payload.url.trim()
+      : undefined;
+  const uri =
+    typeof payload.uri === "string" && payload.uri.trim().length > 0
+      ? payload.uri.trim()
+      : undefined;
+  const validationRefContent =
+    typeof payload.validationRefContent === "string" &&
+    payload.validationRefContent.trim().length > 0
+      ? payload.validationRefContent.trim()
+      : undefined;
+  const issueReason =
+    typeof payload.issueReason === "string" && payload.issueReason.trim().length > 0
+      ? payload.issueReason.trim()
+      : undefined;
+  const correctFact =
+    typeof payload.correctFact === "string" && payload.correctFact.trim().length > 0
+      ? payload.correctFact.trim()
+      : undefined;
   return {
     refId: payload.refId,
     text:
@@ -95,6 +120,14 @@ const sanitizeReferenceHighlight = (
         : text,
     startLine: payload.startLine,
     endLine: payload.endLine,
+    uri,
+    url,
+    title,
+    validationRefContent,
+    accuracy: payload.accuracy,
+    sourceAuthority: payload.sourceAuthority,
+    issueReason,
+    correctFact,
   };
 };
 
@@ -159,8 +192,10 @@ function runValidationSnapshotScript(maxLength: number) {
   };
 }
 
-export function runReferenceHighlightScript(payload: { refId: number; text: string }) {
+export function runReferenceHighlightScript(payload: BrowserViewReferenceHighlight) {
   const inlineMarkerAttribute = "data-deertube-inline-highlight";
+  const inlineRefMarkerAttribute = "data-deertube-ref-marker";
+  const inlineRefTooltipId = "deertube-ref-tooltip";
   const styleId = "deertube-ref-highlight-style";
   const lineNumberPrefix = /^\s*\d+\s+\|\s?/;
   const markdownHorizontalRule = /^\s*(?:-{3,}|_{3,}|\*{3,})\s*$/;
@@ -402,6 +437,81 @@ export function runReferenceHighlightScript(payload: { refId: number; text: stri
         padding: 0 0.08em !important;
         box-shadow: 0 0 0 1px rgba(0, 220, 255, 0.7) inset !important;
       }
+      span[${inlineRefMarkerAttribute}="true"] {
+        display: inline-flex !important;
+        align-items: center !important;
+        justify-content: center !important;
+        margin-left: 0.35em !important;
+        border-radius: 999px !important;
+        border: 1px solid rgba(2, 132, 199, 0.52) !important;
+        background: rgba(2, 132, 199, 0.14) !important;
+        color: #075985 !important;
+        font-size: 0.72em !important;
+        font-weight: 700 !important;
+        line-height: 1 !important;
+        padding: 0.12em 0.44em !important;
+        vertical-align: baseline !important;
+        cursor: pointer !important;
+      }
+      #${inlineRefTooltipId} {
+        position: fixed !important;
+        z-index: 2147483647 !important;
+        width: min(340px, calc(100vw - 24px)) !important;
+        max-height: min(280px, calc(100vh - 24px)) !important;
+        overflow-y: auto !important;
+        border-radius: 10px !important;
+        border: 1px solid rgba(15, 23, 42, 0.22) !important;
+        background: rgba(255, 255, 255, 0.98) !important;
+        color: #0f172a !important;
+        box-shadow: 0 18px 40px rgba(2, 6, 23, 0.3) !important;
+        padding: 10px !important;
+        backdrop-filter: blur(6px) !important;
+      }
+      #${inlineRefTooltipId}[data-hidden="true"] {
+        display: none !important;
+      }
+      #${inlineRefTooltipId} .deertube-ref-tooltip-title {
+        font-size: 12px !important;
+        font-weight: 700 !important;
+        line-height: 1.3 !important;
+        word-break: break-word !important;
+      }
+      #${inlineRefTooltipId} .deertube-ref-tooltip-meta {
+        margin-top: 4px !important;
+        font-size: 11px !important;
+        color: rgba(15, 23, 42, 0.72) !important;
+        line-height: 1.4 !important;
+        word-break: break-word !important;
+      }
+      #${inlineRefTooltipId} .deertube-ref-tooltip-badge {
+        margin-top: 6px !important;
+        font-size: 10px !important;
+        letter-spacing: 0.11em !important;
+        text-transform: uppercase !important;
+      }
+      #${inlineRefTooltipId} .deertube-ref-tooltip-panel {
+        margin-top: 8px !important;
+        border-radius: 7px !important;
+        padding: 6px 7px !important;
+        font-size: 11px !important;
+        line-height: 1.45 !important;
+        word-break: break-word !important;
+      }
+      #${inlineRefTooltipId} .deertube-ref-tooltip-panel.warn {
+        border: 1px solid rgba(220, 38, 38, 0.32) !important;
+        background: rgba(254, 226, 226, 0.7) !important;
+        color: #991b1b !important;
+      }
+      #${inlineRefTooltipId} .deertube-ref-tooltip-panel.good {
+        border: 1px solid rgba(16, 185, 129, 0.32) !important;
+        background: rgba(209, 250, 229, 0.72) !important;
+        color: #065f46 !important;
+      }
+      #${inlineRefTooltipId} .deertube-ref-tooltip-panel.note {
+        border: 1px solid rgba(148, 163, 184, 0.4) !important;
+        background: rgba(241, 245, 249, 0.85) !important;
+        color: #1e293b !important;
+      }
     `;
     document.head.appendChild(style);
   };
@@ -415,6 +525,16 @@ export function runReferenceHighlightScript(payload: { refId: number; text: stri
       parent.replaceChild(document.createTextNode(mark.textContent ?? ""), mark);
       parent.normalize();
     });
+    const markers = document.querySelectorAll<HTMLElement>(
+      `span[${inlineRefMarkerAttribute}="true"]`,
+    );
+    markers.forEach((marker) => {
+      marker.remove();
+    });
+    const tooltip = document.getElementById(inlineRefTooltipId);
+    if (tooltip) {
+      tooltip.remove();
+    }
   };
   const collectTextNodes = (element: HTMLElement): Text[] => {
     const textNodes: Text[] = [];
@@ -507,6 +627,161 @@ export function runReferenceHighlightScript(payload: { refId: number; text: stri
       wrapped += 1;
     });
     return wrapped;
+  };
+  const normalizeOptionalText = (value: unknown): string | null => {
+    if (typeof value !== "string") {
+      return null;
+    }
+    const trimmed = value.trim();
+    return trimmed.length > 0 ? trimmed : null;
+  };
+  const formatAccuracyLabel = (value: unknown): string | null => {
+    if (value === "high") return "High";
+    if (value === "medium") return "Medium";
+    if (value === "low") return "Low";
+    if (value === "conflicting") return "Conflicting";
+    if (value === "insufficient") return "Insufficient";
+    return null;
+  };
+  const formatSourceAuthorityLabel = (value: unknown): string | null => {
+    if (value === "high") return "High";
+    if (value === "medium") return "Medium";
+    if (value === "low") return "Low";
+    if (value === "unknown") return "Unknown";
+    return null;
+  };
+  const getTooltipTextColor = (
+    accuracy: string | null,
+    sourceAuthority: string | null,
+  ): string => {
+    if (accuracy === "Conflicting" || accuracy === "Low") {
+      return "#b91c1c";
+    }
+    if (sourceAuthority === "Low") {
+      return "#b91c1c";
+    }
+    if (accuracy === "High" && sourceAuthority === "High") {
+      return "#047857";
+    }
+    if (accuracy === "Medium" || sourceAuthority === "Medium") {
+      return "#b45309";
+    }
+    return "rgba(15, 23, 42, 0.82)";
+  };
+  const createTooltipContainer = (): HTMLDivElement => {
+    const existing = document.getElementById(inlineRefTooltipId);
+    if (existing instanceof HTMLDivElement) {
+      return existing;
+    }
+    const tooltip = document.createElement("div");
+    tooltip.id = inlineRefTooltipId;
+    tooltip.dataset.hidden = "true";
+    document.body.appendChild(tooltip);
+    return tooltip;
+  };
+  const setTooltipContent = (
+    tooltip: HTMLDivElement,
+    details: {
+      title: string;
+      url: string | null;
+      lineLabel: string | null;
+      accuracy: string | null;
+      sourceAuthority: string | null;
+      validationRefContent: string | null;
+      issueReason: string | null;
+      correctFact: string | null;
+      excerpt: string;
+    },
+  ) => {
+    tooltip.innerHTML = "";
+    const titleNode = document.createElement("div");
+    titleNode.className = "deertube-ref-tooltip-title";
+    titleNode.textContent = details.title;
+    tooltip.appendChild(titleNode);
+
+    if (details.url) {
+      const urlNode = document.createElement("div");
+      urlNode.className = "deertube-ref-tooltip-meta";
+      urlNode.textContent = details.url;
+      tooltip.appendChild(urlNode);
+    }
+    if (details.lineLabel) {
+      const linesNode = document.createElement("div");
+      linesNode.className = "deertube-ref-tooltip-meta";
+      linesNode.textContent = details.lineLabel;
+      tooltip.appendChild(linesNode);
+    }
+    if (details.accuracy ?? details.sourceAuthority) {
+      const badgeNode = document.createElement("div");
+      badgeNode.className = "deertube-ref-tooltip-badge";
+      badgeNode.style.color = getTooltipTextColor(
+        details.accuracy,
+        details.sourceAuthority,
+      );
+      badgeNode.textContent = [
+        details.accuracy ? `Accuracy ${details.accuracy}` : null,
+        details.sourceAuthority
+          ? `Source Authority ${details.sourceAuthority}`
+          : null,
+      ]
+        .filter((part): part is string => Boolean(part))
+        .join(" · ");
+      tooltip.appendChild(badgeNode);
+    }
+    if (details.issueReason) {
+      const issueNode = document.createElement("div");
+      issueNode.className = "deertube-ref-tooltip-panel warn";
+      issueNode.textContent = `Why wrong: ${details.issueReason}`;
+      tooltip.appendChild(issueNode);
+    }
+    if (details.correctFact) {
+      const correctNode = document.createElement("div");
+      correctNode.className = "deertube-ref-tooltip-panel good";
+      correctNode.textContent = `Correct fact: ${details.correctFact}`;
+      tooltip.appendChild(correctNode);
+    }
+    if (details.validationRefContent) {
+      const validationNode = document.createElement("div");
+      validationNode.className = "deertube-ref-tooltip-panel note";
+      validationNode.textContent = details.validationRefContent;
+      tooltip.appendChild(validationNode);
+    }
+    const excerptNode = document.createElement("div");
+    excerptNode.className = "deertube-ref-tooltip-panel note";
+    excerptNode.textContent = details.excerpt;
+    tooltip.appendChild(excerptNode);
+  };
+  const positionTooltipNearAnchor = (
+    tooltip: HTMLDivElement,
+    anchor: HTMLElement,
+  ) => {
+    const margin = 12;
+    const gap = 10;
+    const rect = anchor.getBoundingClientRect();
+    const width = Math.min(
+      Math.max(260, tooltip.offsetWidth || 320),
+      window.innerWidth - margin * 2,
+    );
+    const height = Math.min(
+      Math.max(120, tooltip.offsetHeight || 190),
+      window.innerHeight - margin * 2,
+    );
+    let left = rect.left - width - gap;
+    if (left < margin) {
+      const rightCandidate = rect.right + gap;
+      if (rightCandidate + width <= window.innerWidth - margin) {
+        left = rightCandidate;
+      } else {
+        left = Math.max(
+          margin,
+          Math.min(window.innerWidth - width - margin, left),
+        );
+      }
+    }
+    let top = rect.top + rect.height / 2 - height / 2;
+    top = Math.max(margin, Math.min(top, window.innerHeight - height - margin));
+    tooltip.style.left = `${Math.round(left)}px`;
+    tooltip.style.top = `${Math.round(top)}px`;
   };
 
   const excerpt = typeof payload.text === "string" ? payload.text : "";
@@ -610,6 +885,75 @@ export function runReferenceHighlightScript(payload: { refId: number; text: stri
 
   const highlightedSegments = applyInlineHighlight(target, range.start, range.end);
   const firstInlineMark = target.querySelector<HTMLElement>(`mark[${inlineMarkerAttribute}="true"]`);
+  let markerAttached = false;
+  if (firstInlineMark) {
+    const marker = document.createElement("span");
+    marker.setAttribute(inlineRefMarkerAttribute, "true");
+    marker.textContent = `[${payload.refId}]`;
+    const tooltip = createTooltipContainer();
+    const title =
+      normalizeOptionalText(payload.title) ??
+      normalizeOptionalText(payload.url) ??
+      `Reference ${payload.refId}`;
+    const lineLabel =
+      typeof payload.startLine === "number" && typeof payload.endLine === "number"
+        ? `Lines ${payload.startLine}-${payload.endLine}`
+        : null;
+    const accuracy = formatAccuracyLabel(payload.accuracy);
+    const sourceAuthority = formatSourceAuthorityLabel(payload.sourceAuthority);
+    const validationRefContent = normalizeOptionalText(payload.validationRefContent);
+    const issueReason = normalizeOptionalText(payload.issueReason);
+    const correctFact = normalizeOptionalText(payload.correctFact);
+    const tooltipUrl = normalizeOptionalText(payload.url);
+    const excerptText =
+      normalizeOptionalText(sanitizedExcerpt) ??
+      normalizeOptionalText(excerpt) ??
+      "No excerpt available.";
+
+    let hideTimer: number | null = null;
+    const clearHideTimer = () => {
+      if (hideTimer !== null) {
+        window.clearTimeout(hideTimer);
+        hideTimer = null;
+      }
+    };
+    const showTooltip = () => {
+      clearHideTimer();
+      setTooltipContent(tooltip, {
+        title,
+        url: tooltipUrl,
+        lineLabel,
+        accuracy,
+        sourceAuthority,
+        validationRefContent,
+        issueReason,
+        correctFact,
+        excerpt: excerptText,
+      });
+      tooltip.dataset.hidden = "false";
+      positionTooltipNearAnchor(tooltip, marker);
+    };
+    const scheduleHide = () => {
+      clearHideTimer();
+      hideTimer = window.setTimeout(() => {
+        hideTimer = null;
+        tooltip.dataset.hidden = "true";
+      }, 130);
+    };
+
+    marker.addEventListener("mouseenter", showTooltip);
+    marker.addEventListener("mouseleave", scheduleHide);
+    marker.addEventListener("focus", showTooltip);
+    marker.addEventListener("blur", scheduleHide);
+    marker.tabIndex = 0;
+    marker.style.userSelect = "none";
+
+    tooltip.addEventListener("mouseenter", showTooltip);
+    tooltip.addEventListener("mouseleave", scheduleHide);
+
+    firstInlineMark.insertAdjacentElement("afterend", marker);
+    markerAttached = true;
+  }
   (firstInlineMark ?? target).scrollIntoView({
     behavior: "smooth",
     block: "center",
@@ -622,6 +966,7 @@ export function runReferenceHighlightScript(payload: { refId: number; text: stri
     score: bestMatch.score,
     exact: bestMatch.exact,
     highlightedSegments,
+    markerAttached,
   };
 }
 
@@ -766,10 +1111,7 @@ class BrowserViewController {
       return false;
     }
     const result: unknown = await view.webContents.executeJavaScript(
-      `(${runReferenceHighlightScript.toString()})(${JSON.stringify({
-        refId: payload.refId,
-        text: payload.text,
-      })})`,
+      `(${runReferenceHighlightScript.toString()})(${JSON.stringify(payload)})`,
       true,
     );
     const ok = isJsonObject(result) && result.ok === true;

@@ -428,12 +428,14 @@ const mergeValidateReferencesInline = ({
   references: DeepSearchReferencePayload[];
 }): {
   content: string;
+  modeHints: Record<string, DeepSearchReferencePayload["mode"]>;
   accuracyHints: Record<string, DeepSearchReferencePayload["accuracy"]>;
   sourceAuthorityHints: Record<
     string,
     DeepSearchReferencePayload["sourceAuthority"]
   >;
 } => {
+  const modeHints: Record<string, DeepSearchReferencePayload["mode"]> = {};
   const accuracyHints: Record<
     string,
     DeepSearchReferencePayload["accuracy"]
@@ -450,6 +452,10 @@ const mergeValidateReferencesInline = ({
     if (!uri) {
       return;
     }
+    modeHints[uri] =
+      reference.mode === "search" || reference.mode === "validate"
+        ? reference.mode
+        : "validate";
     if (reference.accuracy) {
       accuracyHints[uri] = reference.accuracy;
     }
@@ -458,7 +464,7 @@ const mergeValidateReferencesInline = ({
     }
   });
   if (references.length === 0) {
-    return { content: source, accuracyHints, sourceAuthorityHints };
+    return { content: source, modeHints, accuracyHints, sourceAuthorityHints };
   }
   const existingUris = extractReferencedUrisFromMarkdown(source);
   const dedupe = new Set<string>();
@@ -495,7 +501,7 @@ const mergeValidateReferencesInline = ({
     )
     .slice(0, VALIDATE_REFERENCE_INLINE_LIMIT);
   if (inlineReferences.length === 0) {
-    return { content: source, accuracyHints, sourceAuthorityHints };
+    return { content: source, modeHints, accuracyHints, sourceAuthorityHints };
   }
 
   const lines = source.split("\n");
@@ -519,7 +525,7 @@ const mergeValidateReferencesInline = ({
     .filter(({ line, index }) => line.trim().length > 0 && !isInCodeFence(index))
     .map(({ index }) => index);
   if (candidateLineIndexes.length === 0) {
-    return { content: source, accuracyHints, sourceAuthorityHints };
+    return { content: source, modeHints, accuracyHints, sourceAuthorityHints };
   }
 
   const lineTokenMap = new Map<number, Set<string>>();
@@ -567,7 +573,7 @@ const mergeValidateReferencesInline = ({
   });
 
   if (markersByLine.size === 0) {
-    return { content: source, accuracyHints, sourceAuthorityHints };
+    return { content: source, modeHints, accuracyHints, sourceAuthorityHints };
   }
   const nextLines = lines.map((line, index) => {
     const markers = markersByLine.get(index);
@@ -579,6 +585,7 @@ const mergeValidateReferencesInline = ({
   });
   return {
     content: nextLines.join("\n"),
+    modeHints,
     accuracyHints,
     sourceAuthorityHints,
   };
@@ -624,6 +631,24 @@ const getValidateAccuracyTextClass = (
     return "text-slate-700 dark:text-slate-300";
   }
   return "text-muted-foreground";
+};
+
+const getSourceAuthorityToneClasses = (
+  sourceAuthority: DeepSearchReferencePayload["sourceAuthority"],
+): string => {
+  if (sourceAuthority === "high") {
+    return "ring-1 ring-emerald-400/35";
+  }
+  if (sourceAuthority === "medium") {
+    return "ring-1 ring-amber-400/35";
+  }
+  if (sourceAuthority === "low") {
+    return "ring-1 ring-red-400/35";
+  }
+  if (sourceAuthority === "unknown") {
+    return "ring-1 ring-slate-400/35";
+  }
+  return "";
 };
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
@@ -1121,6 +1146,7 @@ export default function ChatHistoryPanel({
   const {
     hiddenValidateToolCallIds,
     latestValidateRunByResponseId,
+    latestSearchDeepSearchMessageByResponseId,
     graphMessageByResponseId,
   } = useMemo(() => {
     const assistantResponseIds = new Set(
@@ -1195,6 +1221,21 @@ export default function ChatHistoryPanel({
       }
     });
 
+    const latestSearchByResponseId = new Map<string, ChatMessage>();
+    rawMessages.forEach((message) => {
+      if (message.kind !== "deepsearch-event" || isValidateDeepSearchEvent(message)) {
+        return;
+      }
+      const responseId = readResponseId(message.toolInput);
+      if (!responseId || !assistantResponseIds.has(responseId)) {
+        return;
+      }
+      const current = latestSearchByResponseId.get(responseId);
+      if (shouldPreferDeepSearchMessage(current, message)) {
+        latestSearchByResponseId.set(responseId, message);
+      }
+    });
+
     const graphByResponseId = new Map<string, ChatMessage>();
     rawMessages.forEach((message) => {
       if (message.kind !== "graph-event") {
@@ -1214,6 +1255,7 @@ export default function ChatHistoryPanel({
     return {
       hiddenValidateToolCallIds: hiddenToolCallIds,
       latestValidateRunByResponseId: latestByResponseId,
+      latestSearchDeepSearchMessageByResponseId: latestSearchByResponseId,
       graphMessageByResponseId: graphByResponseId,
     };
   }, [rawMessages]);
@@ -3486,6 +3528,17 @@ export default function ChatHistoryPanel({
                                         formatSourceAuthorityLabel(
                                           reference.sourceAuthority,
                                         );
+                                      const referenceMode =
+                                        reference.mode === "validate" ||
+                                        reference.mode === "search"
+                                          ? reference.mode
+                                          : isValidateMode
+                                            ? "validate"
+                                            : "search";
+                                      const referenceModeLabel =
+                                        referenceMode === "validate"
+                                          ? "Validate"
+                                          : "Search";
                                       const issueReason =
                                         typeof reference.issueReason === "string" &&
                                         reference.issueReason.trim().length > 0
@@ -3507,11 +3560,12 @@ export default function ChatHistoryPanel({
                                           type="button"
                                           className={cn(
                                             "w-full rounded-md border px-3 py-2 text-left text-xs transition",
-                                            isValidateMode
-                                              ? getValidateAccuracyToneClasses(
-                                                  accuracyValue,
-                                                )
-                                              : "border-border/70 bg-card/60",
+                                            getValidateAccuracyToneClasses(
+                                              accuracyValue,
+                                            ),
+                                            getSourceAuthorityToneClasses(
+                                              reference.sourceAuthority,
+                                            ),
                                             "hover:border-border hover:bg-card/80",
                                           )}
                                           onClick={() => {
@@ -3526,15 +3580,16 @@ export default function ChatHistoryPanel({
                                           <div className="break-words text-sm font-semibold text-foreground">
                                             {refTitle}
                                           </div>
+                                          <div className="mt-1 text-[11px] text-muted-foreground">
+                                            Type: {referenceModeLabel}
+                                          </div>
                                           {accuracyLabel ? (
                                             <div
                                               className={cn(
                                                 "mt-1 text-[11px]",
-                                                isValidateMode
-                                                  ? getValidateAccuracyTextClass(
-                                                      accuracyValue,
-                                                    )
-                                                  : "text-muted-foreground",
+                                                getValidateAccuracyTextClass(
+                                                  accuracyValue,
+                                                ),
                                               )}
                                             >
                                               Accuracy: {accuracyLabel}
@@ -3658,8 +3713,54 @@ export default function ChatHistoryPanel({
               const latestValidateRun = !isUser
                 ? latestValidateRunByResponseId.get(message.id)
                 : undefined;
+              const latestSearchDeepSearchMessage = !isUser
+                ? latestSearchDeepSearchMessageByResponseId.get(message.id)
+                : undefined;
               const validateDeepSearchMessage = latestValidateRun?.deepSearchMessage;
               const validateSubagentMessage = latestValidateRun?.subagentMessage;
+              const searchDeepSearchPayloadRaw = parseToolPayload(
+                latestSearchDeepSearchMessage?.toolOutput,
+              );
+              const searchDeepSearchPayload = isDeepSearchPayload(
+                searchDeepSearchPayloadRaw,
+              )
+                ? searchDeepSearchPayloadRaw
+                : null;
+              const searchReferences = Array.isArray(searchDeepSearchPayload?.references)
+                ? searchDeepSearchPayload.references
+                : [];
+              const searchReferenceModeHints: Record<
+                string,
+                DeepSearchReferencePayload["mode"]
+              > = {};
+              const searchReferenceAccuracyHints: Record<
+                string,
+                DeepSearchReferencePayload["accuracy"]
+              > = {};
+              const searchReferenceSourceAuthorityHints: Record<
+                string,
+                DeepSearchReferencePayload["sourceAuthority"]
+              > = {};
+              searchReferences.forEach((reference) => {
+                const uri =
+                  typeof reference.uri === "string" && reference.uri.trim().length > 0
+                    ? reference.uri.trim()
+                    : "";
+                if (!uri) {
+                  return;
+                }
+                searchReferenceModeHints[uri] =
+                  reference.mode === "search" || reference.mode === "validate"
+                    ? reference.mode
+                    : "search";
+                if (reference.accuracy) {
+                  searchReferenceAccuracyHints[uri] = reference.accuracy;
+                }
+                if (reference.sourceAuthority) {
+                  searchReferenceSourceAuthorityHints[uri] =
+                    reference.sourceAuthority;
+                }
+              });
               const validateDeepSearchPayloadRaw = parseToolPayload(
                 validateDeepSearchMessage?.toolOutput,
               );
@@ -3713,16 +3814,25 @@ export default function ChatHistoryPanel({
                       source: resolvedContent,
                       references: validateReferences,
                     })
-                  : {
-                      content: resolvedContent ?? "",
-                      accuracyHints: {},
-                      sourceAuthorityHints: {},
-                    };
+                : {
+                    content: resolvedContent ?? "",
+                    modeHints: {},
+                    accuracyHints: {},
+                    sourceAuthorityHints: {},
+                  };
               const assistantRenderedContent = validateInlineMerge.content;
-              const assistantReferenceAccuracyHints =
-                validateInlineMerge.accuracyHints;
-              const assistantReferenceSourceAuthorityHints =
-                validateInlineMerge.sourceAuthorityHints;
+              const assistantReferenceModeHints = {
+                ...searchReferenceModeHints,
+                ...validateInlineMerge.modeHints,
+              };
+              const assistantReferenceAccuracyHints = {
+                ...searchReferenceAccuracyHints,
+                ...validateInlineMerge.accuracyHints,
+              };
+              const assistantReferenceSourceAuthorityHints = {
+                ...searchReferenceSourceAuthorityHints,
+                ...validateInlineMerge.sourceAuthorityHints,
+              };
               const validationRunning = validateStatus === "running";
               const validationPopoverVisible = Boolean(
                 latestValidateRun && validateStatus,
@@ -4020,6 +4130,7 @@ export default function ChatHistoryPanel({
                     ) : (
                       <MarkdownRenderer
                         source={assistantRenderedContent}
+                        referenceModeHints={assistantReferenceModeHints}
                         referenceAccuracyHints={assistantReferenceAccuracyHints}
                         referenceSourceAuthorityHints={
                           assistantReferenceSourceAuthorityHints

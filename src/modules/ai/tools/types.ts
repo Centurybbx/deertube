@@ -41,6 +41,7 @@ export interface DeepSearchReference {
   startLine: number;
   endLine: number;
   text: string;
+  mode?: "search" | "validate";
   validationRefContent?: string;
   accuracy?: DeepResearchReferenceAccuracy;
   sourceAuthority?: DeepResearchSourceAuthority;

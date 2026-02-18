@@ -7,7 +7,13 @@ export function usePreviewHover() {
     if (node.type !== "source") {
       return;
     }
+    if (node.id.startsWith("validate-source-")) {
+      return;
+    }
     const data = node.data as SourceNodeData;
+    if (data.disableHoverPreview) {
+      return;
+    }
     if (!data.url) {
       return;
     }

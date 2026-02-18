@@ -140,6 +140,7 @@ export async function runDeepSearchTool({
     });
     const references = buildDeepSearchReferences(results, projectId, searchId, {
       includeValidationFields: mode === "validate",
+      mode,
     });
     const sources = buildDeepSearchSources(results, references);
     writeDeepSearchStream(
@@ -187,6 +188,7 @@ export async function runDeepSearchTool({
           startLine: reference.startLine,
           endLine: reference.endLine,
           text: reference.text,
+          mode: reference.mode,
           validationRefContent: reference.validationRefContent,
           accuracy: reference.accuracy,
           sourceAuthority: reference.sourceAuthority,
