@@ -243,7 +243,12 @@ const setValidationEventResolved = ({
   ) => void;
 }) => {
   const skipped = result.status === "skipped";
-  const status = result.status === "failed" ? "failed" : "complete";
+  const status: ChatMessage["toolStatus"] =
+    result.status === "failed"
+      ? "failed"
+      : skipped
+        ? "skipped"
+        : "complete";
   const skippedInfo = skipped
     ? result.skipReason === "no-fact-checkable-claims"
       ? "Validation skipped: no fact-checkable claims under current strictness."
@@ -264,7 +269,7 @@ const setValidationEventResolved = ({
               query: result.query,
               projectId: result.projectId,
               searchId: result.searchId,
-              status: status === "failed" ? "failed" : "complete",
+              status,
               sources: result.sources,
               references: result.references,
               error: skippedInfo,
@@ -317,6 +322,9 @@ const resolveDeepSearchStatus = (
 ): ChatMessage["toolStatus"] => {
   if (payload.status === "failed") {
     return "failed";
+  }
+  if (payload.status === "skipped") {
+    return "skipped";
   }
   if (
     payload.status === "complete" ||
@@ -389,7 +397,7 @@ const setSubagentStatusForToolCall = ({
     updater: (prev: ChatMessage[]) => ChatMessage[],
   ) => void;
 }) => {
-  if (status !== "complete" && status !== "failed") {
+  if (status !== "complete" && status !== "failed" && status !== "skipped") {
     return;
   }
   setAsyncSubagentEventMessages((prev) =>

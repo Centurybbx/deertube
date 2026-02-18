@@ -156,13 +156,14 @@ interface SubagentEntry {
   tone?: "warn";
 }
 
-type ToolExecutionStatus = "running" | "complete" | "failed";
+type ToolExecutionStatus = "running" | "complete" | "failed" | "skipped";
 
 interface ToolProgress {
   total: number;
   done: number;
   running: number;
   failed: number;
+  skipped: number;
 }
 
 interface GraphChatItem {
@@ -712,6 +713,9 @@ const toExecutionStatus = (
   if (status === "failed") {
     return "failed";
   }
+  if (status === "skipped") {
+    return "skipped";
+  }
   if (status === "complete") {
     return "complete";
   }
@@ -720,8 +724,8 @@ const toExecutionStatus = (
 
 const isTerminalToolStatus = (
   status: ChatMessage["toolStatus"] | undefined,
-): status is "complete" | "failed" =>
-  status === "complete" || status === "failed";
+): status is "complete" | "failed" | "skipped" =>
+  status === "complete" || status === "failed" || status === "skipped";
 
 const shouldPreferDeepSearchMessage = (
   current: ChatMessage | undefined,
@@ -798,7 +802,8 @@ const getProgressByStatuses = (statuses: ToolExecutionStatus[]): ToolProgress =>
   const done = statuses.filter((status) => status !== "running").length;
   const running = statuses.filter((status) => status === "running").length;
   const failed = statuses.filter((status) => status === "failed").length;
-  return { total, done, running, failed };
+  const skipped = statuses.filter((status) => status === "skipped").length;
+  return { total, done, running, failed, skipped };
 };
 
 const summarizeToolInput = (toolName: string | undefined, input: unknown) => {
@@ -2431,6 +2436,9 @@ export default function ChatHistoryPanel({
     if (status === "failed") {
       return "Failed";
     }
+    if (status === "skipped") {
+      return "Skipped";
+    }
     return "Complete";
   }, []);
 
@@ -2440,6 +2448,9 @@ export default function ChatHistoryPanel({
     }
     if (status === "failed") {
       return "failed";
+    }
+    if (status === "skipped") {
+      return "skipped";
     }
     return "done";
   }, []);
@@ -2484,6 +2495,9 @@ export default function ChatHistoryPanel({
       if (progress.failed > 0) {
         return "failed";
       }
+      if (progress.skipped > 0) {
+        return "skipped";
+      }
       return "complete";
     },
     [],
@@ -2497,6 +2511,9 @@ export default function ChatHistoryPanel({
       }
       if (progress.failed > 0) {
         return `${base} · ${progress.failed} failed`;
+      }
+      if (progress.skipped > 0) {
+        return `${base} · ${progress.skipped} skipped`;
       }
       return `${base} · all done`;
     },
@@ -2518,6 +2535,9 @@ export default function ChatHistoryPanel({
     if (status === "failed") {
       return "border-destructive/40 bg-destructive/10";
     }
+    if (status === "skipped") {
+      return "border-amber-400/40 bg-amber-500/10";
+    }
     return "border-border/60 bg-card/25";
   }, []);
 
@@ -2525,6 +2545,8 @@ export default function ChatHistoryPanel({
     (status: ChatMessage["toolStatus"]) =>
       status === "complete" ? (
         <Check className="h-4 w-4 shrink-0 text-emerald-500" aria-label="Complete" />
+      ) : status === "skipped" ? (
+        <AlertCircle className="h-4 w-4 shrink-0 text-amber-500" aria-label="Skipped" />
       ) : null,
     [],
   );
@@ -2535,6 +2557,9 @@ export default function ChatHistoryPanel({
     }
     if (status === "failed") {
       return <AlertCircle className="h-3.5 w-3.5 text-destructive" />;
+    }
+    if (status === "skipped") {
+      return <AlertCircle className="h-3.5 w-3.5 text-amber-500" />;
     }
     return (
       <Loader2
@@ -2550,6 +2575,8 @@ export default function ChatHistoryPanel({
       const barClassName =
         status === "failed"
           ? "bg-destructive/70"
+          : status === "skipped"
+            ? "bg-amber-500/70"
           : progress.running > 0
             ? "bg-sky-400/80"
             : "bg-emerald-500/70";
@@ -2567,6 +2594,8 @@ export default function ChatHistoryPanel({
               <span>{`${progress.running} running`}</span>
             ) : progress.failed > 0 ? (
               <span>{`${progress.failed} failed`}</span>
+            ) : progress.skipped > 0 ? (
+              <span>{`${progress.skipped} skipped`}</span>
             ) : (
               <span>all done</span>
             )}
@@ -3939,6 +3968,8 @@ export default function ChatHistoryPanel({
                             ? "animate-pulse text-sky-600 hover:bg-red-500/20 hover:text-red-600 dark:text-sky-300"
                             : validateStatus === "failed"
                               ? "text-red-600 hover:bg-red-500/15 hover:text-red-600 dark:text-red-300"
+                              : validateStatus === "skipped"
+                                ? "text-amber-600 hover:bg-amber-500/15 hover:text-amber-600 dark:text-amber-300"
                               : validateStatus === "complete"
                                 ? "text-emerald-600 hover:bg-emerald-500/15 hover:text-emerald-600 dark:text-emerald-300"
                                 : "text-muted-foreground hover:bg-muted/35 hover:text-foreground",
@@ -3964,6 +3995,8 @@ export default function ChatHistoryPanel({
                             ? "Stop validation"
                             : validateStatus === "failed"
                               ? "Validation failed, click to retry"
+                              : validateStatus === "skipped"
+                                ? "Validation skipped, click to retry"
                               : validateStatus === "complete"
                                 ? "Validate again"
                                 : "Validate this response"
@@ -3981,6 +4014,8 @@ export default function ChatHistoryPanel({
                           </>
                         ) : validateStatus === "failed" ? (
                           <AlertCircle className="h-3.5 w-3.5" />
+                        ) : validateStatus === "skipped" ? (
+                          <AlertCircle className="h-3.5 w-3.5 text-amber-500" />
                         ) : (
                           <ShieldCheck className="h-3.5 w-3.5" />
                         )}
@@ -4002,6 +4037,8 @@ export default function ChatHistoryPanel({
                           <div className="flex items-center gap-2 text-xs text-muted-foreground">
                             {validationRunning ? (
                               <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                            ) : validateStatus === "skipped" ? (
+                              <AlertCircle className="h-3.5 w-3.5 text-amber-500" />
                             ) : validateStatus === "complete" ? (
                               <Check className="h-3.5 w-3.5 text-emerald-500" />
                             ) : (
@@ -4010,6 +4047,8 @@ export default function ChatHistoryPanel({
                             <span>
                               {validationRunning
                                 ? "Validate running"
+                                : validateStatus === "skipped"
+                                  ? "Validate skipped"
                                 : validateStatus === "complete"
                                   ? "Validate complete"
                                   : "Validate failed"}
@@ -4021,7 +4060,14 @@ export default function ChatHistoryPanel({
                             </div>
                           ) : null}
                           {validateError ? (
-                            <div className="rounded border border-red-400/40 bg-red-500/10 px-2 py-1 text-[11px] text-red-700 dark:text-red-300">
+                            <div
+                              className={cn(
+                                "rounded px-2 py-1 text-[11px]",
+                                validateStatus === "skipped"
+                                  ? "border border-amber-400/40 bg-amber-500/10 text-amber-700 dark:text-amber-300"
+                                  : "border border-red-400/40 bg-red-500/10 text-red-700 dark:text-red-300",
+                              )}
+                            >
                               {validateError}
                             </div>
                           ) : null}

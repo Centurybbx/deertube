@@ -68,7 +68,7 @@ export interface DeepSearchStreamPayload {
   query?: string
   projectId?: string
   searchId?: string
-  status?: 'running' | 'complete' | 'failed'
+  status?: 'running' | 'complete' | 'failed' | 'skipped'
   sources?: DeepSearchSourcePayload[]
   references?: DeepSearchReferencePayload[]
   prompt?: string
@@ -101,5 +101,5 @@ export interface ChatMessage {
   toolName?: string
   toolInput?: ChatToolInput
   toolOutput?: ChatToolOutput
-  toolStatus?: 'running' | 'complete' | 'failed'
+  toolStatus?: 'running' | 'complete' | 'failed' | 'skipped'
 }

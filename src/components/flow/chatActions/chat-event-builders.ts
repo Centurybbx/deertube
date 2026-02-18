@@ -48,7 +48,8 @@ const isDeepSearchDone = (
   return (
     payload.complete === true ||
     payload.status === "complete" ||
-    payload.status === "failed"
+    payload.status === "failed" ||
+    payload.status === "skipped"
   );
 };
 

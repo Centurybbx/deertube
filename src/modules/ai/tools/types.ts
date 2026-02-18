@@ -56,7 +56,7 @@ export interface DeepSearchStreamPayload {
   query?: string;
   projectId?: string;
   searchId?: string;
-  status?: "running" | "complete" | "failed";
+  status?: "running" | "complete" | "failed" | "skipped";
   sources?: DeepSearchSource[];
   references?: DeepSearchReference[];
   prompt?: string;

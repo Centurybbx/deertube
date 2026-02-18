@@ -61,7 +61,12 @@ export const readDeepSearchPartPayload = (
 };
 
 const readKnownToolStatus = (value: unknown): ChatMessage["toolStatus"] | null => {
-  if (value === "running" || value === "complete" || value === "failed") {
+  if (
+    value === "running" ||
+    value === "complete" ||
+    value === "failed" ||
+    value === "skipped"
+  ) {
     return value;
   }
   return null;
@@ -119,6 +124,9 @@ export const deriveSubagentResultStatus = (
   if (statuses.includes("running")) {
     return "running";
   }
+  if (statuses.includes("skipped")) {
+    return "skipped";
+  }
   if (statuses.includes("complete")) {
     return "complete";
   }
@@ -139,7 +147,11 @@ export const deriveDeepSearchResultStatus = (
   done: boolean,
 ): ChatMessage["toolStatus"] | null => {
   const payloadStatus = readKnownToolStatus(payload.status);
-  if (payloadStatus === "failed" || payloadStatus === "complete") {
+  if (
+    payloadStatus === "failed" ||
+    payloadStatus === "complete" ||
+    payloadStatus === "skipped"
+  ) {
     return payloadStatus;
   }
   if (done) {
@@ -158,8 +170,8 @@ export const deriveDeepSearchResultStatus = (
 
 const isTerminalToolStatus = (
   status: ChatMessage["toolStatus"] | null,
-): status is "complete" | "failed" =>
-  status === "complete" || status === "failed";
+): status is "complete" | "failed" | "skipped" =>
+  status === "complete" || status === "failed" || status === "skipped";
 
 const mergeDeepSearchStatus = (
   previous: DeepSearchStreamPayload["status"],

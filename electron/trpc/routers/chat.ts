@@ -377,6 +377,7 @@ const deriveValidationClaimsFromAnswer = async ({
     return { claims: [], method: "raw-answer" };
   }
   const scopedAnswer = clampText(trimmedAnswer, VALIDATE_CLAIM_SPLIT_ANSWER_MAX);
+  let llmFailed = false;
   try {
     const result = await generateText({
       model,
@@ -397,23 +398,24 @@ const deriveValidationClaimsFromAnswer = async ({
     if (isAbortError(error)) {
       throw error;
     }
+    llmFailed = true;
     logValidate({
       event: "claim-split-fallback",
       projectPath,
       level: "warn",
       payload: {
-      message: error instanceof Error ? error.message : String(error),
+        message: error instanceof Error ? error.message : String(error),
       },
     });
-  }
-  if (strictness !== "all-claims") {
-    return { claims: [], method: "fallback-skip" };
   }
   const fallbackClaims = splitAnswerIntoSentenceLikeClaims(scopedAnswer)
     .map((line) => clampText(line, VALIDATE_CLAIM_ITEM_MAX))
     .slice(0, VALIDATE_CLAIM_MAX_COUNT);
   if (fallbackClaims.length > 0) {
     return { claims: fallbackClaims, method: "fallback" };
+  }
+  if (!llmFailed && strictness !== "all-claims") {
+    return { claims: [], method: "fallback-skip" };
   }
   return { claims: [], method: "raw-answer" };
 };
