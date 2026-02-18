@@ -114,20 +114,45 @@
   color: rgb(5 150 105);
 }
 
+.markdown-body
+  a.markdown-link[data-reference-uri][data-ref-accuracy="high"] {
+  background-color: rgb(16 185 129 / 0.14);
+}
+
 .markdown-body a.markdown-link[data-ref-accuracy="medium"] {
   color: rgb(217 119 6);
+}
+
+.markdown-body
+  a.markdown-link[data-reference-uri][data-ref-accuracy="medium"] {
+  background-color: rgb(245 158 11 / 0.16);
 }
 
 .markdown-body a.markdown-link[data-ref-accuracy="low"] {
   color: rgb(234 88 12);
 }
 
+.markdown-body
+  a.markdown-link[data-reference-uri][data-ref-accuracy="low"] {
+  background-color: rgb(249 115 22 / 0.18);
+}
+
 .markdown-body a.markdown-link[data-ref-accuracy="conflicting"] {
   color: rgb(220 38 38);
 }
 
+.markdown-body
+  a.markdown-link[data-reference-uri][data-ref-accuracy="conflicting"] {
+  background-color: rgb(239 68 68 / 0.2);
+}
+
 .markdown-body a.markdown-link[data-ref-accuracy="insufficient"] {
   color: rgb(71 85 105);
+}
+
+.markdown-body
+  a.markdown-link[data-reference-uri][data-ref-accuracy="insufficient"] {
+  background-color: rgb(100 116 139 / 0.18);
 }
 
 .markdown-body a.markdown-link[data-reference-uri][data-ref-mode="search"] {
@@ -144,23 +169,50 @@
   color: rgb(52 211 153);
 }
 
+.dark
+  .markdown-body a.markdown-link[data-reference-uri][data-ref-accuracy="high"] {
+  background-color: rgb(16 185 129 / 0.26);
+}
+
 .dark .markdown-body a.markdown-link[data-ref-accuracy="medium"] {
   color: rgb(251 191 36);
+}
+
+.dark
+  .markdown-body a.markdown-link[data-reference-uri][data-ref-accuracy="medium"] {
+  background-color: rgb(245 158 11 / 0.28);
 }
 
 .dark .markdown-body a.markdown-link[data-ref-accuracy="low"] {
   color: rgb(251 146 60);
 }
 
+.dark
+  .markdown-body a.markdown-link[data-reference-uri][data-ref-accuracy="low"] {
+  background-color: rgb(249 115 22 / 0.3);
+}
+
 .dark .markdown-body a.markdown-link[data-ref-accuracy="conflicting"] {
   color: rgb(248 113 113);
+}
+
+.dark
+  .markdown-body
+  a.markdown-link[data-reference-uri][data-ref-accuracy="conflicting"] {
+  background-color: rgb(239 68 68 / 0.32);
 }
 
 .dark .markdown-body a.markdown-link[data-ref-accuracy="insufficient"] {
   color: rgb(148 163 184);
 }
 
-.markdown-body a.markdown-link[data-reference-uri][data-ref-source-authority] {
+.dark
+  .markdown-body
+  a.markdown-link[data-reference-uri][data-ref-accuracy="insufficient"] {
+  background-color: rgb(100 116 139 / 0.3);
+}
+
+.markdown-body a.markdown-link[data-reference-uri] {
   border-radius: 9999px;
   margin: 0 0.04em;
   padding: 0 0.22em;

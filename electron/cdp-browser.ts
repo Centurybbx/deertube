@@ -320,6 +320,8 @@ const sanitizeReferenceHighlight = (
       text.length > MAX_HIGHLIGHT_TEXT_LENGTH
         ? `${text.slice(0, MAX_HIGHLIGHT_TEXT_LENGTH)}...`
         : text,
+    append: payload.append === true,
+    showMarker: payload.showMarker !== false,
     startLine: payload.startLine,
     endLine: payload.endLine,
     uri,

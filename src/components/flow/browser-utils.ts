@@ -61,6 +61,42 @@ export const toReferenceHighlightPayload = (
   correctFact: reference.correctFact,
 });
 
+export const toReferenceHighlightFromDeepSearchReference = (
+  reference: DeepSearchReferencePayload,
+): BrowserViewReferenceHighlight | null => {
+  const text = stripLineNumberPrefix(reference.text).trim();
+  if (!text) {
+    return null;
+  }
+  const startLine =
+    Number.isFinite(reference.startLine) && reference.startLine > 0
+      ? Math.floor(reference.startLine)
+      : 1;
+  const normalizedEndLine =
+    Number.isFinite(reference.endLine) && reference.endLine > 0
+      ? Math.floor(reference.endLine)
+      : startLine;
+  const endLine =
+    normalizedEndLine >= startLine ? normalizedEndLine : startLine;
+  return {
+    refId:
+      Number.isFinite(reference.refId) && reference.refId > 0
+        ? Math.floor(reference.refId)
+        : 1,
+    text,
+    startLine,
+    endLine,
+    uri: reference.uri,
+    url: reference.url,
+    title: reference.title,
+    validationRefContent: reference.validationRefContent,
+    accuracy: reference.accuracy,
+    sourceAuthority: reference.sourceAuthority,
+    issueReason: reference.issueReason,
+    correctFact: reference.correctFact,
+  };
+};
+
 const getValidationAccuracyPriority = (
   accuracy: BrowserPageValidationRecord["accuracy"],
 ): number => {

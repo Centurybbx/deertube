@@ -82,6 +82,7 @@ import {
   normalizeHttpUrl,
   stripLineNumberPrefix,
   toReferenceHighlightPayload,
+  toReferenceHighlightFromDeepSearchReference,
   toValidationHighlightPayload,
   truncateLabel,
 } from "./flow/browser-utils";
@@ -1953,7 +1954,10 @@ function FlowWorkspaceInner({
         } | null;
       }>;
       onRunning: () => void | Promise<void>;
-      onComplete: (record: BrowserPageValidationRecord) => void | Promise<void>;
+      onComplete: (result: {
+        record: BrowserPageValidationRecord;
+        references: DeepSearchReferencePayload[];
+      }) => void | Promise<void>;
       onFailed: (result: {
         message: string;
         reason: BrowserValidationFailureReason;
@@ -2047,12 +2051,15 @@ function FlowWorkspaceInner({
         startRunningChatJob(project.path, mappedChatId, runId);
       }
       let terminalStatusSettled = false;
-      const settleComplete = async (record: BrowserPageValidationRecord) => {
+      const settleComplete = async (result: {
+        record: BrowserPageValidationRecord;
+        references: DeepSearchReferencePayload[];
+      }) => {
         if (terminalStatusSettled) {
           return;
         }
         terminalStatusSettled = true;
-        await onComplete(record);
+        await onComplete(result);
       };
       const settleFailed = async (message: string) => {
         if (terminalStatusSettled) {
@@ -2254,7 +2261,10 @@ function FlowWorkspaceInner({
         if (graphInsertion.edges.length > 0) {
           setEdges((prev) => [...prev, ...graphInsertion.edges]);
         }
-        await settleComplete(record);
+        await settleComplete({
+          record,
+          references: normalizedReferences,
+        });
         logBrowserValidate("terminal-complete", {
           tabRuntimeId,
           runId,
@@ -2404,7 +2414,7 @@ function FlowWorkspaceInner({
               status: "running",
             });
           },
-          onComplete: async (record) => {
+          onComplete: async ({ record }) => {
             logBrowserValidate("cdp-ui-complete", {
               sessionId,
               accuracy: record.accuracy,
@@ -2693,14 +2703,21 @@ function FlowWorkspaceInner({
     (
       tabId: string,
       reference: BrowserViewReferenceHighlight,
-      attempt = 0,
+      options?: {
+        attempt?: number;
+        baseDelayMs?: number;
+      },
     ) => {
+      const attempt = options?.attempt ?? 0;
+      const baseDelayMs = options?.baseDelayMs ?? 0;
       if (attempt > 8) {
         throw new Error(
           `highlightReference retry budget exceeded for tab ${tabId}`,
         );
       }
-      const delay = attempt === 0 ? 180 : Math.min(1300, 220 * (attempt + 1));
+      const delay =
+        baseDelayMs +
+        (attempt === 0 ? 180 : Math.min(1300, 220 * (attempt + 1)));
       const timerId = window.setTimeout(() => {
         browserHighlightTimersRef.current.delete(timerId);
         void trpc.browserView.highlightReference
@@ -2715,13 +2732,45 @@ function FlowWorkspaceInner({
                   `highlightReference failed after retries for tab ${tabId}`,
                 );
               }
-              scheduleBrowserReferenceHighlight(tabId, reference, attempt + 1);
+              scheduleBrowserReferenceHighlight(tabId, reference, {
+                attempt: attempt + 1,
+                baseDelayMs,
+              });
             }
           });
       }, delay);
       browserHighlightTimersRef.current.add(timerId);
     },
     [],
+  );
+
+  const scheduleBrowserReferenceHighlights = useCallback(
+    (tabId: string, references: BrowserViewReferenceHighlight[]) => {
+      const dedupe = new Set<string>();
+      const normalized = references
+        .filter((reference) => reference.text.trim().length > 0)
+        .filter((reference) => {
+          const key = `${reference.refId}:${reference.startLine ?? 0}:${reference.endLine ?? 0}:${reference.text.trim()}`;
+          if (dedupe.has(key)) {
+            return false;
+          }
+          dedupe.add(key);
+          return true;
+        })
+        .slice(0, 8);
+      normalized.forEach((reference, index) => {
+        scheduleBrowserReferenceHighlight(
+          tabId,
+          {
+            ...reference,
+            append: index > 0,
+            showMarker: reference.showMarker ?? true,
+          },
+          { baseDelayMs: index * 260 },
+        );
+      });
+    },
+    [scheduleBrowserReferenceHighlight],
   );
 
   const resolveBrowserReference = useCallback(
@@ -2811,8 +2860,10 @@ function FlowWorkspaceInner({
           if (!reference) {
             return;
           }
-          const highlight = toReferenceHighlightPayload(reference);
-          openCdpUrl(reference.url, highlight);
+          openCdpUrl(reference.url, {
+            ...toReferenceHighlightPayload(reference),
+            showMarker: false,
+          });
         });
         return;
       }
@@ -2824,16 +2875,19 @@ function FlowWorkspaceInner({
         if (!reference) {
           return;
         }
-        const highlight = toReferenceHighlightPayload(reference);
+        const chatReferenceHighlight: BrowserViewReferenceHighlight = {
+          ...toReferenceHighlightPayload(reference),
+          showMarker: false,
+        };
         const tabId = openBrowserUrl(
           reference.url,
           reference.title ?? label ?? `Ref ${reference.refId}`,
-          highlight,
+          chatReferenceHighlight,
         );
         if (!tabId) {
           return;
         }
-        scheduleBrowserReferenceHighlight(tabId, highlight);
+        scheduleBrowserReferenceHighlight(tabId, chatReferenceHighlight);
       });
     },
     [
@@ -3117,22 +3171,33 @@ function FlowWorkspaceInner({
             }),
           );
         },
-        onComplete: (record) => {
+        onComplete: ({ record, references }) => {
           logBrowserValidate("ui-complete", {
             tabId,
             accuracy: record.accuracy,
           });
-          const validationHighlight = toValidationHighlightPayload(record);
-          if (validationHighlight) {
-            scheduleBrowserReferenceHighlight(tabId, validationHighlight);
+          const validationHighlights = references
+            .map((reference) =>
+              toReferenceHighlightFromDeepSearchReference(reference),
+            )
+            .filter(
+              (
+                reference,
+              ): reference is NonNullable<typeof reference> => reference !== null,
+            );
+          if (validationHighlights.length > 0) {
+            scheduleBrowserReferenceHighlights(tabId, validationHighlights);
           }
+          const primaryValidationHighlight =
+            validationHighlights[0] ?? toValidationHighlightPayload(record);
           setBrowserTabs((prev) =>
             updateBrowserTabValidationState({
               tabs: prev.map((item) =>
                 item.id === tabId
                   ? {
                       ...item,
-                      referenceHighlight: validationHighlight ?? item.referenceHighlight,
+                      referenceHighlight:
+                        primaryValidationHighlight ?? item.referenceHighlight,
                     }
                   : item,
               ),
@@ -3180,7 +3245,7 @@ function FlowWorkspaceInner({
     },
     [
       browserTabMap,
-      scheduleBrowserReferenceHighlight,
+      scheduleBrowserReferenceHighlights,
       setValidationStatusForUrls,
       startPageValidation,
       stopPageValidationRun,

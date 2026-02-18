@@ -94,6 +94,8 @@ export interface BrowserViewStatePayload {
 export interface BrowserViewReferenceHighlight {
   refId: number;
   text: string;
+  append?: boolean;
+  showMarker?: boolean;
   startLine?: number;
   endLine?: number;
   uri?: string;

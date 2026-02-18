@@ -118,6 +118,8 @@ const sanitizeReferenceHighlight = (
       text.length > MAX_HIGHLIGHT_TEXT_LENGTH
         ? `${text.slice(0, MAX_HIGHLIGHT_TEXT_LENGTH)}...`
         : text,
+    append: payload.append === true,
+    showMarker: payload.showMarker !== false,
     startLine: payload.startLine,
     endLine: payload.endLine,
     uri,
@@ -792,7 +794,9 @@ export function runReferenceHighlightScript(payload: BrowserViewReferenceHighlig
   }
 
   ensureStyle();
-  clearExistingHighlights();
+  if (payload.append !== true) {
+    clearExistingHighlights();
+  }
 
   const tokens = tokenized(sanitizedExcerpt || excerpt);
   const primarySelector = "p,li,blockquote,pre,code,h1,h2,h3,h4,h5,h6,td,th";
@@ -885,8 +889,9 @@ export function runReferenceHighlightScript(payload: BrowserViewReferenceHighlig
 
   const highlightedSegments = applyInlineHighlight(target, range.start, range.end);
   const firstInlineMark = target.querySelector<HTMLElement>(`mark[${inlineMarkerAttribute}="true"]`);
+  const shouldShowMarker = payload.showMarker !== false;
   let markerAttached = false;
-  if (firstInlineMark) {
+  if (firstInlineMark && shouldShowMarker) {
     const marker = document.createElement("span");
     marker.setAttribute(inlineRefMarkerAttribute, "true");
     marker.textContent = `[${payload.refId}]`;
@@ -968,6 +973,35 @@ export function runReferenceHighlightScript(payload: BrowserViewReferenceHighlig
     highlightedSegments,
     markerAttached,
   };
+}
+
+function runClearReferenceHighlightScript() {
+  const inlineMarkerAttribute = "data-deertube-inline-highlight";
+  const inlineRefMarkerAttribute = "data-deertube-ref-marker";
+  const inlineRefTooltipId = "deertube-ref-tooltip";
+  const markedNodes = Array.from(
+    document.querySelectorAll<HTMLElement>(
+      `mark[${inlineMarkerAttribute}="true"]`,
+    ),
+  );
+  markedNodes.forEach((mark) => {
+    const parent = mark.parentNode;
+    if (!parent) {
+      return;
+    }
+    while (mark.firstChild) {
+      parent.insertBefore(mark.firstChild, mark);
+    }
+    parent.removeChild(mark);
+  });
+  document
+    .querySelectorAll<HTMLElement>(`[${inlineRefMarkerAttribute}="true"]`)
+    .forEach((node) => node.remove());
+  const tooltip = document.getElementById(inlineRefTooltipId);
+  if (tooltip) {
+    tooltip.remove();
+  }
+  return { ok: true };
 }
 
 class BrowserViewController {
@@ -1273,6 +1307,21 @@ class BrowserViewController {
     }
     this.pendingHighlights.set(tabId, payload);
     return this.applyPendingHighlight(tabId);
+  }
+
+  async clearReferenceHighlight(tabId: string): Promise<boolean> {
+    const view = this.views.get(tabId);
+    if (!view) {
+      return false;
+    }
+    if (view.webContents.isLoadingMainFrame()) {
+      return false;
+    }
+    const result: unknown = await view.webContents.executeJavaScript(
+      `(${runClearReferenceHighlightScript.toString()})()`,
+      true,
+    );
+    return isJsonObject(result) && result.ok === true;
   }
 }
 

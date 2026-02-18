@@ -125,6 +125,43 @@ const getSourceAuthorityToneClass = (
   return "text-muted-foreground";
 };
 
+const composeReferenceHoverTitle = ({
+  existingTitle,
+  mode,
+  accuracy,
+  sourceAuthority,
+}: {
+  existingTitle?: string;
+  mode?: MarkdownReferencePreview["mode"];
+  accuracy?: MarkdownReferencePreview["accuracy"];
+  sourceAuthority?: MarkdownReferencePreview["sourceAuthority"];
+}): string | undefined => {
+  const modeLabel =
+    mode === "validate"
+      ? "Validation reference"
+      : mode === "search"
+        ? "Search reference"
+        : undefined;
+  const accuracyLabel = formatAccuracyLabel(accuracy);
+  const sourceAuthorityLabel = formatSourceAuthorityLabel(sourceAuthority);
+  const details = [
+    modeLabel,
+    accuracyLabel ? `Accuracy: ${accuracyLabel}` : null,
+    sourceAuthorityLabel ? `Source authority: ${sourceAuthorityLabel}` : null,
+  ].filter((part): part is string => Boolean(part));
+  const trimmedExisting = existingTitle?.trim();
+  if (trimmedExisting && details.length > 0) {
+    return [trimmedExisting, ...details].join(" | ");
+  }
+  if (trimmedExisting) {
+    return trimmedExisting;
+  }
+  if (details.length > 0) {
+    return details.join(" | ");
+  }
+  return undefined;
+};
+
 interface MarkdownRendererProps {
   source: string;
   className?: string;
@@ -682,10 +719,18 @@ export const MarkdownRenderer = memo(
               normalizedHref && isDeertubeReference
                 ? mergedReferenceSourceAuthorityByUri[normalizedHref]
                 : undefined;
+            const referenceTitle = composeReferenceHoverTitle({
+              existingTitle:
+                typeof restProps.title === "string" ? restProps.title : undefined,
+              mode: referenceMode,
+              accuracy: referenceAccuracy,
+              sourceAuthority: referenceSourceAuthority,
+            });
             return (
               <a
                 {...restProps}
                 href={normalizedHref ?? undefined}
+                title={referenceTitle}
                 onClick={(event) => {
                   event.preventDefault();
                   event.stopPropagation();

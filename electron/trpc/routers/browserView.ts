@@ -12,6 +12,8 @@ const boundsSchema = z.object({
 const highlightSchema = z.object({
   refId: z.number().int().positive(),
   text: z.string().min(1),
+  append: z.boolean().optional(),
+  showMarker: z.boolean().optional(),
   startLine: z.number().int().positive().optional(),
   endLine: z.number().int().positive().optional(),
   uri: z.string().optional(),
@@ -121,6 +123,13 @@ export const browserViewRouter = createTRPCRouter({
     .mutation(async ({ input }) => {
       const controller = getBrowserViewController();
       const ok = await controller.highlightReference(input.tabId, input.reference);
+      return { ok };
+    }),
+  clearReferenceHighlight: baseProcedure
+    .input(z.object({ tabId: z.string() }))
+    .mutation(async ({ input }) => {
+      const controller = getBrowserViewController();
+      const ok = await controller.clearReferenceHighlight(input.tabId);
       return { ok };
     }),
 });
