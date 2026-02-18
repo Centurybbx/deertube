@@ -58,7 +58,7 @@ import { runExtractSubagent } from "./extract-subagent";
 
 const SEARCH_SUBAGENT_MAX_STEPS = 16;
 const ABORT_ERROR_NAME = "AbortError";
-const MAX_VALIDATE_ANSWER_CHARS = 5000;
+const MAX_VALIDATE_ANSWER_CHARS = 20000;
 
 const normalizeToolKey = (value: string): string =>
   value.replace(/\s+/g, " ").trim().toLowerCase();
@@ -73,6 +73,29 @@ const normalizeSearchViewpoint = (
   const compact = (value ?? "").replace(/\s+/g, " ").trim();
   return compact.length > 0 ? compact : fallback;
 };
+
+const DEERTUBE_REF_PREFIX = "deertube://";
+
+const isDeertubeReferenceUrl = (url: string): boolean =>
+  url.trim().toLowerCase().startsWith(DEERTUBE_REF_PREFIX);
+
+const normalizeLineSelections = (selections: LineSelection[]): LineSelection[] =>
+  selections
+    .flatMap((selection) => {
+      const rawStart = Math.floor(selection.start);
+      const rawEnd = Math.floor(selection.end);
+      if (!Number.isFinite(rawStart) || !Number.isFinite(rawEnd)) {
+        return [];
+      }
+      const start = Math.max(1, rawStart);
+      const end = Math.max(start, rawEnd);
+      const text = selection.text.trim();
+      if (!text) {
+        return [];
+      }
+      return [{ start, end, text }];
+    })
+    .sort((a, b) => (a.start === b.start ? a.end - b.end : a.start - b.start));
 
 const isAbortError = (error: unknown): boolean =>
   error instanceof Error && error.name === ABORT_ERROR_NAME;
@@ -901,16 +924,61 @@ export async function runSearchSubagent({
     candidate: SearchResult[],
   ): { normalized: SearchResult[]; errors: string[] } => {
     const errors: string[] = [];
-    const extractedUrls = new Set<string>([
-      ...Array.from(extractedEvidenceByUrl.keys()),
-      ...Array.from(extractedMetaByUrl.keys()),
-    ]);
+    const hasExtractedUrl = (url: string): boolean =>
+      extractedEvidenceByUrl.has(url) || extractedMetaByUrl.has(url);
     const normalized = candidate.flatMap((item) => {
-      if (!extractedUrls.has(item.url)) {
-        errors.push(
-          `writeResults returned URL that was never extracted: ${item.url}`,
-        );
-        return [];
+      if (!hasExtractedUrl(item.url)) {
+        const allowValidateRefWithoutExtract =
+          mode === "validate" && isDeertubeReferenceUrl(item.url);
+        if (!allowValidateRefWithoutExtract) {
+          errors.push(
+            `writeResults returned URL that was never extracted: ${item.url}`,
+          );
+          return [];
+        }
+        const normalizedSelections = normalizeLineSelections(item.selections);
+        const hasPerUrlError =
+          typeof item.error === "string" && item.error.trim().length > 0;
+        const hasUsableValidateRefPayload =
+          normalizedSelections.length > 0 ||
+          (item.broken ?? false) ||
+          (item.inrelavate ?? false) ||
+          hasPerUrlError;
+        if (!hasUsableValidateRefPayload) {
+          errors.push(
+            `validate writeResults returned deertube reference without usable selections/flags: ${item.url}`,
+          );
+          return [];
+        }
+        if (normalizedSelections.length > 0) {
+          const contentsBySelection = new Map<string, string>();
+          normalizedSelections.forEach((selection) => {
+            contentsBySelection.set(
+              `${selection.start}:${selection.end}`,
+              selection.text,
+            );
+          });
+          extractedEvidenceByUrl.set(item.url, {
+            selections: normalizedSelections,
+            contentsBySelection,
+          });
+        }
+        const existingMeta = extractedMetaByUrl.get(item.url) ?? {};
+        extractedMetaByUrl.set(item.url, {
+          title: existingMeta.title ?? item.title ?? searchLookup.get(item.url)?.title,
+          pageId: existingMeta.pageId ?? item.pageId,
+          lineCount: existingMeta.lineCount ?? item.lineCount,
+          viewpoint: existingMeta.viewpoint ?? item.viewpoint,
+          validationRefContent:
+            existingMeta.validationRefContent ?? item.validationRefContent,
+          accuracy: existingMeta.accuracy ?? item.accuracy,
+          sourceAuthority: existingMeta.sourceAuthority ?? item.sourceAuthority,
+          broken: (existingMeta.broken ?? false) || (item.broken ?? false),
+          inrelavate:
+            (existingMeta.inrelavate ?? false) || (item.inrelavate ?? false),
+          error: existingMeta.error ?? item.error,
+        });
+        return [{ ...item, selections: normalizedSelections }];
       }
       if ((item.broken ?? false) || (item.inrelavate ?? false)) {
         return [item];

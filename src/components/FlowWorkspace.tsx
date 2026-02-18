@@ -1831,7 +1831,7 @@ function FlowWorkspaceInner({
         return existingChatId;
       }
       const inFlight = validationChatCreationByUrlRef.current[normalizedTabUrl];
-      if (inFlight) {
+      if (inFlight !== undefined) {
         return inFlight;
       }
       const createPromise = (async () => {
@@ -1853,7 +1853,9 @@ function FlowWorkspaceInner({
         const initialMessages =
           candidateMessages && candidateMessages.length > 0
             ? candidateMessages
-            : [seed.requestMessage, seed.runningEventMessage];
+            : runningSession
+              ? [seed.requestMessage, seed.runningEventMessage]
+              : [];
         const candidateUrls =
           runningSession?.pageUrls && runningSession.pageUrls.length > 0
             ? runningSession.pageUrls
@@ -1891,7 +1893,6 @@ function FlowWorkspaceInner({
           urls: Object.keys(pageMapping),
           messages: initialMessages,
         });
-        onSavedChatUpdate(result.chat);
         const activeRun = browserValidationRunsRef.current.get(tabRuntimeId);
         if (activeRun && activeRun.chatId === null) {
           activeRun.chatId = chatId;
@@ -1906,7 +1907,6 @@ function FlowWorkspaceInner({
     },
     [
       buildValidationChatMappingForUrls,
-      onSavedChatUpdate,
       project.path,
       queueValidationChatPersist,
       runtimeSettings,
@@ -1983,43 +1983,13 @@ function FlowWorkspaceInner({
         pageUrl: normalizedTabUrl,
         pageTitle: tab.title,
       });
-      const mappedChatId = browserValidationChatByUrlRef.current[normalizedTabUrl];
-      const hasBoundValidationChat = typeof mappedChatId === "string";
-      const chatId = mappedChatId
-        ? mappedChatId
-        : (
-            await trpc.project.createChat.mutate({
-              path: project.path,
-              firstQuestion: seed.firstQuestion,
-              settings: runtimeSettings,
-              activate: false,
-              state: {
-                version: 1,
-                nodes: [],
-                edges: [],
-                chat: [seed.requestMessage, seed.runningEventMessage],
-                autoLayoutLocked: true,
-                browserValidationByUrl: {},
-                browserValidationChatByUrl: {},
-                browserValidationStatusByUrl: {},
-              },
-            })
-          ).chat.id;
-      const existingMappingsForChat = Object.fromEntries(
-        Object.entries(browserValidationChatByUrlRef.current).filter(
-          ([, mappedId]) => mappedId === chatId,
-        ),
-      );
-      const initialMapping = {
-        ...existingMappingsForChat,
-        [normalizedTabUrl]: chatId,
-      };
-      const existingMessages = hasBoundValidationChat
-        ? validationChatMessagesRef.current[chatId] ??
+      const mappedChatId = browserValidationChatByUrlRef.current[normalizedTabUrl] ?? null;
+      const existingMessages = mappedChatId
+        ? validationChatMessagesRef.current[mappedChatId] ??
           (
             await trpc.project.readChatState.mutate({
               path: project.path,
-              chatId,
+              chatId: mappedChatId,
             })
           ).state.chat ??
           []
@@ -2029,59 +1999,53 @@ function FlowWorkspaceInner({
         seed.requestMessage,
         seed.runningEventMessage,
       ];
-      let runningMessages = seedMessages;
-      let runningPersistChain: Promise<void> = Promise.resolve();
-      const queueRunningValidationChatPersist = (messages: ChatMessage[]) => {
-        runningMessages = messages;
-        validationChatMessagesRef.current[chatId] = messages;
-        dispatchValidationChatMessagesUpdated({
-          chatId,
-          messages,
-          validationByUrl: browserValidationByUrlRef.current,
-          validationChatByUrl: initialMapping,
-          validationStatusByUrl: browserValidationStatusByUrlRef.current,
-        });
-        runningPersistChain = runningPersistChain.then(async () => {
-          await persistValidationChatState({
-            chatId,
-            messages,
-            pageMapping: initialMapping,
-            validationByUrl: browserValidationByUrlRef.current,
-            validationStatusByUrl: browserValidationStatusByUrlRef.current,
-          });
-        });
-      };
-      validationChatMessagesRef.current[chatId] = seedMessages;
-      await persistValidationChatState({
-        chatId,
-        messages: seedMessages,
-        pageMapping: initialMapping,
-        validationByUrl: browserValidationByUrlRef.current,
-        validationStatusByUrl: browserValidationStatusByUrlRef.current,
-      });
-      setBrowserValidationChatByUrl((prev) => ({
-        ...prev,
-        ...initialMapping,
-      }));
-      browserValidationChatByUrlRef.current = {
-        ...browserValidationChatByUrlRef.current,
-        ...initialMapping,
-      };
-
       const abortController = new AbortController();
       const runId = `validate-run-${crypto.randomUUID()}`;
       const runSession: BrowserValidationRunSession = {
         runId,
         tabRuntimeId,
-        chatId,
+        chatId: mappedChatId,
+        pageUrls: [normalizedTabUrl],
         pageUrl: normalizedTabUrl,
         querySeed: seed.firstQuestion,
         eventId: seed.eventId,
         toolCallId: seed.toolCallId,
         abortController,
+        messages: seedMessages,
+      };
+      let runningMessages = seedMessages;
+      let runningPersistChain: Promise<void> = Promise.resolve();
+      const queueRunningValidationChatPersist = (messages: ChatMessage[]): Promise<void> => {
+        runningMessages = messages;
+        runSession.messages = messages;
+        upsertValidationMessagesForUrls({
+          urls: runSession.pageUrls,
+          messages,
+        });
+        const activeRun = browserValidationRunsRef.current.get(tabRuntimeId);
+        if (!activeRun || activeRun.runId !== runId || !activeRun.chatId) {
+          return runningPersistChain;
+        }
+        const pageMapping = buildValidationChatMappingForUrls(
+          activeRun.chatId,
+          runSession.pageUrls,
+        );
+        runningPersistChain = queueValidationChatPersist({
+          chatId: activeRun.chatId,
+          messages,
+          pageMapping,
+        });
+        return runningPersistChain;
       };
       browserValidationRunsRef.current.set(tabRuntimeId, runSession);
-      startRunningChatJob(project.path, chatId, runId);
+      void queueRunningValidationChatPersist(seedMessages);
+      if (mappedChatId) {
+        const initialMapping = buildValidationChatMappingForUrls(mappedChatId, [
+          normalizedTabUrl,
+        ]);
+        upsertBrowserValidationChatMapping(initialMapping);
+        startRunningChatJob(project.path, mappedChatId, runId);
+      }
       let terminalStatusSettled = false;
       const settleComplete = async (record: BrowserPageValidationRecord) => {
         if (terminalStatusSettled) {
@@ -2116,7 +2080,7 @@ function FlowWorkspaceInner({
       logBrowserValidate("run-started", {
         tabRuntimeId,
         runId,
-        chatId,
+        chatId: runSession.chatId,
         querySeed: seed.firstQuestion,
       });
       try {
@@ -2180,7 +2144,7 @@ function FlowWorkspaceInner({
                     toolStatus: "running",
                     status: "complete",
                   };
-                  queueRunningValidationChatPersist(
+                  void queueRunningValidationChatPersist(
                     upsertChatMessage(runningMessages, subagentEvent),
                   );
                   return;
@@ -2220,7 +2184,7 @@ function FlowWorkspaceInner({
                   status: "complete",
                   error: resolvedError,
                 };
-                queueRunningValidationChatPersist(
+                void queueRunningValidationChatPersist(
                   upsertChatMessage(runningMessages, deepSearchEvent),
                 );
               },
@@ -2259,10 +2223,16 @@ function FlowWorkspaceInner({
           upsertChatMessage(runningMessages, completedEvent),
           summaryMessage,
         );
-        const pageMapping: Record<string, string> = {
-          [normalizedTabUrl]: chatId,
-          [resolvedPageUrl]: chatId,
-        };
+        runSession.pageUrls = [normalizedTabUrl, resolvedPageUrl];
+        runSession.pageUrl = resolvedPageUrl;
+        if (runSession.chatId) {
+          const pageMapping = buildValidationChatMappingForUrls(
+            runSession.chatId,
+            runSession.pageUrls,
+          );
+          upsertBrowserValidationChatMapping(pageMapping);
+        }
+        await queueRunningValidationChatPersist(completedMessages);
         setValidationStatusForUrls({
           urls: [normalizedTabUrl, resolvedPageUrl],
           status: "complete",
@@ -2273,20 +2243,6 @@ function FlowWorkspaceInner({
         };
         browserValidationByUrlRef.current = nextValidationByUrl;
         setBrowserValidationByUrl(nextValidationByUrl);
-        const nextValidationChatByUrl = {
-          ...browserValidationChatByUrlRef.current,
-          [normalizedTabUrl]: chatId,
-          [resolvedPageUrl]: chatId,
-        };
-        browserValidationChatByUrlRef.current = nextValidationChatByUrl;
-        setBrowserValidationChatByUrl(nextValidationChatByUrl);
-        await persistValidationChatState({
-          chatId,
-          messages: completedMessages,
-          pageMapping,
-          validationByUrl: nextValidationByUrl,
-          validationStatusByUrl: browserValidationStatusByUrlRef.current,
-        });
         const graphInsertion = buildValidationGraphInsertion({
           baseNodes: nodesRef.current,
           validation: record,
@@ -2347,15 +2303,16 @@ function FlowWorkspaceInner({
           runningMessages,
           failedEvent,
         );
-        await persistValidationChatState({
-          chatId,
-          messages: failedMessages,
-          pageMapping: {
-            [normalizedTabUrl]: chatId,
-          },
-          validationByUrl: browserValidationByUrlRef.current,
-          validationStatusByUrl: browserValidationStatusByUrlRef.current,
-        });
+        runSession.pageUrls = [normalizedTabUrl];
+        runSession.pageUrl = normalizedTabUrl;
+        if (runSession.chatId) {
+          const failedMapping = buildValidationChatMappingForUrls(
+            runSession.chatId,
+            runSession.pageUrls,
+          );
+          upsertBrowserValidationChatMapping(failedMapping);
+        }
+        await queueRunningValidationChatPersist(failedMessages);
         await settleFailed(message);
         if (isAbortError(error)) {
           logBrowserValidate("aborted", {
@@ -2379,7 +2336,9 @@ function FlowWorkspaceInner({
           });
           await settleFailed("Validation finished without terminal status.");
         }
-        finishRunningChatJob(project.path, chatId, runId);
+        if (runSession.chatId) {
+          finishRunningChatJob(project.path, runSession.chatId, runId);
+        }
         if (activeRun?.runId === runId) {
           browserValidationRunsRef.current.delete(tabRuntimeId);
         }
@@ -2390,13 +2349,16 @@ function FlowWorkspaceInner({
       }
     },
     [
+      buildValidationChatMappingForUrls,
       setValidationStatusForUrls,
       deepResearchConfig,
-      persistValidationChatState,
       project.path,
+      queueValidationChatPersist,
       runtimeSettings,
       setEdges,
       setNodes,
+      upsertBrowserValidationChatMapping,
+      upsertValidationMessagesForUrls,
     ],
   );
 
@@ -2514,21 +2476,27 @@ function FlowWorkspaceInner({
   );
 
   const handleCdpOpenValidationChatRequest = useCallback(
-    (payload: CdpBrowserValidateRequestPayload) => {
+    async (payload: CdpBrowserValidateRequestPayload) => {
+      const sessionId =
+        typeof payload.sessionId === "string" ? payload.sessionId.trim() : "";
       const normalizedTabUrl = normalizeHttpUrl(payload.url);
-      if (!normalizedTabUrl) {
+      if (!sessionId || !normalizedTabUrl) {
         return;
       }
-      const chatId = browserValidationChatByUrlRef.current[normalizedTabUrl];
+      const chatId = await ensureValidationChatForUrl({
+        tabRuntimeId: `cdp:${sessionId}`,
+        normalizedTabUrl,
+        pageTitle: payload.title,
+      });
       if (!chatId) {
         return;
       }
-      void switchChatWithOptionalBrowserTransfer(chatId, {
+      await switchChatWithOptionalBrowserTransfer(chatId, {
         url: normalizedTabUrl,
         title: payload.title,
       });
     },
-    [switchChatWithOptionalBrowserTransfer],
+    [ensureValidationChatForUrl, switchChatWithOptionalBrowserTransfer],
   );
 
   useEffect(() => {
@@ -2552,7 +2520,7 @@ function FlowWorkspaceInner({
       _event: IpcRendererEvent,
       payload: CdpBrowserValidateRequestPayload,
     ) => {
-      handleCdpOpenValidationChatRequest(payload);
+      void handleCdpOpenValidationChatRequest(payload);
     };
     ipc.on("cdp-browser-validate-request", handleValidateRequest);
     ipc.on("cdp-browser-validate-stop-request", handleValidateStopRequest);
@@ -3039,7 +3007,7 @@ function FlowWorkspaceInner({
   );
 
   const handleBrowserOpenValidationChat = useCallback(
-    (tabId: string) => {
+    async (tabId: string) => {
       const tab = browserTabMap.get(tabId);
       if (!tab) {
         return;
@@ -3048,17 +3016,27 @@ function FlowWorkspaceInner({
       if (!normalizedTabUrl) {
         return;
       }
-      const chatId = browserValidationChatByUrlRef.current[normalizedTabUrl];
+      const chatId = await ensureValidationChatForUrl({
+        tabRuntimeId: tabId,
+        normalizedTabUrl,
+        pageTitle: tab.title,
+      });
       if (!chatId) {
         return;
       }
-      void switchChatWithOptionalBrowserTransfer(chatId, {
+      await switchChatWithOptionalBrowserTransfer(chatId, {
         url: normalizedTabUrl,
         title: tab.title,
         referenceHighlight: tab.referenceHighlight,
       });
+      openOrFocusTab("chat");
     },
-    [browserTabMap, switchChatWithOptionalBrowserTransfer],
+    [
+      browserTabMap,
+      ensureValidationChatForUrl,
+      openOrFocusTab,
+      switchChatWithOptionalBrowserTransfer,
+    ],
   );
 
   const handleBrowserValidate = useCallback(

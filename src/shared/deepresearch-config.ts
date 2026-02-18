@@ -588,6 +588,9 @@ export const buildSearchSubagentSystemPrompt = (
       ? "You are the DeepResearch validation subagent. Verify whether an existing assistant answer is well-supported by web evidence."
       : "You are the DeepResearch subagent. Your task is to collect structured evidence through web search and page extraction.",
     ...modeSpecificLines,
+    isValidateMode
+      ? "Claim scope rule: derive validation claims only from the answer-to-validate content. Do not use the original user question to define validation scope."
+      : "",
     "Available tools:",
     "- discoverSkills: List available domain skills and activation hints.",
     "- loadSkill: Load full guidance for a specific skill.",
@@ -626,6 +629,9 @@ export const buildSearchSubagentSystemPrompt = (
     isValidateMode
       ? "6) In writeResults input, each result item should include: url, viewpoint, content, selections, validationRefContent, accuracy, sourceAuthority, issueReason, correctFact."
       : "6) In writeResults input, each result item should include: url, viewpoint, content, selections, accuracy, sourceAuthority.",
+    isValidateMode
+      ? "6.1) In validate mode, do not leave `accuracy` and `sourceAuthority` empty when evidence exists."
+      : "",
     "7) `extract` returns line-numbered selections. All chosen selections must map to those numbered lines.",
     "8) Prefer small precise spans (typically 2-12 lines). Avoid broad/full-page spans unless strictly necessary.",
     "9) The same source can support multiple claims: keep multiple selections for one URL when needed.",
@@ -687,6 +693,9 @@ export const buildSearchSubagentRuntimePrompt = ({
         }`
       : "",
     ...(isValidateMode ? buildValidateStrictnessLines(strictness) : []),
+    isValidateMode
+      ? "Claim scope rule: split claims only from the Answer to validate. Do not re-scope claims from the original user question."
+      : "",
     `${config.splitStrategy}`,
     "Prefer serial search: run one search call, inspect its results, then decide the next query.",
     "Language fallback strategy: start in the user-question language; only try English/other languages when results are empty, weak, or off-topic.",
@@ -695,6 +704,9 @@ export const buildSearchSubagentRuntimePrompt = ({
     isValidateMode
       ? "Each result item must include: url, viewpoint, content, selections, validationRefContent, accuracy, sourceAuthority, issueReason, correctFact."
       : "Each result item must include: url, viewpoint, content, selections, accuracy, sourceAuthority.",
+    isValidateMode
+      ? "In validate mode, `accuracy` and `sourceAuthority` should be populated for each evidence item whenever evidence is available."
+      : "",
     "Selections must be precise and minimal. Avoid broad/full-page spans unless strictly necessary.",
     "When one source supports multiple points, keep multiple small selections under the same URL.",
     "Merge duplicate viewpoints into one consolidated result item; do not repeat equivalent viewpoints.",

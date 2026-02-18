@@ -21,6 +21,7 @@ import { readToolCallId } from "./tool-call-input";
 interface ValidateExecutionResult {
   status: "complete" | "failed" | "skipped";
   query?: string;
+  skipReason?: "disabled-by-config" | "no-fact-checkable-claims";
   projectId?: string;
   searchId?: string;
   sources?: DeepSearchSourcePayload[];
@@ -242,8 +243,12 @@ const setValidationEventResolved = ({
   ) => void;
 }) => {
   const skipped = result.status === "skipped";
-  const status = result.status === "complete" ? "complete" : "failed";
-  const skippedError = skipped ? "Validation skipped by config." : undefined;
+  const status = result.status === "failed" ? "failed" : "complete";
+  const skippedInfo = skipped
+    ? result.skipReason === "no-fact-checkable-claims"
+      ? "Validation skipped: no fact-checkable claims under current strictness."
+      : "Validation skipped by config."
+    : undefined;
 
   setAsyncDeepSearchEventMessages((prev) =>
     prev.map((event) =>
@@ -259,13 +264,13 @@ const setValidationEventResolved = ({
               query: result.query,
               projectId: result.projectId,
               searchId: result.searchId,
-              status,
+              status: status === "failed" ? "failed" : "complete",
               sources: result.sources,
               references: result.references,
-              error: skippedError,
+              error: skippedInfo,
               complete: true,
             } satisfies DeepSearchStreamPayload,
-            error: skippedError,
+            error: skippedInfo,
           },
     ),
   );

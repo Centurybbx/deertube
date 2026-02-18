@@ -28,6 +28,7 @@ interface CaptureValidationSnapshotResult {
 interface ChatValidateResult {
   status: "complete" | "failed" | "skipped";
   query?: string;
+  skipReason?: "disabled-by-config" | "no-fact-checkable-claims";
   searchId?: string;
   projectId?: string;
   references?: DeepSearchReferencePayload[];
@@ -68,16 +69,24 @@ const trimOrUndefined = (value: string | undefined): string | undefined => {
 };
 
 const resolveValidationQuery = ({
+  pageText,
   snapshotTitle,
   tabTitle,
   resolvedPageUrl,
 }: {
+  pageText: string;
   snapshotTitle: string | undefined;
   tabTitle: string | undefined;
   resolvedPageUrl: string;
 }): string => {
+  const normalizedPageText = pageText.replace(/\s+/g, " ").trim();
+  if (normalizedPageText.length > 0) {
+    return normalizedPageText.length > 320
+      ? normalizedPageText.slice(0, 320)
+      : normalizedPageText;
+  }
   const querySeed = snapshotTitle ?? tabTitle ?? resolvedPageUrl;
-  return querySeed.length > 220 ? querySeed.slice(0, 220) : querySeed;
+  return querySeed.length > 320 ? querySeed.slice(0, 320) : querySeed;
 };
 
 export const updateBrowserTabValidationState = ({
@@ -130,6 +139,7 @@ export const executeBrowserValidation = async ({
   const snapshotTitle = trimOrUndefined(snapshot.title);
   const tabTitle = trimOrUndefined(tab.title);
   const query = resolveValidationQuery({
+    pageText,
     snapshotTitle,
     tabTitle,
     resolvedPageUrl,
@@ -143,8 +153,8 @@ export const executeBrowserValidation = async ({
     settings: runtimeSettings,
     deepResearch: deepResearchConfig,
   }, signal);
-  if (validateResult.status !== "complete") {
-    throw new Error("Validation skipped. Enable validate in deep research settings.");
+  if (validateResult.status === "failed") {
+    throw new Error("Validation failed.");
   }
 
   const references = Array.isArray(validateResult.references)

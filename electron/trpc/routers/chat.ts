@@ -1,3 +1,5 @@
+import fs from "node:fs/promises";
+import path from "node:path";
 import { z } from "zod";
 import {
   convertToModelMessages,
@@ -20,6 +22,7 @@ import {
 import {
   buildMainAgentSystemPrompt,
   DeepResearchConfigSchema,
+  type DeepResearchStrictness,
   resolveDeepResearchConfig,
 } from "../../../src/shared/deepresearch-config";
 import { scanLocalAgentSkills } from "../../skills/registry";
@@ -28,6 +31,102 @@ import { runDeepSearchTool } from "../../../src/modules/ai/tools/runners/deepsea
 
 const noStepLimit = () => false;
 const VALIDATE_LOG_PREFIX = "[validate][chat.router]";
+const VALIDATE_LOG_DIR_ENV = "DEERTUBE_VALIDATE_LOG_DIR";
+
+type ValidateLogLevel = "info" | "warn" | "error";
+
+const resolveValidateLogDir = (projectPath: string): string => {
+  const configured = process.env[VALIDATE_LOG_DIR_ENV]?.trim();
+  if (!configured) {
+    return path.resolve(projectPath, ".deertube", "validate-logs");
+  }
+  return path.isAbsolute(configured)
+    ? configured
+    : path.resolve(projectPath, configured);
+};
+
+const resolveValidateLogFilePath = (projectPath: string): string => {
+  const dayStamp = new Date().toISOString().slice(0, 10);
+  return path.join(resolveValidateLogDir(projectPath), `${dayStamp}.jsonl`);
+};
+
+const appendValidateLogFile = async ({
+  projectPath,
+  level,
+  event,
+  payload,
+}: {
+  projectPath: string;
+  level: ValidateLogLevel;
+  event: string;
+  payload?: Record<string, unknown>;
+}): Promise<void> => {
+  try {
+    const filePath = resolveValidateLogFilePath(projectPath);
+    await fs.mkdir(path.dirname(filePath), { recursive: true });
+    const entry: Record<string, unknown> = {
+      timestamp: new Date().toISOString(),
+      level,
+      event,
+      projectPath,
+      pid: process.pid,
+    };
+    if (payload) {
+      entry.payload = payload;
+    }
+    const serialized = JSON.stringify(entry);
+    if (!serialized) {
+      return;
+    }
+    await fs.appendFile(filePath, `${serialized}\n`, "utf-8");
+  } catch (error) {
+    console.warn(VALIDATE_LOG_PREFIX, "file-log-write-failed", {
+      event,
+      projectPath,
+      message: error instanceof Error ? error.message : String(error),
+    });
+  }
+};
+
+const logValidate = ({
+  event,
+  payload,
+  projectPath,
+  level = "info",
+}: {
+  event: string;
+  payload?: Record<string, unknown>;
+  projectPath?: string;
+  level?: ValidateLogLevel;
+}): void => {
+  if (level === "warn") {
+    if (payload) {
+      console.warn(VALIDATE_LOG_PREFIX, event, payload);
+    } else {
+      console.warn(VALIDATE_LOG_PREFIX, event);
+    }
+  } else if (level === "error") {
+    if (payload) {
+      console.error(VALIDATE_LOG_PREFIX, event, payload);
+    } else {
+      console.error(VALIDATE_LOG_PREFIX, event);
+    }
+  } else if (payload) {
+    console.log(VALIDATE_LOG_PREFIX, event, payload);
+  } else {
+    console.log(VALIDATE_LOG_PREFIX, event);
+  }
+
+  if (!projectPath) {
+    return;
+  }
+  void appendValidateLogFile({
+    projectPath,
+    level,
+    event,
+    payload,
+  });
+};
 
 const loadExternalSkills = async (): Promise<RuntimeAgentSkill[]> => {
   const scanResult = await scanLocalAgentSkills();
@@ -171,6 +270,184 @@ const MARKDOWN_DEERTUBE_URI_PATTERN = /\[[^\]]+\]\((deertube:\/\/[^)\s]+)\)/gi;
 const VALIDATE_CONTEXT_REF_LIMIT = 8;
 const VALIDATE_CONTEXT_VIEWPOINT_MAX = 240;
 const VALIDATE_CONTEXT_EXCERPT_MAX = 360;
+const VALIDATE_CONTEXT_REFERENCE_TEXT_MAX = 1800;
+const VALIDATE_CONTEXT_VALIDATION_NOTE_MAX = 720;
+const VALIDATE_CLAIM_SPLIT_ANSWER_MAX = 20000;
+const VALIDATE_CLAIM_QUERY_MAX = 3200;
+const VALIDATE_CLAIM_MAX_COUNT = 12;
+const VALIDATE_CLAIM_ITEM_MAX = 260;
+const VALIDATE_NO_CLAIM_SENTINEL = "NO_CLAIM";
+
+const normalizeInlineText = (value: string): string =>
+  value.replace(/\s+/g, " ").trim();
+
+const hasNoClaimSentinel = (rawText: string): boolean =>
+  rawText
+    .split(/\r?\n/)
+    .some(
+      (line) =>
+        normalizeInlineText(line).toUpperCase() === VALIDATE_NO_CLAIM_SENTINEL,
+    );
+
+const splitAnswerIntoSentenceLikeClaims = (answer: string): string[] => {
+  const normalized = normalizeInlineText(answer);
+  if (!normalized) {
+    return [];
+  }
+  const candidates = normalized
+    .split(/(?<=[.!?。！？；;])\s+/)
+    .map((line) => normalizeInlineText(line))
+    .filter((line) => line.length > 0);
+  if (candidates.length > 0) {
+    return candidates;
+  }
+  return [normalized];
+};
+
+const parseClaimLines = (rawText: string): string[] => {
+  const lines = rawText
+    .split(/\r?\n/)
+    .map((line) => line.replace(/^\s*(?:[-*•]|\d+[).:-])\s*/, "").trim())
+    .filter((line) => line.length > 0);
+  const dedupe = new Set<string>();
+  lines.forEach((line) => {
+    const normalized = normalizeInlineText(line);
+    if (!normalized) {
+      return;
+    }
+    if (normalized === VALIDATE_NO_CLAIM_SENTINEL) {
+      return;
+    }
+    if (/^(claims?|output|json)\s*:/i.test(normalized)) {
+      return;
+    }
+    dedupe.add(clampText(normalized, VALIDATE_CLAIM_ITEM_MAX));
+  });
+  return Array.from(dedupe.values()).slice(0, VALIDATE_CLAIM_MAX_COUNT);
+};
+
+const buildValidationClaimScopePrompt = ({
+  answer,
+  strictness,
+}: {
+  answer: string;
+  strictness: DeepResearchStrictness;
+}): string => {
+  const strictnessLines =
+    strictness === "all-claims"
+      ? [
+          "Mode: all-claims.",
+          "Extract every material factual claim from the answer text.",
+        ]
+      : [
+          "Mode: uncertain-claims.",
+          "Extract only uncertain, contested, time-sensitive, or high-impact factual claims.",
+        ];
+  return [
+    "You are a validation claim splitter.",
+    "Use only the provided answer text as claim scope.",
+    "Do not use or infer from the original user question.",
+    ...strictnessLines,
+    `Output one claim per line. If no fact-checkable claim exists, output exactly ${VALIDATE_NO_CLAIM_SENTINEL}.`,
+    "No markdown. No JSON. No explanation.",
+    "",
+    "Answer text:",
+    answer,
+  ].join("\n");
+};
+
+const deriveValidationClaimsFromAnswer = async ({
+  model,
+  answer,
+  strictness,
+  projectPath,
+  abortSignal,
+}: {
+  model: ReturnType<typeof buildLanguageModel>["model"];
+  answer: string;
+  strictness: DeepResearchStrictness;
+  projectPath?: string;
+  abortSignal?: AbortSignal;
+}): Promise<{
+  claims: string[];
+  method: "llm" | "llm-no-claim" | "fallback" | "fallback-skip" | "raw-answer";
+}> => {
+  const trimmedAnswer = answer.trim();
+  if (!trimmedAnswer) {
+    return { claims: [], method: "raw-answer" };
+  }
+  const scopedAnswer = clampText(trimmedAnswer, VALIDATE_CLAIM_SPLIT_ANSWER_MAX);
+  try {
+    const result = await generateText({
+      model,
+      prompt: buildValidationClaimScopePrompt({
+        answer: scopedAnswer,
+        strictness,
+      }),
+      abortSignal,
+    });
+    if (hasNoClaimSentinel(result.text)) {
+      return { claims: [], method: "llm-no-claim" };
+    }
+    const claims = parseClaimLines(result.text);
+    if (claims.length > 0) {
+      return { claims, method: "llm" };
+    }
+  } catch (error) {
+    if (isAbortError(error)) {
+      throw error;
+    }
+    logValidate({
+      event: "claim-split-fallback",
+      projectPath,
+      level: "warn",
+      payload: {
+      message: error instanceof Error ? error.message : String(error),
+      },
+    });
+  }
+  if (strictness !== "all-claims") {
+    return { claims: [], method: "fallback-skip" };
+  }
+  const fallbackClaims = splitAnswerIntoSentenceLikeClaims(scopedAnswer)
+    .map((line) => clampText(line, VALIDATE_CLAIM_ITEM_MAX))
+    .slice(0, VALIDATE_CLAIM_MAX_COUNT);
+  if (fallbackClaims.length > 0) {
+    return { claims: fallbackClaims, method: "fallback" };
+  }
+  return { claims: [], method: "raw-answer" };
+};
+
+const buildValidationQueryFromClaims = ({
+  claims,
+  strictness,
+  answer,
+  fallbackQuery,
+}: {
+  claims: string[];
+  strictness: DeepResearchStrictness;
+  answer: string;
+  fallbackQuery: string;
+}): string => {
+  if (claims.length === 0) {
+    const normalizedAnswer = normalizeInlineText(answer);
+    if (normalizedAnswer.length > 0) {
+      return clampText(normalizedAnswer, VALIDATE_CLAIM_QUERY_MAX);
+    }
+    return clampText(
+      normalizeInlineText(fallbackQuery),
+      VALIDATE_CLAIM_QUERY_MAX,
+    );
+  }
+  const modeLabel =
+    strictness === "all-claims" ? "all-claims" : "uncertain-claims";
+  const lines = [
+    `Validation claim scope (${modeLabel}) from answer content:`,
+    ...claims.map((claim, index) => `${index + 1}. ${claim}`),
+    "Claim scope source: answer-to-validate only. Do not rescope from original question.",
+  ];
+  return clampText(lines.join("\n"), VALIDATE_CLAIM_QUERY_MAX);
+};
 
 const extractDeertubeUrisFromText = (input: string): string[] => {
   const dedupe = new Set<string>();
@@ -206,10 +483,14 @@ const resolveReferencedContextForValidation = async (
         try {
           return await resolveDeepResearchReference(projectPath, uri);
         } catch (error) {
-          console.warn(VALIDATE_LOG_PREFIX, {
-            status: "resolve-reference-failed",
+          logValidate({
+            event: "resolve-reference-failed",
+            projectPath,
+            level: "warn",
+            payload: {
             uri,
             message: error instanceof Error ? error.message : String(error),
+            },
           });
           return null;
         }
@@ -226,12 +507,22 @@ const resolveReferencedContextForValidation = async (
     "Answer-cited references (reuse before launching extra validation search):",
     ...resolvedReferences.map((reference, index) => {
       const title = trimOrUndefined(reference.title) ?? reference.url;
-      const excerpt = trimOrUndefined(
-        reference.validationRefContent ?? reference.text,
+      const viewpointLine = clampText(
+        reference.viewpoint,
+        VALIDATE_CONTEXT_VIEWPOINT_MAX,
       );
+      const selectedPassage = trimOrUndefined(reference.text);
+      const selectedPassageLine = selectedPassage
+        ? clampText(selectedPassage, VALIDATE_CONTEXT_REFERENCE_TEXT_MAX)
+        : "No selected passage text.";
+      const validationNote = trimOrUndefined(reference.validationRefContent);
+      const validationNoteLine = validationNote
+        ? clampText(validationNote, VALIDATE_CONTEXT_VALIDATION_NOTE_MAX)
+        : null;
+      const excerpt = trimOrUndefined(reference.validationRefContent);
       const excerptLine = excerpt
         ? clampText(excerpt, VALIDATE_CONTEXT_EXCERPT_MAX)
-        : "No excerpt.";
+        : null;
       const accuracyLine = reference.accuracy
         ? `Accuracy: ${reference.accuracy}`
         : null;
@@ -242,10 +533,13 @@ const resolveReferencedContextForValidation = async (
         `[${index + 1}] ${title}`,
         `URI: ${reference.uri}`,
         `URL: ${reference.url}`,
-        `Viewpoint: ${clampText(reference.viewpoint, VALIDATE_CONTEXT_VIEWPOINT_MAX)}`,
+        `Viewpoint: ${viewpointLine}`,
+        `Selected passage lines: ${reference.startLine}-${reference.endLine}`,
+        `Selected passage text: ${selectedPassageLine}`,
+        validationNoteLine ? `Validation note: ${validationNoteLine}` : null,
         accuracyLine,
         sourceAuthorityLine,
-        `Excerpt: ${excerptLine}`,
+        excerptLine ? `Legacy excerpt: ${excerptLine}` : null,
       ]
         .filter((line): line is string => Boolean(line))
         .join("\n");
@@ -334,10 +628,24 @@ const ValidateInputSchema = z.object({
 
 type ValidateInput = z.infer<typeof ValidateInputSchema>;
 
+const ValidateUiEventInputSchema = z.object({
+  projectPath: z.string(),
+  event: z.string().min(1),
+  chatId: z.string().optional(),
+  responseId: z.string().optional(),
+  payload: z
+    .record(
+      z.string(),
+      z.union([z.string(), z.number(), z.boolean(), z.null()]),
+    )
+    .optional(),
+});
+
 interface ValidateResult {
   status: "complete" | "skipped";
   mode: "validate";
   query: string;
+  skipReason?: "disabled-by-config" | "no-fact-checkable-claims";
   searchId?: string;
   projectId?: string;
   references: Awaited<ReturnType<typeof runDeepSearchTool>>["references"];
@@ -387,7 +695,7 @@ const runValidateForInput = async (
         },
       }
     : deepResearchConfig;
-  const query = input.query.trim();
+  const incomingQuery = input.query.trim();
   const answer = input.answer.trim();
   const existingRefContext = await resolveReferencedContextForValidation(
     input.projectPath,
@@ -396,22 +704,35 @@ const runValidateForInput = async (
   const validateTargetAnswer = existingRefContext.context
     ? `${answer}\n\n${existingRefContext.context}`
     : answer;
-  console.log(VALIDATE_LOG_PREFIX, {
-    query: query.slice(0, 180),
+  logValidate({
+    event: "start",
+    projectPath: input.projectPath,
+    payload: {
+    logFilePath: resolveValidateLogFilePath(input.projectPath),
+    query: incomingQuery.slice(0, 180),
     validateEnabled:
       deepResearchConfig.enabled && deepResearchConfig.validate.enabled,
     forced: forceValidate,
     aborted: Boolean(abortSignal?.aborted),
     answerRefsResolved: existingRefContext.resolvedCount,
+    },
   });
   if (
     !forceValidate &&
     (!deepResearchConfig.enabled || !deepResearchConfig.validate.enabled)
   ) {
+    logValidate({
+      event: "skip-disabled-config",
+      projectPath: input.projectPath,
+      payload: {
+        query: incomingQuery.slice(0, 180),
+      },
+    });
     return {
       status: "skipped",
       mode: "validate",
-      query,
+      query: incomingQuery,
+      skipReason: "disabled-by-config",
       searchId: undefined,
       projectId: undefined,
       references: [],
@@ -440,6 +761,51 @@ const runValidateForInput = async (
   const tavilyApiKey = trimOrUndefined(input.settings?.tavilyApiKey);
   const jinaReaderBaseUrl = trimOrUndefined(input.settings?.jinaReaderBaseUrl);
   const jinaReaderApiKey = trimOrUndefined(input.settings?.jinaReaderApiKey);
+  const claimSplit = await deriveValidationClaimsFromAnswer({
+    model: validateModelConfig.model,
+    answer,
+    strictness: effectiveDeepResearchConfig.validate.strictness,
+    projectPath: input.projectPath,
+    abortSignal,
+  });
+  if (claimSplit.claims.length === 0) {
+    logValidate({
+      event: "skip-no-fact-checkable-claims",
+      projectPath: input.projectPath,
+      payload: {
+      incomingQueryPreview: incomingQuery.slice(0, 120),
+      claimScopeMethod: claimSplit.method,
+      strictness: effectiveDeepResearchConfig.validate.strictness,
+      },
+    });
+    return {
+      status: "skipped",
+      mode: "validate",
+      query: incomingQuery,
+      skipReason: "no-fact-checkable-claims",
+      searchId: undefined,
+      projectId: undefined,
+      references: [],
+      sources: [],
+    };
+  }
+  const query = buildValidationQueryFromClaims({
+    claims: claimSplit.claims,
+    strictness: effectiveDeepResearchConfig.validate.strictness,
+    answer,
+    fallbackQuery: incomingQuery,
+  });
+  logValidate({
+    event: "claim-scope-derived",
+    projectPath: input.projectPath,
+    payload: {
+    incomingQueryPreview: incomingQuery.slice(0, 120),
+    derivedQueryPreview: query.slice(0, 180),
+    claimCount: claimSplit.claims.length,
+    claimScopeMethod: claimSplit.method,
+    strictness: effectiveDeepResearchConfig.validate.strictness,
+    },
+  });
   const result = await runDeepSearchTool({
     query,
     searchModel: validateModelConfig.model,
@@ -468,11 +834,14 @@ const runValidateForInput = async (
       });
     },
   });
-  console.log(VALIDATE_LOG_PREFIX, {
+  logValidate({
+    event: "complete",
+    projectPath: input.projectPath,
+    payload: {
     query: query.slice(0, 180),
-    status: "complete",
     sources: result.sources.length,
     references: result.references.length,
+    },
   });
   return {
     status: "complete",
@@ -565,6 +934,23 @@ export const chatRouter = createTRPCRouter({
   validate: baseProcedure
     .input(ValidateInputSchema)
     .mutation(async ({ input }) => runValidateForInput(input)),
+  validateUiEvent: baseProcedure
+    .input(ValidateUiEventInputSchema)
+    .mutation(({ input }) => {
+      logValidate({
+        event: `ui.${input.event}`,
+        projectPath: input.projectPath,
+        payload: {
+          chatId: input.chatId,
+          responseId: input.responseId,
+          ...(input.payload ?? {}),
+        },
+      });
+      return {
+        ok: true,
+        logFilePath: resolveValidateLogFilePath(input.projectPath),
+      };
+    }),
   validateStream: baseProcedure
     .input(ValidateInputSchema)
     .subscription(async function* ({ input, signal }) {

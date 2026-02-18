@@ -197,9 +197,18 @@ export function BrowserTab({
     /stopped by user|abort/i.test(validationError ?? "");
   const validationSucceeded = validationStatus === "complete" && Boolean(validation);
   const canRetryValidation = validationSucceeded;
+  const hasValidationContext =
+    validationStatus === "running" ||
+    validationStatus === "complete" ||
+    validationStatus === "failed" ||
+    Boolean(validation) ||
+    Boolean(validationChatId);
   const hasValidationChatButton = Boolean(
-    validationChatId && onRequestOpenValidationChat,
+    onRequestOpenValidationChat && hasValidationContext,
   );
+  const validationChatButtonTitle = validationChatId
+    ? "Focus validation chat"
+    : "Create and open validation chat";
   const mainHasTrailingButton = canRetryValidation || hasValidationChatButton;
   const validationPopoverSide = validationFailed ? "top" : "bottom";
   const failureTitle = validationStopped
@@ -595,8 +604,8 @@ export function BrowserTab({
                 onClick={() => {
                   onRequestOpenValidationChat?.(tabId);
                 }}
-                title="Focus validation chat"
-                aria-label="Focus validation chat"
+                title={validationChatButtonTitle}
+                aria-label={validationChatButtonTitle}
               >
                 <MessageSquare className="h-3.5 w-3.5" />
               </Button>

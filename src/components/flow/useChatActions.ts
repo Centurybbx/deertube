@@ -59,6 +59,7 @@ const CHAT_ACTION_DEBUG_LOGS_ENABLED =
   import.meta.env.VITE_CHAT_ACTION_DEBUG_LOGS === "true";
 const CHAT_STREAM_RUNNING_JOB_ID = "chat-stream";
 const CHAT_VALIDATE_LOG_PREFIX = "[validate][chat.manager]";
+const VALIDATE_QUERY_SEED_MAX = 320;
 
 const logChatValidateManager = (
   event: string,
@@ -70,6 +71,19 @@ const logChatValidateManager = (
   }
   console.log(CHAT_VALIDATE_LOG_PREFIX, event);
 };
+
+const buildValidationQuerySeedFromContent = (content: string): string => {
+  const normalized = content.replace(/\s+/g, " ").trim();
+  if (!normalized) {
+    return "";
+  }
+  return normalized.length > VALIDATE_QUERY_SEED_MAX
+    ? normalized.slice(0, VALIDATE_QUERY_SEED_MAX)
+    : normalized;
+};
+
+type ValidateUiEventPayloadValue = string | number | boolean | null;
+type ValidateUiEventPayload = Record<string, ValidateUiEventPayloadValue>;
 
 export function useChatActions({
   projectPath,
@@ -125,6 +139,26 @@ export function useChatActions({
       asyncValidationAbortControllersRef.current.size > 0,
     );
   }, []);
+
+  const emitValidateUiEvent = useCallback(
+    (event: string, responseId?: string, payload?: ValidateUiEventPayload) => {
+      const normalizedPayload = payload
+        ? Object.fromEntries(
+            Object.entries(payload).filter(([, value]) => value !== undefined),
+          )
+        : undefined;
+      void trpc.chat.validateUiEvent
+        .mutate({
+          projectPath,
+          event,
+          chatId: chatId ?? undefined,
+          responseId: responseId?.trim() ? responseId : undefined,
+          payload: normalizedPayload,
+        })
+        .catch(() => undefined);
+    },
+    [chatId, projectPath],
+  );
 
   const handleValidationRunStart = useCallback(
     (
@@ -205,11 +239,14 @@ export function useChatActions({
           responseId,
           activeRuns: asyncValidationAbortControllersRef.current.size,
         });
+        emitValidateUiEvent("manual-stop-response", responseId, {
+          activeRuns: asyncValidationAbortControllersRef.current.size,
+        });
         markAsyncValidationBusy();
       }
       return stopped;
     },
-    [chatId, markAsyncValidationBusy],
+    [chatId, emitValidateUiEvent, markAsyncValidationBusy],
   );
 
   useEffect(() => {
@@ -358,7 +395,9 @@ export function useChatActions({
         projectPath,
         deepResearchConfig,
         runtimeSettings,
-        queryOverride: options?.queryOverride ?? lastSubmittedPromptRef.current,
+        queryOverride:
+          options?.queryOverride ??
+          buildValidationQuerySeedFromContent(responseText),
         force: options?.force ?? false,
         setAsyncSubagentEventMessages,
         setAsyncDeepSearchEventMessages,
@@ -435,40 +474,11 @@ export function useChatActions({
     return targets;
   }, [messages]);
 
-  const latestUserValidationQuery = useMemo(() => {
-    for (let index = messages.length - 1; index >= 0; index -= 1) {
-      const message = messages[index];
-      if (message.role !== "user") {
-        continue;
-      }
-      const query = extractUiMessageText(message).trim();
-      if (query.length > 0) {
-        return query;
-      }
-    }
-    return lastSubmittedPromptRef.current.trim();
-  }, [messages]);
-
   const resolveValidationQueryForResponse = useCallback(
-    (responseId: string, responseText: string): string => {
-      const responseIndex = messages.findIndex(
-        (message) => message.id === responseId,
-      );
-      if (responseIndex >= 0) {
-        for (let index = responseIndex - 1; index >= 0; index -= 1) {
-          const message = messages[index];
-          if (message.role !== "user") {
-            continue;
-          }
-          const query = extractUiMessageText(message).trim();
-          if (query.length > 0) {
-            return query;
-          }
-        }
-      }
-      return latestUserValidationQuery.trim() || responseText.trim();
+    (_responseId: string, responseText: string): string => {
+      return buildValidationQuerySeedFromContent(responseText);
     },
-    [latestUserValidationQuery, messages],
+    [],
   );
 
   const canValidateCurrentChat = latestAssistantValidationTarget !== null;
@@ -481,6 +491,9 @@ export function useChatActions({
         logChatValidateManager("manual-skip-missing-response", {
           chatId,
           responseId,
+        });
+        emitValidateUiEvent("manual-skip-missing-response", responseId, {
+          reason: "response-not-found-in-assistant-targets",
         });
         return;
       }
@@ -498,6 +511,10 @@ export function useChatActions({
         queryLength: queryOverride.length,
         answerLength: target.responseText.length,
       });
+      emitValidateUiEvent("manual-start-response", responseId, {
+        queryLength: queryOverride.length,
+        answerLength: target.responseText.length,
+      });
       void runPostAnswerValidation(responseId, target.responseText, {
         force: true,
         queryOverride,
@@ -506,6 +523,7 @@ export function useChatActions({
     [
       assistantValidationTargetsById,
       chatId,
+      emitValidateUiEvent,
       resolveValidationQueryForResponse,
       runPostAnswerValidation,
       stopValidationForResponse,
@@ -529,10 +547,16 @@ export function useChatActions({
       logChatValidateManager("manual-skip-no-assistant", {
         chatId,
       });
+      emitValidateUiEvent("manual-skip-no-assistant");
       return;
     }
     toggleValidateResponse(target.responseId);
-  }, [chatId, latestAssistantValidationTarget, toggleValidateResponse]);
+  }, [
+    chatId,
+    emitValidateUiEvent,
+    latestAssistantValidationTarget,
+    toggleValidateResponse,
+  ]);
 
   const generateGraphCurrentChat = useCallback(() => {
     const target = latestAssistantValidationTarget;
