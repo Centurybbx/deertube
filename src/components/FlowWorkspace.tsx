@@ -182,12 +182,14 @@ type ValidateStreamEvent =
 interface BrowserValidationRunSession {
   runId: string;
   tabRuntimeId: string;
-  chatId: string;
+  chatId: string | null;
+  pageUrls: string[];
   pageUrl: string;
   querySeed: string;
   eventId: string;
   toolCallId: string;
   abortController: AbortController;
+  messages: ChatMessage[];
 }
 
 const createAbortError = (): Error => {
@@ -992,6 +994,11 @@ function FlowWorkspaceInner({
     Record<string, BrowserPageValidationStatusRecord>
   >(initialState.browserValidationStatusByUrl ?? {});
   const validationChatMessagesRef = useRef<Record<string, ChatMessage[]>>({});
+  const validationMessagesByUrlRef = useRef<Record<string, ChatMessage[]>>({});
+  const validationChatPersistQueueRef = useRef<Record<string, Promise<void>>>({});
+  const validationChatCreationByUrlRef = useRef<Record<string, Promise<string | null>>>(
+    {},
+  );
   const saveTimer = useRef<number | null>(null);
   const inputZoomRef = useRef<{ viewport: Viewport; nodeId: string } | null>(null);
   const nodeZoomRef = useRef<Viewport | null>(null);
@@ -1699,6 +1706,213 @@ function FlowWorkspaceInner({
       onSavedChatUpdate(result.chat);
     },
     [onSavedChatUpdate, project.path, runtimeSettings],
+  );
+
+  const upsertValidationMessagesForUrls = useCallback(
+    ({
+      urls,
+      messages,
+    }: {
+      urls: (string | null | undefined)[];
+      messages: ChatMessage[];
+    }) => {
+      const next = { ...validationMessagesByUrlRef.current };
+      const seen = new Set<string>();
+      let changed = false;
+      urls.forEach((url) => {
+        if (!url || seen.has(url)) {
+          return;
+        }
+        seen.add(url);
+        if (next[url] === messages) {
+          return;
+        }
+        next[url] = messages;
+        changed = true;
+      });
+      if (!changed) {
+        return;
+      }
+      validationMessagesByUrlRef.current = next;
+    },
+    [],
+  );
+
+  const buildValidationChatMappingForUrls = useCallback(
+    (chatId: string, urls: (string | null | undefined)[]): Record<string, string> => {
+      const mapping = Object.fromEntries(
+        Object.entries(browserValidationChatByUrlRef.current).filter(
+          ([, mappedChatId]) => mappedChatId === chatId,
+        ),
+      );
+      const seen = new Set<string>();
+      urls.forEach((url) => {
+        if (!url || seen.has(url)) {
+          return;
+        }
+        seen.add(url);
+        mapping[url] = chatId;
+      });
+      return mapping;
+    },
+    [],
+  );
+
+  const upsertBrowserValidationChatMapping = useCallback(
+    (mapping: Record<string, string>) => {
+      const entries = Object.entries(mapping).filter(
+        ([url, chatId]) => url.length > 0 && chatId.length > 0,
+      );
+      if (entries.length === 0) {
+        return;
+      }
+      const next = { ...browserValidationChatByUrlRef.current };
+      let changed = false;
+      entries.forEach(([url, chatId]) => {
+        if (next[url] === chatId) {
+          return;
+        }
+        next[url] = chatId;
+        changed = true;
+      });
+      if (!changed) {
+        return;
+      }
+      browserValidationChatByUrlRef.current = next;
+      setBrowserValidationChatByUrl((previous) => ({
+        ...previous,
+        ...Object.fromEntries(entries),
+      }));
+    },
+    [],
+  );
+
+  const queueValidationChatPersist = useCallback(
+    ({
+      chatId,
+      messages,
+      pageMapping,
+    }: {
+      chatId: string;
+      messages: ChatMessage[];
+      pageMapping: Record<string, string>;
+    }): Promise<void> => {
+      const previous =
+        validationChatPersistQueueRef.current[chatId] ?? Promise.resolve();
+      const next = previous
+        .catch(() => undefined)
+        .then(async () => {
+          await persistValidationChatState({
+            chatId,
+            messages,
+            pageMapping,
+            validationByUrl: browserValidationByUrlRef.current,
+            validationStatusByUrl: browserValidationStatusByUrlRef.current,
+          });
+        });
+      validationChatPersistQueueRef.current[chatId] = next;
+      return next;
+    },
+    [persistValidationChatState],
+  );
+
+  const ensureValidationChatForUrl = useCallback(
+    async ({
+      tabRuntimeId,
+      normalizedTabUrl,
+      pageTitle,
+    }: {
+      tabRuntimeId: string;
+      normalizedTabUrl: string;
+      pageTitle?: string;
+    }): Promise<string | null> => {
+      const existingChatId = browserValidationChatByUrlRef.current[normalizedTabUrl];
+      if (existingChatId) {
+        return existingChatId;
+      }
+      const inFlight = validationChatCreationByUrlRef.current[normalizedTabUrl];
+      if (inFlight) {
+        return inFlight;
+      }
+      const createPromise = (async () => {
+        const runningSession = browserValidationRunsRef.current.get(tabRuntimeId);
+        const hasValidationContext =
+          Boolean(runningSession) ||
+          Boolean(browserValidationByUrlRef.current[normalizedTabUrl]) ||
+          Boolean(browserValidationStatusByUrlRef.current[normalizedTabUrl]) ||
+          Boolean(validationMessagesByUrlRef.current[normalizedTabUrl]);
+        if (!hasValidationContext) {
+          return null;
+        }
+        const seed = createPageValidationChatSeed({
+          pageUrl: normalizedTabUrl,
+          pageTitle,
+        });
+        const candidateMessages =
+          runningSession?.messages ?? validationMessagesByUrlRef.current[normalizedTabUrl];
+        const initialMessages =
+          candidateMessages && candidateMessages.length > 0
+            ? candidateMessages
+            : [seed.requestMessage, seed.runningEventMessage];
+        const candidateUrls =
+          runningSession?.pageUrls && runningSession.pageUrls.length > 0
+            ? runningSession.pageUrls
+            : Object.entries(validationMessagesByUrlRef.current)
+                .filter(([, messages]) => messages === candidateMessages)
+                .map(([url]) => url);
+        const result = await trpc.project.createChat.mutate({
+          path: project.path,
+          firstQuestion: runningSession?.querySeed ?? seed.firstQuestion,
+          settings: runtimeSettings,
+          activate: false,
+          state: {
+            version: 1,
+            nodes: [],
+            edges: [],
+            chat: initialMessages,
+            autoLayoutLocked: true,
+            browserValidationByUrl: browserValidationByUrlRef.current,
+            browserValidationChatByUrl: {},
+            browserValidationStatusByUrl: browserValidationStatusByUrlRef.current,
+          },
+        });
+        const chatId = result.chat.id;
+        const pageMapping = buildValidationChatMappingForUrls(chatId, [
+          normalizedTabUrl,
+          ...candidateUrls,
+        ]);
+        await queueValidationChatPersist({
+          chatId,
+          messages: initialMessages,
+          pageMapping,
+        });
+        upsertBrowserValidationChatMapping(pageMapping);
+        upsertValidationMessagesForUrls({
+          urls: Object.keys(pageMapping),
+          messages: initialMessages,
+        });
+        onSavedChatUpdate(result.chat);
+        const activeRun = browserValidationRunsRef.current.get(tabRuntimeId);
+        if (activeRun && activeRun.chatId === null) {
+          activeRun.chatId = chatId;
+          startRunningChatJob(project.path, chatId, activeRun.runId);
+        }
+        return chatId;
+      })().finally(() => {
+        delete validationChatCreationByUrlRef.current[normalizedTabUrl];
+      });
+      validationChatCreationByUrlRef.current[normalizedTabUrl] = createPromise;
+      return createPromise;
+    },
+    [
+      buildValidationChatMappingForUrls,
+      onSavedChatUpdate,
+      project.path,
+      queueValidationChatPersist,
+      runtimeSettings,
+      upsertBrowserValidationChatMapping,
+      upsertValidationMessagesForUrls,
+    ],
   );
 
   const stopPageValidationRun = useCallback((tabRuntimeId: string): boolean => {

@@ -3658,15 +3658,20 @@ export default function ChatHistoryPanel({
                 isUser && stickyQuestionCount > 1;
               const stickyQuestionActive =
                 isUser && Boolean(activeStickyQuestionById[message.id]);
-              const stickyQuestionStackIndex =
+              // Keep expanded vertical order unchanged; only reverse collapsed stack layering.
+              const stickyQuestionExpandedIndex =
                 stickyQuestionOrder !== undefined ? stickyQuestionOrder - 1 : 0;
+              const stickyQuestionCollapsedIndex =
+                stickyQuestionOrder !== undefined
+                  ? Math.max(0, stickyQuestionCount - stickyQuestionOrder)
+                  : 0;
               const stickyQuestionCollapsedDepth = Math.min(
-                stickyQuestionStackIndex,
+                stickyQuestionCollapsedIndex,
                 STICKY_STACK_COLLAPSED_VISIBLE_COUNT - 1,
               );
               const stickyQuestionExpandedTopOffset =
                 stickyQuestionExpandedTopOffsetById.get(message.id) ??
-                stickyQuestionStackIndex *
+                stickyQuestionExpandedIndex *
                   (STICKY_STACK_EXPANDED_FALLBACK_HEIGHT_PX +
                     STICKY_STACK_EXPANDED_GAP_PX);
               const stickyQuestionTopOffset = stickyQuestionExpandable
@@ -3684,7 +3689,7 @@ export default function ChatHistoryPanel({
               const stickyQuestionInteractive =
                 stickyQuestionExpandable && stickyQuestionActive;
               const stickyQuestionZIndex = stickyQuestionOrder
-                ? 60 + stickyQuestionCount - stickyQuestionOrder
+                ? 60 + stickyQuestionOrder
                 : undefined;
               const handleStickyQuestionEnter = () => {
                 if (!stickyQuestionInteractive) {
