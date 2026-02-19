@@ -212,6 +212,7 @@ interface BrowserTabProps {
     tabId: string,
     reference: BrowserViewReferenceHighlight,
   ) => void;
+  onRequestOpenReference?: (target: string, label?: string) => void;
   onRequestOpenCdp: (tabId: string, url: string) => void;
   onRequestOpenExternal: (url: string) => void;
   onRequestNavigate: (tabId: string, url: string) => void;
@@ -235,6 +236,7 @@ export function BrowserTab({
   onRequestValidate,
   onRequestOpenValidationChat,
   onRequestHighlightReference,
+  onRequestOpenReference,
   onRequestOpenCdp,
   onRequestOpenExternal,
   onRequestNavigate,
@@ -257,6 +259,7 @@ export function BrowserTab({
     validationStatus === "failed" ||
     Boolean(validation) ||
     Boolean(validationChatId);
+  const shouldShowValidationActionsPopover = hasValidationContext;
   const hasValidationChatButton = Boolean(
     onRequestOpenValidationChat && hasValidationContext,
   );
@@ -281,7 +284,12 @@ export function BrowserTab({
   const sourceAuthorityLabel = formatSourceAuthorityLabel(
     validation?.sourceAuthority,
   );
+  const validationClaims = validation?.claims ?? [];
   const claimSupports = validation?.claimSupports ?? [];
+  const supportsForDisplay =
+    validationClaims.length > 0
+      ? validationClaims.flatMap((claim) => claim.supports)
+      : claimSupports;
   const checkedAtLabel = useMemo(() => {
     if (!validation?.checkedAt) {
       return null;
@@ -454,135 +462,153 @@ export function BrowserTab({
           >
             CDP
           </Button>
-          <Popover
-            open={validationActionsOpen}
-            onOpenChange={setValidationActionsOpen}
-          >
-            <PopoverTrigger asChild>
-              <Button
-                type="button"
-                variant="ghost"
-                size="icon"
-                className={cn("h-7 w-7", validateButtonToneClass)}
-                disabled={!url}
-                title="Validation actions"
-                aria-label="Validation actions"
-              >
-                {validationStatus === "running" ? (
-                  <Square className="h-3.5 w-3.5" />
-                ) : validationFailed ? (
-                  <AlertCircle className="h-3.5 w-3.5" />
-                ) : (
-                  <ShieldCheck className="h-3.5 w-3.5" />
-                )}
-              </Button>
-            </PopoverTrigger>
-            <PopoverContent
-              side="top"
-              align="end"
-              avoidCollisions={false}
-              sideOffset={6}
-              className="w-[280px] max-w-[92vw] p-1.5"
-              onOpenAutoFocus={(event) => {
-                event.preventDefault();
-              }}
+          {shouldShowValidationActionsPopover ? (
+            <Popover
+              open={validationActionsOpen}
+              onOpenChange={setValidationActionsOpen}
             >
-              <div className="space-y-1">
-                {showValidatedConfig && validateConfig ? (
-                  <div className="space-y-0.5 text-[10px] leading-tight text-foreground/90">
-                    <div className="truncate">
-                      <span className="text-muted-foreground">Validated:</span>{" "}
-                      {formatValidateStrictnessLabel(
-                        validateConfig.strictness,
-                      )}{" "}
-                      ·{" "}
-                      {formatSearchComplexityLabel(
-                        validateConfig.searchComplexity,
-                      )}{" "}
-                      /{" "}
-                      {formatTavilyDepthLabel(
-                        validateConfig.tavilySearchDepth,
+              <PopoverTrigger asChild>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="icon"
+                  className={cn("h-7 w-7", validateButtonToneClass)}
+                  disabled={!url}
+                  title="Validation actions"
+                  aria-label="Validation actions"
+                >
+                  {validationStatus === "running" ? (
+                    <Square className="h-3.5 w-3.5" />
+                  ) : validationFailed ? (
+                    <AlertCircle className="h-3.5 w-3.5" />
+                  ) : (
+                    <ShieldCheck className="h-3.5 w-3.5" />
+                  )}
+                </Button>
+              </PopoverTrigger>
+              <PopoverContent
+                side="top"
+                align="end"
+                avoidCollisions={false}
+                sideOffset={6}
+                className="w-[280px] max-w-[92vw] p-1.5"
+                onOpenAutoFocus={(event) => {
+                  event.preventDefault();
+                }}
+              >
+                <div className="space-y-1">
+                  {showValidatedConfig && validateConfig ? (
+                    <div className="space-y-0.5 text-[10px] leading-tight text-foreground/90">
+                      <div className="truncate">
+                        <span className="text-muted-foreground">Validated:</span>{" "}
+                        {formatValidateStrictnessLabel(
+                          validateConfig.strictness,
+                        )}{" "}
+                        ·{" "}
+                        {formatSearchComplexityLabel(
+                          validateConfig.searchComplexity,
+                        )}{" "}
+                        /{" "}
+                        {formatTavilyDepthLabel(
+                          validateConfig.tavilySearchDepth,
+                        )}
+                      </div>
+                      <div className="truncate">
+                        <span className="text-muted-foreground">Limits:</span> S
+                        {validateConfig.maxSearchCalls} · E
+                        {validateConfig.maxExtractCalls} ·{" "}
+                        {validateConfig.enabled ? "Enabled" : "Disabled"}
+                      </div>
+                    </div>
+                  ) : null}
+                  {showValidatedConfig ? (
+                    <div
+                      className="truncate text-[9px] leading-tight text-muted-foreground"
+                      title="Set validate config in DeepResearch, then click rerun."
+                    >
+                      Tip: set validate in DeepResearch, then click rerun.
+                    </div>
+                  ) : null}
+                  <div className="flex items-center justify-start gap-0.5">
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="icon"
+                      className="h-6 w-6 text-muted-foreground hover:text-foreground"
+                      onClick={() => {
+                        onRequestValidate(tabId);
+                        setValidationActionsOpen(false);
+                      }}
+                      disabled={!url}
+                      title={validateRunButtonTitle}
+                      aria-label={validateRunButtonTitle}
+                    >
+                      {validationStatus === "running" ? (
+                        <Square className="h-3.5 w-3.5" />
+                      ) : (
+                        <RotateCw className="h-3.5 w-3.5" />
                       )}
-                    </div>
-                    <div className="truncate">
-                      <span className="text-muted-foreground">Limits:</span> S
-                      {validateConfig.maxSearchCalls} · E
-                      {validateConfig.maxExtractCalls} ·{" "}
-                      {validateConfig.enabled ? "Enabled" : "Disabled"}
-                    </div>
+                    </Button>
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="icon"
+                      className="h-6 w-6 text-muted-foreground hover:text-foreground"
+                      onClick={() => {
+                        onRequestOpenValidationChat?.(tabId);
+                        setValidationActionsOpen(false);
+                      }}
+                      disabled={!hasValidationChatButton}
+                      title={validationChatButtonTitle}
+                      aria-label={validationChatButtonTitle}
+                    >
+                      <MessageSquare className="h-3.5 w-3.5" />
+                    </Button>
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="icon"
+                      className="h-6 w-6 text-muted-foreground hover:text-foreground"
+                      onClick={() => {
+                        setValidationPanelOpen((previous) => !previous);
+                        setValidationActionsOpen(false);
+                      }}
+                      disabled={!hasValidationDetailsButton}
+                      title={
+                        validationPanelOpen
+                          ? "Hide validation details"
+                          : "Show validation details"
+                      }
+                      aria-label={
+                        validationPanelOpen
+                          ? "Hide validation details"
+                          : "Show validation details"
+                      }
+                      aria-expanded={validationPanelOpen}
+                    >
+                      <List className="h-3.5 w-3.5" />
+                    </Button>
                   </div>
-                ) : null}
-                {showValidatedConfig ? (
-                  <div
-                    className="truncate text-[9px] leading-tight text-muted-foreground"
-                    title="Set validate config in DeepResearch, then click rerun."
-                  >
-                    Tip: set validate in DeepResearch, then click rerun.
-                  </div>
-                ) : null}
-                <div className="flex items-center justify-start gap-0.5">
-                  <Button
-                    type="button"
-                    variant="ghost"
-                    size="icon"
-                    className="h-6 w-6 text-muted-foreground hover:text-foreground"
-                    onClick={() => {
-                      onRequestValidate(tabId);
-                      setValidationActionsOpen(false);
-                    }}
-                    disabled={!url}
-                    title={validateRunButtonTitle}
-                    aria-label={validateRunButtonTitle}
-                  >
-                    {validationStatus === "running" ? (
-                      <Square className="h-3.5 w-3.5" />
-                    ) : (
-                      <RotateCw className="h-3.5 w-3.5" />
-                    )}
-                  </Button>
-                  <Button
-                    type="button"
-                    variant="ghost"
-                    size="icon"
-                    className="h-6 w-6 text-muted-foreground hover:text-foreground"
-                    onClick={() => {
-                      onRequestOpenValidationChat?.(tabId);
-                      setValidationActionsOpen(false);
-                    }}
-                    disabled={!hasValidationChatButton}
-                    title={validationChatButtonTitle}
-                    aria-label={validationChatButtonTitle}
-                  >
-                    <MessageSquare className="h-3.5 w-3.5" />
-                  </Button>
-                  <Button
-                    type="button"
-                    variant="ghost"
-                    size="icon"
-                    className="h-6 w-6 text-muted-foreground hover:text-foreground"
-                    onClick={() => {
-                      setValidationPanelOpen((previous) => !previous);
-                      setValidationActionsOpen(false);
-                    }}
-                    disabled={!hasValidationDetailsButton}
-                    title={
-                      validationPanelOpen
-                        ? "Hide validation details"
-                        : "Show validation details"
-                    }
-                    aria-label={
-                      validationPanelOpen
-                        ? "Hide validation details"
-                        : "Show validation details"
-                    }
-                    aria-expanded={validationPanelOpen}
-                  >
-                    <List className="h-3.5 w-3.5" />
-                  </Button>
                 </div>
-              </div>
-            </PopoverContent>
-          </Popover>
+              </PopoverContent>
+            </Popover>
+          ) : (
+            <Button
+              type="button"
+              variant="ghost"
+              size="icon"
+              className={cn("h-7 w-7", validateButtonToneClass)}
+              disabled={!url}
+              onClick={() => {
+                onRequestValidate(tabId);
+                setValidationActionsOpen(false);
+              }}
+              title="Validate page content"
+              aria-label="Validate page content"
+            >
+              <ShieldCheck className="h-3.5 w-3.5" />
+            </Button>
+          )}
         </div>
       </div>
       {validationPanelOpen && hasValidationPanelContent ? (
@@ -604,7 +630,167 @@ export function BrowserTab({
             </div>
           ) : validation ? (
             <div className="max-h-[260px] space-y-2 overflow-y-auto pr-1">
-              {claimSupports.length > 0 ? (
+              {validationClaims.length > 0 ? (
+                <div className="space-y-1.5 rounded border border-border/60 bg-card/40 p-2">
+                  <div className="text-[10px] uppercase tracking-[0.12em] text-muted-foreground">
+                    Claims & refs
+                  </div>
+                  {validationClaims.map((claim, claimIndex) => {
+                    const claimAccuracyLabel = formatAccuracyLabel(claim.accuracy);
+                    const claimSourceAuthorityLabel = formatSourceAuthorityLabel(
+                      claim.sourceAuthority,
+                    );
+                    const claimText = claim.originalText.trim();
+                    return (
+                      <div
+                        key={claim.claimId}
+                        className="space-y-1 rounded border border-border/50 bg-background/60 px-2 py-1"
+                      >
+                        <button
+                          type="button"
+                          className="w-full space-y-0.5 text-left transition-colors hover:bg-accent/40"
+                          onClick={() => {
+                            if (!claimText) {
+                              return;
+                            }
+                            onRequestHighlightReference?.(tabId, {
+                              refId: claimIndex + 1,
+                              text: claimText,
+                              url: claim.origin.url ?? validation.url,
+                              title: claim.summary || claimText,
+                              accuracy: claim.accuracy,
+                              sourceAuthority: claim.sourceAuthority,
+                              issueReason: claim.issueReason,
+                              correctFact: claim.correctFact,
+                              showMarker: false,
+                            });
+                          }}
+                          title="Highlight claim original text"
+                        >
+                          <div className="text-[11px] font-medium leading-relaxed text-foreground">
+                            {truncateText(claim.summary, 180)}
+                          </div>
+                          <div className="text-[11px] leading-relaxed text-foreground/85">
+                            {truncateText(claimText, 280)}
+                          </div>
+                          {claimAccuracyLabel ? (
+                            <div
+                              className={cn(
+                                "text-[10px] uppercase tracking-[0.12em]",
+                                getAccuracyTextClass(claim.accuracy),
+                              )}
+                            >
+                              Accuracy {claimAccuracyLabel}
+                            </div>
+                          ) : null}
+                          {claimSourceAuthorityLabel ? (
+                            <div
+                              className={cn(
+                                "text-[10px] uppercase tracking-[0.12em]",
+                                getSourceAuthorityTextClass(
+                                  claim.sourceAuthority,
+                                ),
+                              )}
+                            >
+                              Source Authority {claimSourceAuthorityLabel}
+                            </div>
+                          ) : null}
+                        </button>
+                        {claim.supports.length > 0 ? (
+                          <div className="space-y-1">
+                            {claim.supports.map((support, supportIndex) => {
+                              const supportRefId =
+                                typeof support.referenceRefId === "number" &&
+                                support.referenceRefId > 0
+                                  ? support.referenceRefId
+                                  : supportIndex + 1;
+                              const supportAccuracyLabel = formatAccuracyLabel(
+                                support.accuracy,
+                              );
+                              const supportSourceAuthorityLabel =
+                                formatSourceAuthorityLabel(
+                                  support.sourceAuthority,
+                                );
+                              const trimmedReferenceUri =
+                                support.referenceUri?.trim();
+                              const referenceOpenTarget =
+                                trimmedReferenceUri &&
+                                trimmedReferenceUri.length > 0
+                                  ? trimmedReferenceUri
+                                  : support.referenceUrl;
+                              return (
+                                <div
+                                  key={`${claim.claimId}:${support.referenceRefId ?? supportIndex}`}
+                                  className="rounded border border-border/50 bg-background/50 px-2 py-1"
+                                >
+                                  <div className="flex items-start gap-1">
+                                    <div className="min-w-0 flex-1 space-y-0.5">
+                                      <div className="truncate text-[10px] text-muted-foreground">
+                                        [{supportRefId}] {support.referenceUrl}
+                                      </div>
+                                      <div className="text-[10px] uppercase tracking-[0.12em] text-muted-foreground">
+                                        Lines {support.startLine}-{support.endLine}
+                                      </div>
+                                      {supportAccuracyLabel ? (
+                                        <div
+                                          className={cn(
+                                            "text-[10px] uppercase tracking-[0.12em]",
+                                            getAccuracyTextClass(support.accuracy),
+                                          )}
+                                        >
+                                          Accuracy {supportAccuracyLabel}
+                                        </div>
+                                      ) : null}
+                                      {supportSourceAuthorityLabel ? (
+                                        <div
+                                          className={cn(
+                                            "text-[10px] uppercase tracking-[0.12em]",
+                                            getSourceAuthorityTextClass(
+                                              support.sourceAuthority,
+                                            ),
+                                          )}
+                                        >
+                                          Source Authority {supportSourceAuthorityLabel}
+                                        </div>
+                                      ) : null}
+                                      <div className="text-[11px] leading-relaxed text-foreground/85">
+                                        {truncateText(support.text, 240)}
+                                      </div>
+                                    </div>
+                                    <Button
+                                      type="button"
+                                      variant="ghost"
+                                      size="icon"
+                                      className="h-6 w-6 shrink-0 text-muted-foreground hover:text-foreground"
+                                      onClick={() =>
+                                        onRequestOpenReference?.(
+                                          referenceOpenTarget,
+                                          support.referenceTitle ?? claim.summary,
+                                        )
+                                      }
+                                      disabled={
+                                        !onRequestOpenReference || !referenceOpenTarget
+                                      }
+                                      title="Open reference in new page"
+                                      aria-label="Open reference in new page"
+                                    >
+                                      <ExternalLink className="h-3.5 w-3.5" />
+                                    </Button>
+                                  </div>
+                                </div>
+                              );
+                            })}
+                          </div>
+                        ) : (
+                          <div className="text-[11px] leading-relaxed text-muted-foreground">
+                            No supporting references were returned for this claim.
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+              ) : claimSupports.length > 0 ? (
                 <div className="space-y-1.5 rounded border border-border/60 bg-card/40 p-2">
                   <div className="text-[10px] uppercase tracking-[0.12em] text-muted-foreground">
                     Claims & refs
@@ -620,76 +806,93 @@ export function BrowserTab({
                       support.referenceRefId > 0
                         ? support.referenceRefId
                         : index + 1;
+                    const trimmedReferenceUri = support.referenceUri?.trim();
+                    const referenceOpenTarget =
+                      trimmedReferenceUri && trimmedReferenceUri.length > 0
+                        ? trimmedReferenceUri
+                        : support.referenceUrl;
                     return (
-                      <button
-                        type="button"
+                      <div
                         key={`${support.viewpoint}:${support.referenceRefId ?? index}`}
-                        className="w-full space-y-0.5 rounded border border-border/50 bg-background/60 px-2 py-1 text-left transition-colors hover:bg-accent/40"
-                        onClick={() => {
-                          onRequestHighlightReference?.(tabId, {
-                            refId,
-                            text: support.text,
-                            startLine: support.startLine,
-                            endLine: support.endLine,
-                            uri: support.referenceUri,
-                            url: support.referenceUrl,
-                            title: support.referenceTitle,
-                            accuracy: support.accuracy,
-                            sourceAuthority: support.sourceAuthority,
-                          });
-                        }}
-                        title="Scroll to this cited segment"
+                        className="rounded border border-border/50 bg-background/60 px-2 py-1"
                       >
-                        <div className="text-[11px] font-medium leading-relaxed text-foreground">
-                          {truncateText(support.viewpoint, 180)}
-                        </div>
-                        <div className="truncate text-[10px] text-muted-foreground">
-                          {support.referenceUrl}
-                        </div>
-                        <div className="text-[10px] uppercase tracking-[0.12em] text-muted-foreground">
-                          Lines {support.startLine}-{support.endLine}
-                        </div>
-                        {supportAccuracyLabel ? (
-                          <div
-                            className={cn(
-                              "text-[10px] uppercase tracking-[0.12em]",
-                              getAccuracyTextClass(support.accuracy),
-                            )}
+                        <div className="flex items-start gap-1">
+                          <button
+                            type="button"
+                            className="min-w-0 flex-1 space-y-0.5 text-left transition-colors hover:bg-accent/40"
+                            onClick={() => {
+                              onRequestHighlightReference?.(tabId, {
+                                refId,
+                                text: support.text,
+                                startLine: support.startLine,
+                                endLine: support.endLine,
+                                uri: support.referenceUri,
+                                url: support.referenceUrl,
+                                title: support.referenceTitle,
+                                accuracy: support.accuracy,
+                                sourceAuthority: support.sourceAuthority,
+                              });
+                            }}
+                            title="Scroll to this cited segment"
                           >
-                            Accuracy {supportAccuracyLabel}
-                          </div>
-                        ) : null}
-                        {supportSourceAuthorityLabel ? (
-                          <div
-                            className={cn(
-                              "text-[10px] uppercase tracking-[0.12em]",
-                              getSourceAuthorityTextClass(
-                                support.sourceAuthority,
-                              ),
-                            )}
+                            <div className="text-[11px] font-medium leading-relaxed text-foreground">
+                              {truncateText(support.viewpoint, 180)}
+                            </div>
+                            <div className="truncate text-[10px] text-muted-foreground">
+                              {support.referenceUrl}
+                            </div>
+                            <div className="text-[10px] uppercase tracking-[0.12em] text-muted-foreground">
+                              Lines {support.startLine}-{support.endLine}
+                            </div>
+                            {supportAccuracyLabel ? (
+                              <div
+                                className={cn(
+                                  "text-[10px] uppercase tracking-[0.12em]",
+                                  getAccuracyTextClass(support.accuracy),
+                                )}
+                              >
+                                Accuracy {supportAccuracyLabel}
+                              </div>
+                            ) : null}
+                            {supportSourceAuthorityLabel ? (
+                              <div
+                                className={cn(
+                                  "text-[10px] uppercase tracking-[0.12em]",
+                                  getSourceAuthorityTextClass(
+                                    support.sourceAuthority,
+                                  ),
+                                )}
+                              >
+                                Source Authority {supportSourceAuthorityLabel}
+                              </div>
+                            ) : null}
+                            <div className="text-[11px] leading-relaxed text-foreground/85">
+                              {truncateText(support.text, 240)}
+                            </div>
+                          </button>
+                          <Button
+                            type="button"
+                            variant="ghost"
+                            size="icon"
+                            className="h-6 w-6 shrink-0 text-muted-foreground hover:text-foreground"
+                            onClick={() =>
+                              onRequestOpenReference?.(
+                                referenceOpenTarget,
+                                support.referenceTitle ?? support.viewpoint,
+                              )
+                            }
+                            disabled={!onRequestOpenReference || !referenceOpenTarget}
+                            title="Open reference in new page"
+                            aria-label="Open reference in new page"
                           >
-                            Source Authority {supportSourceAuthorityLabel}
-                          </div>
-                        ) : null}
-                        <div className="text-[11px] leading-relaxed text-foreground/85">
-                          {truncateText(support.text, 240)}
+                            <ExternalLink className="h-3.5 w-3.5" />
+                          </Button>
                         </div>
-                      </button>
+                      </div>
                     );
                   })}
                 </div>
               ) : null}
-              <div className="truncate text-xs font-semibold text-foreground">
-                {validation.referenceTitle ??
-                  validation.title ??
-                  "Validation Result"}
-              </div>
-              <div className="truncate text-[11px] text-muted-foreground">
-                {validation.referenceUrl ?? validation.url}
-              </div>
-              <div className="text-[10px] uppercase tracking-[0.12em] text-muted-foreground">
-                Lines {validation.startLine}-{validation.endLine}
-              </div>
               {checkedAtLabel ? (
                 <div className="text-[10px] uppercase tracking-[0.12em] text-muted-foreground">
                   Checked {checkedAtLabel}
@@ -715,24 +918,32 @@ export function BrowserTab({
                   Source Authority {sourceAuthorityLabel}
                 </div>
               ) : null}
-              {validation.issueReason ? (
-                <div className="rounded border border-red-400/40 bg-red-500/10 px-2 py-1 text-[11px] leading-relaxed text-red-700 dark:text-red-300">
-                  Why wrong: {validation.issueReason}
+              {supportsForDisplay.length > 0 ? (
+                <div className="text-[11px] leading-relaxed text-muted-foreground">
+                  Select a claim above to highlight the original statement.
                 </div>
-              ) : null}
-              {validation.correctFact ? (
-                <div className="rounded border border-emerald-400/40 bg-emerald-500/10 px-2 py-1 text-[11px] leading-relaxed text-emerald-700 dark:text-emerald-300">
-                  Correct fact: {validation.correctFact}
-                </div>
-              ) : null}
-              {validation.validationRefContent ? (
-                <div className="rounded border border-border/60 bg-card/40 px-2 py-1 text-[11px] leading-relaxed text-foreground/90">
-                  {validation.validationRefContent}
-                </div>
-              ) : null}
-              <div className="whitespace-pre-wrap text-xs leading-relaxed text-foreground/90">
-                {validation.text}
-              </div>
+              ) : (
+                <>
+                  {validation.issueReason ? (
+                    <div className="rounded border border-red-400/40 bg-red-500/10 px-2 py-1 text-[11px] leading-relaxed text-red-700 dark:text-red-300">
+                      Why wrong: {validation.issueReason}
+                    </div>
+                  ) : null}
+                  {validation.correctFact ? (
+                    <div className="rounded border border-emerald-400/40 bg-emerald-500/10 px-2 py-1 text-[11px] leading-relaxed text-emerald-700 dark:text-emerald-300">
+                      Correct fact: {validation.correctFact}
+                    </div>
+                  ) : null}
+                  {validation.validationRefContent ? (
+                    <div className="rounded border border-border/60 bg-card/40 px-2 py-1 text-[11px] leading-relaxed text-foreground/90">
+                      {validation.validationRefContent}
+                    </div>
+                  ) : null}
+                  <div className="whitespace-pre-wrap text-xs leading-relaxed text-foreground/90">
+                    {validation.text}
+                  </div>
+                </>
+              )}
             </div>
           ) : (
             <div className="text-xs text-muted-foreground">

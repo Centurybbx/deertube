@@ -650,6 +650,7 @@ interface ValidateResult {
   skipReason?: "disabled-by-config" | "no-fact-checkable-claims";
   searchId?: string;
   projectId?: string;
+  claims: string[];
   references: Awaited<ReturnType<typeof runDeepSearchTool>>["references"];
   sources: Awaited<ReturnType<typeof runDeepSearchTool>>["sources"];
 }
@@ -737,6 +738,7 @@ const runValidateForInput = async (
       skipReason: "disabled-by-config",
       searchId: undefined,
       projectId: undefined,
+      claims: [],
       references: [],
       sources: [],
     };
@@ -787,6 +789,7 @@ const runValidateForInput = async (
       skipReason: "no-fact-checkable-claims",
       searchId: undefined,
       projectId: undefined,
+      claims: [],
       references: [],
       sources: [],
     };
@@ -851,6 +854,7 @@ const runValidateForInput = async (
     query,
     searchId: result.searchId,
     projectId: result.projectId,
+    claims: claimSplit.claims,
     references: result.references,
     sources: result.sources,
   };

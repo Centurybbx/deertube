@@ -1,5 +1,6 @@
 import type { DeepSearchReferencePayload } from "@/types/chat";
 import type {
+  BrowserValidationClaim,
   BrowserValidationClaimSupport,
   BrowserPageValidationRecord,
   BrowserViewReferenceHighlight,
@@ -152,13 +153,77 @@ const normalizeClaimViewpoint = (
   if (!excerpt) {
     return undefined;
   }
-  return excerpt.length > 180 ? `${excerpt.slice(0, 177)}...` : excerpt;
+  return excerpt.length > 240 ? `${excerpt.slice(0, 237)}...` : excerpt;
 };
 
-const toValidationClaimSupport = (
-  reference: DeepSearchReferencePayload,
-  viewpoint: string,
-): BrowserValidationClaimSupport | null => {
+const normalizeClaimText = (value: string): string =>
+  value.replace(/\s+/g, " ").trim();
+
+const normalizeClaimHints = (claims: string[] | undefined): string[] => {
+  if (!Array.isArray(claims)) {
+    return [];
+  }
+  const dedupe = new Set<string>();
+  claims.forEach((claim) => {
+    const normalized = normalizeClaimText(claim);
+    if (normalized.length === 0) {
+      return;
+    }
+    dedupe.add(normalized);
+  });
+  return Array.from(dedupe.values());
+};
+
+const toClaimComparable = (value: string): string =>
+  normalizeClaimText(value)
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}\s]/gu, " ");
+
+const tokenizeClaimComparable = (value: string): string[] => {
+  const normalized = toClaimComparable(value);
+  const latinTokens = normalized
+    .split(/\s+/)
+    .map((token) => token.trim())
+    .filter((token) => token.length >= 4);
+  const cjkTokens = normalized.match(/[\u4e00-\u9fff]{2,}/g) ?? [];
+  return Array.from(new Set([...latinTokens, ...cjkTokens]));
+};
+
+const scoreClaimMatch = (left: string, right: string): number => {
+  const leftComparable = toClaimComparable(left).replace(/\s+/g, " ").trim();
+  const rightComparable = toClaimComparable(right).replace(/\s+/g, " ").trim();
+  if (!leftComparable || !rightComparable) {
+    return 0;
+  }
+  if (leftComparable === rightComparable) {
+    return 1;
+  }
+  let score = 0;
+  if (
+    leftComparable.includes(rightComparable) ||
+    rightComparable.includes(leftComparable)
+  ) {
+    score += 0.58;
+  }
+  const leftTokens = tokenizeClaimComparable(leftComparable);
+  const rightTokens = tokenizeClaimComparable(rightComparable);
+  if (leftTokens.length === 0 || rightTokens.length === 0) {
+    return Math.min(1, score);
+  }
+  const rightSet = new Set(rightTokens);
+  const overlap = leftTokens.filter((token) => rightSet.has(token)).length;
+  const overlapRatio = overlap / Math.max(leftTokens.length, rightTokens.length);
+  score += overlapRatio * 0.5;
+  return Math.min(1, score);
+};
+
+const toValidationClaimSupport = ({
+  reference,
+  viewpoint,
+}: {
+  reference: DeepSearchReferencePayload;
+  viewpoint: string;
+}): BrowserValidationClaimSupport | null => {
   const referenceUrl = reference.url?.trim();
   if (!referenceUrl) {
     return null;
@@ -194,64 +259,261 @@ const toValidationClaimSupport = (
     endLine,
     accuracy: reference.accuracy,
     sourceAuthority: reference.sourceAuthority,
+    validationRefContent: reference.validationRefContent,
+    issueReason: reference.issueReason,
+    correctFact: reference.correctFact,
   };
 };
 
-const buildValidationClaimSupports = (
-  references: DeepSearchReferencePayload[],
-): BrowserValidationClaimSupport[] => {
-  const claimSupports: BrowserValidationClaimSupport[] = [];
-  references.forEach((reference) => {
-    const viewpoint = normalizeClaimViewpoint(reference);
-    if (!viewpoint) {
-      return;
+interface ValidationClaimBucket {
+  originalText: string;
+  summary: string;
+  supports: BrowserValidationClaimSupport[];
+}
+
+const findBestClaimBucketIndex = ({
+  buckets,
+  candidateText,
+}: {
+  buckets: ValidationClaimBucket[];
+  candidateText: string;
+}): number => {
+  if (buckets.length === 0) {
+    return -1;
+  }
+  let selectedIndex = -1;
+  let selectedScore = 0;
+  buckets.forEach((bucket, index) => {
+    const score = Math.max(
+      scoreClaimMatch(candidateText, bucket.originalText),
+      scoreClaimMatch(candidateText, bucket.summary),
+    );
+    if (score > selectedScore) {
+      selectedScore = score;
+      selectedIndex = index;
     }
-    const support = toValidationClaimSupport(reference, viewpoint);
-    if (!support) {
-      return;
-    }
-    claimSupports.push(support);
   });
-  return claimSupports;
+  return selectedScore >= 0.36 ? selectedIndex : -1;
 };
 
-const pickPrimaryValidationReference = (
-  references: DeepSearchReferencePayload[],
-): DeepSearchReferencePayload | null => {
-  if (references.length === 0) {
-    return null;
-  }
-  let selected: DeepSearchReferencePayload = references[0];
-  let selectedScore = getValidationAccuracyPriority(selected.accuracy);
-  references.slice(1).forEach((candidate) => {
-    const candidateScore = getValidationAccuracyPriority(candidate.accuracy);
+const aggregateClaimSupportAccuracy = (
+  supports: BrowserValidationClaimSupport[],
+): BrowserPageValidationRecord["accuracy"] => {
+  let selected: BrowserPageValidationRecord["accuracy"] | undefined;
+  let selectedScore = 0;
+  supports.forEach((support) => {
+    const candidate = support.accuracy;
+    const candidateScore = getValidationAccuracyPriority(candidate);
     if (candidateScore > selectedScore) {
       selected = candidate;
       selectedScore = candidateScore;
+    }
+  });
+  return selected;
+};
+
+const aggregateClaimSupportSourceAuthority = (
+  supports: BrowserValidationClaimSupport[],
+): BrowserPageValidationRecord["sourceAuthority"] => {
+  let selected: BrowserPageValidationRecord["sourceAuthority"] | undefined;
+  let selectedScore = 0;
+  supports.forEach((support) => {
+    const candidate = support.sourceAuthority;
+    const candidateScore = getValidationSourceAuthorityPriority(candidate);
+    if (candidateScore > selectedScore) {
+      selected = candidate;
+      selectedScore = candidateScore;
+    }
+  });
+  return selected;
+};
+
+const pickClaimIssueReason = (
+  supports: BrowserValidationClaimSupport[],
+): string | undefined => {
+  const sorted = [...supports].sort(
+    (left, right) =>
+      getValidationAccuracyPriority(right.accuracy) -
+      getValidationAccuracyPriority(left.accuracy),
+  );
+  return sorted.find((support) => support.issueReason)?.issueReason;
+};
+
+const pickClaimCorrectFact = (
+  supports: BrowserValidationClaimSupport[],
+): string | undefined => {
+  const sorted = [...supports].sort(
+    (left, right) =>
+      getValidationAccuracyPriority(right.accuracy) -
+      getValidationAccuracyPriority(left.accuracy),
+  );
+  return sorted.find((support) => support.correctFact)?.correctFact;
+};
+
+const buildValidationClaims = ({
+  references,
+  claimHints,
+  originUrl,
+}: {
+  references: DeepSearchReferencePayload[],
+  claimHints: string[];
+  originUrl: string;
+}): BrowserValidationClaim[] => {
+  const buckets: ValidationClaimBucket[] = claimHints.map((claim) => ({
+    originalText: claim,
+    summary: claim,
+    supports: [],
+  }));
+  references.forEach((reference) => {
+    const normalizedViewpoint = normalizeClaimViewpoint(reference);
+    if (!normalizedViewpoint) {
       return;
     }
-    if (candidateScore !== selectedScore) {
+    const candidateClaimText = normalizeClaimText(normalizedViewpoint);
+    const supportCandidate = toValidationClaimSupport({
+      reference,
+      viewpoint: candidateClaimText,
+    });
+    if (!supportCandidate) {
       return;
     }
-    const selectedAuthorityScore = getValidationSourceAuthorityPriority(
-      selected.sourceAuthority,
+    const bucketIndex = findBestClaimBucketIndex({
+      buckets,
+      candidateText: candidateClaimText,
+    });
+    const targetBucket =
+      bucketIndex >= 0
+        ? buckets[bucketIndex]
+        : (() => {
+            const created: ValidationClaimBucket = {
+              originalText: candidateClaimText,
+              summary: candidateClaimText,
+              supports: [],
+            };
+            buckets.push(created);
+            return created;
+          })();
+    if (
+      targetBucket.summary === targetBucket.originalText &&
+      candidateClaimText !== targetBucket.originalText
+    ) {
+      targetBucket.summary = candidateClaimText;
+    }
+    targetBucket.supports.push({
+      ...supportCandidate,
+      viewpoint: targetBucket.summary,
+    });
+  });
+  return buckets
+    .filter((bucket) => bucket.supports.length > 0)
+    .map((bucket, index) => {
+      const originalText = normalizeClaimText(bucket.originalText);
+      const summary = normalizeClaimText(bucket.summary) || originalText;
+      return {
+        claimId: `claim-${index + 1}`,
+        originalText,
+        summary,
+        origin: {
+          type: "browserview",
+          url: originUrl,
+        },
+        accuracy: aggregateClaimSupportAccuracy(bucket.supports),
+        sourceAuthority: aggregateClaimSupportSourceAuthority(bucket.supports),
+        issueReason: pickClaimIssueReason(bucket.supports),
+        correctFact: pickClaimCorrectFact(bucket.supports),
+        supports: bucket.supports,
+      };
+    });
+};
+
+const buildFallbackClaimsFromHints = ({
+  claimHints,
+  originUrl,
+}: {
+  claimHints: string[];
+  originUrl: string;
+}): BrowserValidationClaim[] =>
+  claimHints.map((claim, index) => ({
+    claimId: `claim-${index + 1}`,
+    originalText: claim,
+    summary: claim,
+    origin: {
+      type: "browserview",
+      url: originUrl,
+    },
+    accuracy: "insufficient",
+    sourceAuthority: "unknown",
+    supports: [],
+  }));
+
+const flattenValidationClaimSupports = (
+  claims: BrowserValidationClaim[],
+): BrowserValidationClaimSupport[] => {
+  const supports: BrowserValidationClaimSupport[] = [];
+  claims.forEach((claim) => {
+    claim.supports.forEach((support) => {
+      supports.push({
+        ...support,
+        viewpoint: claim.summary,
+      });
+    });
+  });
+  return supports;
+};
+
+const pickRecordIssueReason = (
+  claims: BrowserValidationClaim[],
+): string | undefined =>
+  claims.find((claim) => claim.issueReason)?.issueReason;
+
+const pickRecordCorrectFact = (
+  claims: BrowserValidationClaim[],
+): string | undefined =>
+  claims.find((claim) => claim.correctFact)?.correctFact;
+
+const pickRecordValidationRefContent = (
+  claims: BrowserValidationClaim[],
+): string | undefined => {
+  for (const claim of claims) {
+    const supportWithNote = claim.supports.find(
+      (support) =>
+        typeof support.validationRefContent === "string" &&
+        support.validationRefContent.trim().length > 0,
     );
-    const candidateAuthorityScore = getValidationSourceAuthorityPriority(
-      candidate.sourceAuthority,
-    );
-    if (candidateAuthorityScore > selectedAuthorityScore) {
-      selected = candidate;
-      return;
+    if (supportWithNote?.validationRefContent) {
+      return supportWithNote.validationRefContent;
     }
-    if (candidateAuthorityScore < selectedAuthorityScore) {
-      return;
-    }
-    if (candidate.validationRefContent && !selected.validationRefContent) {
+  }
+  return undefined;
+};
+
+const aggregateValidationAccuracy = (
+  references: DeepSearchReferencePayload[],
+): BrowserPageValidationRecord["accuracy"] => {
+  let selected: BrowserPageValidationRecord["accuracy"] | undefined;
+  let selectedScore = 0;
+  references.forEach((reference) => {
+    const candidate = reference.accuracy;
+    const candidateScore = getValidationAccuracyPriority(candidate);
+    if (candidateScore > selectedScore) {
       selected = candidate;
-      return;
+      selectedScore = candidateScore;
     }
-    if (candidate.issueReason && !selected.issueReason) {
+  });
+  return selected;
+};
+
+const aggregateValidationSourceAuthority = (
+  references: DeepSearchReferencePayload[],
+): BrowserPageValidationRecord["sourceAuthority"] => {
+  let selected: BrowserPageValidationRecord["sourceAuthority"] | undefined;
+  let selectedScore = 0;
+  references.forEach((reference) => {
+    const candidate = reference.sourceAuthority;
+    const candidateScore = getValidationSourceAuthorityPriority(candidate);
+    if (candidateScore > selectedScore) {
       selected = candidate;
+      selectedScore = candidateScore;
     }
   });
   return selected;
@@ -263,17 +525,30 @@ export const buildBrowserValidationRecord = ({
   query,
   references,
   sourceCount,
+  claims,
 }: {
   url: string;
   title?: string;
   query: string;
   references: DeepSearchReferencePayload[];
   sourceCount: number;
+  claims?: string[];
 }): BrowserPageValidationRecord => {
   const checkedAt = new Date().toISOString();
-  const claimSupports = buildValidationClaimSupports(references);
-  const selected = pickPrimaryValidationReference(references);
-  if (!selected) {
+  const claimHints = normalizeClaimHints(claims);
+  const validationClaims =
+    references.length > 0
+      ? buildValidationClaims({
+          references,
+          claimHints,
+          originUrl: url,
+        })
+      : buildFallbackClaimsFromHints({
+          claimHints,
+          originUrl: url,
+        });
+  const claimSupports = flattenValidationClaimSupports(validationClaims);
+  if (references.length === 0) {
     return {
       url,
       title,
@@ -284,36 +559,32 @@ export const buildBrowserValidationRecord = ({
       endLine: 1,
       accuracy: "insufficient",
       sourceAuthority: "unknown",
+      claims: validationClaims.length > 0 ? validationClaims : undefined,
       claimSupports: claimSupports.length > 0 ? claimSupports : undefined,
       sourceCount,
       referenceCount: 0,
     };
   }
 
-  const startLine = selected.startLine > 0 ? selected.startLine : 1;
-  const endLine = selected.endLine >= startLine ? selected.endLine : startLine;
-  const text = stripLineNumberPrefix(selected.text).trim();
+  const text =
+    validationClaims.length > 0
+      ? "Validated claims and references are available. Select a claim to highlight the original statement."
+      : "Validated references were returned, but no claim records could be derived for this page.";
 
   return {
     url,
     title,
     query,
     checkedAt,
-    text: text.length > 0 ? text : "No validated reference excerpt available.",
-    startLine,
-    endLine,
-    referenceTitle: selected.title,
-    referenceUrl: selected.url,
-    referenceUri: selected.uri,
-    referenceRefId:
-      typeof selected.refId === "number" && selected.refId > 0
-        ? selected.refId
-        : undefined,
-    accuracy: selected.accuracy,
-    sourceAuthority: selected.sourceAuthority,
-    validationRefContent: selected.validationRefContent,
-    issueReason: selected.issueReason,
-    correctFact: selected.correctFact,
+    text,
+    startLine: 1,
+    endLine: 1,
+    accuracy: aggregateValidationAccuracy(references),
+    sourceAuthority: aggregateValidationSourceAuthority(references),
+    validationRefContent: pickRecordValidationRefContent(validationClaims),
+    issueReason: pickRecordIssueReason(validationClaims),
+    correctFact: pickRecordCorrectFact(validationClaims),
+    claims: validationClaims.length > 0 ? validationClaims : undefined,
     claimSupports: claimSupports.length > 0 ? claimSupports : undefined,
     sourceCount,
     referenceCount: references.length,

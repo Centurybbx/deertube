@@ -9,6 +9,8 @@ import { baseProcedure, createTRPCRouter } from '../init'
 import type { FlowEdge, FlowNode } from '../../../src/types/flow'
 import type { ChatMessage } from '../../../src/types/chat'
 import type {
+  BrowserValidationClaim,
+  BrowserValidationClaimOrigin,
   BrowserValidationClaimSupport,
   BrowserPageValidationRecord,
   BrowserPageValidationStatusRecord,
@@ -384,6 +386,61 @@ const normalizeBrowserValidationClaimSupport = (
     endLine,
     accuracy,
     sourceAuthority,
+    validationRefContent: normalizeOptionalText(value.validationRefContent),
+    issueReason: normalizeOptionalText(value.issueReason),
+    correctFact: normalizeOptionalText(value.correctFact),
+  }
+}
+
+const normalizeBrowserValidationClaimOrigin = (
+  value: unknown,
+): BrowserValidationClaimOrigin => {
+  if (!isObject(value)) {
+    return { type: 'browserview' }
+  }
+  const rawType = normalizeOptionalText(value.type)
+  const type: BrowserValidationClaimOrigin['type'] =
+    rawType === 'chat' ? 'chat' : 'browserview'
+  return {
+    type,
+    url: normalizeOptionalText(value.url),
+    responseId: normalizeOptionalText(value.responseId),
+  }
+}
+
+const normalizeBrowserValidationClaim = (
+  value: unknown,
+): BrowserValidationClaim | null => {
+  if (!isObject(value)) {
+    return null
+  }
+  const originalText = normalizeOptionalText(value.originalText)
+  if (!originalText) {
+    return null
+  }
+  const summary = normalizeOptionalText(value.summary) ?? originalText
+  const claimId = normalizeOptionalText(value.claimId) ?? `claim-${randomUUID()}`
+  const supports = Array.isArray(value.supports)
+    ? value.supports
+      .map((item) => normalizeBrowserValidationClaimSupport(item))
+      .filter((item): item is BrowserValidationClaimSupport => item !== null)
+    : []
+  const accuracy = isReferenceAccuracy(value.accuracy)
+    ? value.accuracy
+    : undefined
+  const sourceAuthority = isReferenceSourceAuthority(value.sourceAuthority)
+    ? value.sourceAuthority
+    : undefined
+  return {
+    claimId,
+    originalText,
+    summary,
+    origin: normalizeBrowserValidationClaimOrigin(value.origin),
+    accuracy,
+    sourceAuthority,
+    issueReason: normalizeOptionalText(value.issueReason),
+    correctFact: normalizeOptionalText(value.correctFact),
+    supports,
   }
 }
 
@@ -417,6 +474,11 @@ const normalizeBrowserValidationRecord = (
   const sourceAuthority = isReferenceSourceAuthority(value.sourceAuthority)
     ? value.sourceAuthority
     : undefined
+  const claims = Array.isArray(value.claims)
+    ? value.claims
+      .map((item) => normalizeBrowserValidationClaim(item))
+      .filter((item): item is BrowserValidationClaim => item !== null)
+    : []
   const claimSupports = Array.isArray(value.claimSupports)
     ? value.claimSupports
       .map((item) => normalizeBrowserValidationClaimSupport(item))
@@ -439,6 +501,7 @@ const normalizeBrowserValidationRecord = (
     validationRefContent: normalizeOptionalText(value.validationRefContent),
     issueReason: normalizeOptionalText(value.issueReason),
     correctFact: normalizeOptionalText(value.correctFact),
+    claims: claims.length > 0 ? claims : undefined,
     claimSupports: claimSupports.length > 0 ? claimSupports : undefined,
     sourceCount: normalizeNonNegativeInteger(value.sourceCount),
     referenceCount: normalizeNonNegativeInteger(value.referenceCount),

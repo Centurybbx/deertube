@@ -31,6 +31,7 @@ interface ChatValidateResult {
   skipReason?: "disabled-by-config" | "no-fact-checkable-claims";
   searchId?: string;
   projectId?: string;
+  claims?: string[];
   references?: DeepSearchReferencePayload[];
   sources?: DeepSearchSourcePayload[];
 }
@@ -172,6 +173,7 @@ export const executeBrowserValidation = async ({
       query: validateResult.query ?? query,
       references,
       sourceCount: sources.length,
+      claims: validateResult.claims,
     }),
     query: validateResult.query ?? query,
     searchId: validateResult.searchId,

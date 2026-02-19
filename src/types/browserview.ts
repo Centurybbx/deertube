@@ -45,6 +45,27 @@ export interface BrowserValidationClaimSupport {
   endLine: number;
   accuracy?: ReferenceAccuracy;
   sourceAuthority?: ReferenceSourceAuthority;
+  validationRefContent?: string;
+  issueReason?: string;
+  correctFact?: string;
+}
+
+export interface BrowserValidationClaimOrigin {
+  type: "chat" | "browserview";
+  url?: string;
+  responseId?: string;
+}
+
+export interface BrowserValidationClaim {
+  claimId: string;
+  originalText: string;
+  summary: string;
+  origin: BrowserValidationClaimOrigin;
+  accuracy?: ReferenceAccuracy;
+  sourceAuthority?: ReferenceSourceAuthority;
+  issueReason?: string;
+  correctFact?: string;
+  supports: BrowserValidationClaimSupport[];
 }
 
 export interface BrowserPageValidationRecord {
@@ -64,6 +85,7 @@ export interface BrowserPageValidationRecord {
   validationRefContent?: string;
   issueReason?: string;
   correctFact?: string;
+  claims?: BrowserValidationClaim[];
   claimSupports?: BrowserValidationClaimSupport[];
   sourceCount: number;
   referenceCount: number;
