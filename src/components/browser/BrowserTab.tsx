@@ -32,6 +32,11 @@ import type {
   BrowserViewReferenceHighlight,
 } from "@/types/browserview";
 import { cn } from "@/lib/utils";
+import type {
+  DeepResearchStrictness,
+  SubagentSearchComplexity,
+  TavilySearchDepth,
+} from "@/shared/deepresearch-config";
 
 const formatAccuracyLabel = (
   accuracy: BrowserPageValidationRecord["accuracy"],
@@ -147,8 +152,44 @@ const getValidationButtonToneClass = ({
   return "text-muted-foreground";
 };
 
+const formatValidateStrictnessLabel = (
+  strictness: DeepResearchStrictness,
+): string => {
+  if (strictness === "all-claims") {
+    return "All claims";
+  }
+  if (strictness === "uncertain-claims") {
+    return "Uncertain claims";
+  }
+  return "No search";
+};
+
+const formatSearchComplexityLabel = (
+  complexity: SubagentSearchComplexity,
+): string => {
+  if (complexity === "balanced") {
+    return "Balanced";
+  }
+  if (complexity === "deep") {
+    return "Deep";
+  }
+  return "Standard";
+};
+
+const formatTavilyDepthLabel = (depth: TavilySearchDepth): string =>
+  depth === "advanced" ? "Advanced" : "Basic";
+
 const truncateText = (value: string, maxLength: number): string =>
   value.length > maxLength ? `${value.slice(0, maxLength - 3)}...` : value;
+
+interface BrowserValidateConfigSummary {
+  enabled: boolean;
+  strictness: DeepResearchStrictness;
+  searchComplexity: SubagentSearchComplexity;
+  tavilySearchDepth: TavilySearchDepth;
+  maxSearchCalls: number;
+  maxExtractCalls: number;
+}
 
 interface BrowserTabProps {
   tabId: string;
@@ -156,6 +197,7 @@ interface BrowserTabProps {
   canGoBack?: boolean;
   canGoForward?: boolean;
   validation?: BrowserPageValidationRecord;
+  validateConfig?: BrowserValidateConfigSummary;
   validationChatId?: string;
   validationStatus?: BrowserValidationStatus;
   validationError?: string;
@@ -181,6 +223,7 @@ export function BrowserTab({
   canGoBack,
   canGoForward,
   validation,
+  validateConfig,
   validationChatId,
   validationStatus,
   validationError,
@@ -201,7 +244,10 @@ export function BrowserTab({
   const [isEditing, setIsEditing] = useState(false);
   const [validationPanelOpen, setValidationPanelOpen] = useState(false);
   const [validationActionsOpen, setValidationActionsOpen] = useState(false);
-  const validationFailed = validationStatus === "failed" || Boolean(validationError);
+  const validationFailed =
+    validationStatus === "failed" || Boolean(validationError);
+  const validationCompletedSuccessfully =
+    validationStatus === "complete" && !validationFailed && Boolean(validation);
   const validationStopped =
     validationFailureReason === "stopped" ||
     /stopped by user|abort/i.test(validationError ?? "");
@@ -254,6 +300,14 @@ export function BrowserTab({
     accuracy: validation?.accuracy,
     hasError: validationFailed,
   });
+  const validateRunButtonTitle =
+    validationStatus === "running"
+      ? "Stop page validation"
+      : validationCompletedSuccessfully
+        ? "Rerun page validation"
+        : "Validate page content";
+  const showValidatedConfig =
+    validationCompletedSuccessfully && Boolean(validateConfig);
 
   const emitBounds = useCallback(() => {
     const node = viewRef.current;
@@ -349,9 +403,7 @@ export function BrowserTab({
             type="button"
             variant="ghost"
             size="icon"
-            className={cn(
-              "h-7 w-7 text-muted-foreground",
-            )}
+            className={cn("h-7 w-7 text-muted-foreground")}
             onClick={() => onRequestBack(tabId)}
             disabled={!canGoBack}
             title="Back"
@@ -362,9 +414,7 @@ export function BrowserTab({
             type="button"
             variant="ghost"
             size="icon"
-            className={cn(
-              "h-7 w-7 text-muted-foreground",
-            )}
+            className={cn("h-7 w-7 text-muted-foreground")}
             onClick={() => onRequestForward(tabId)}
             disabled={!canGoForward}
             title="Forward"
@@ -375,9 +425,7 @@ export function BrowserTab({
             type="button"
             variant="ghost"
             size="icon"
-            className={cn(
-              "h-7 w-7 text-muted-foreground",
-            )}
+            className={cn("h-7 w-7 text-muted-foreground")}
             onClick={() => onRequestReload(tabId)}
             disabled={!url}
             title="Reload"
@@ -432,75 +480,106 @@ export function BrowserTab({
             <PopoverContent
               side="top"
               align="end"
-              className="w-auto p-1"
+              avoidCollisions={false}
+              sideOffset={6}
+              className="w-[280px] max-w-[92vw] p-1.5"
+              onOpenAutoFocus={(event) => {
+                event.preventDefault();
+              }}
             >
-              <div className="flex items-center gap-1">
-                <Button
-                  type="button"
-                  variant="ghost"
-                  size="icon"
-                  className="h-7 w-7 text-muted-foreground hover:text-foreground"
-                  onClick={() => {
-                    onRequestValidate(tabId);
-                    setValidationActionsOpen(false);
-                  }}
-                  disabled={!url}
-                  title={
-                    validationStatus === "running"
-                      ? "Stop page validation"
-                      : "Validate page content"
-                  }
-                  aria-label={
-                    validationStatus === "running"
-                      ? "Stop page validation"
-                      : "Validate page content"
-                  }
-                >
-                  {validationStatus === "running" ? (
-                    <Square className="h-3.5 w-3.5" />
-                  ) : (
-                    <RotateCw className="h-3.5 w-3.5" />
-                  )}
-                </Button>
-                <Button
-                  type="button"
-                  variant="ghost"
-                  size="icon"
-                  className="h-7 w-7 text-muted-foreground hover:text-foreground"
-                  onClick={() => {
-                    onRequestOpenValidationChat?.(tabId);
-                    setValidationActionsOpen(false);
-                  }}
-                  disabled={!hasValidationChatButton}
-                  title={validationChatButtonTitle}
-                  aria-label={validationChatButtonTitle}
-                >
-                  <MessageSquare className="h-3.5 w-3.5" />
-                </Button>
-                <Button
-                  type="button"
-                  variant="ghost"
-                  size="icon"
-                  className="h-7 w-7 text-muted-foreground hover:text-foreground"
-                  onClick={() => {
-                    setValidationPanelOpen((previous) => !previous);
-                    setValidationActionsOpen(false);
-                  }}
-                  disabled={!hasValidationDetailsButton}
-                  title={
-                    validationPanelOpen
-                      ? "Hide validation details"
-                      : "Show validation details"
-                  }
-                  aria-label={
-                    validationPanelOpen
-                      ? "Hide validation details"
-                      : "Show validation details"
-                  }
-                  aria-expanded={validationPanelOpen}
-                >
-                  <List className="h-3.5 w-3.5" />
-                </Button>
+              <div className="space-y-1">
+                {showValidatedConfig && validateConfig ? (
+                  <div className="space-y-0.5 text-[10px] leading-tight text-foreground/90">
+                    <div className="truncate">
+                      <span className="text-muted-foreground">Validated:</span>{" "}
+                      {formatValidateStrictnessLabel(
+                        validateConfig.strictness,
+                      )}{" "}
+                      ·{" "}
+                      {formatSearchComplexityLabel(
+                        validateConfig.searchComplexity,
+                      )}{" "}
+                      /{" "}
+                      {formatTavilyDepthLabel(
+                        validateConfig.tavilySearchDepth,
+                      )}
+                    </div>
+                    <div className="truncate">
+                      <span className="text-muted-foreground">Limits:</span> S
+                      {validateConfig.maxSearchCalls} · E
+                      {validateConfig.maxExtractCalls} ·{" "}
+                      {validateConfig.enabled ? "Enabled" : "Disabled"}
+                    </div>
+                  </div>
+                ) : null}
+                {showValidatedConfig ? (
+                  <div
+                    className="truncate text-[9px] leading-tight text-muted-foreground"
+                    title="Set validate config in DeepResearch, then click rerun."
+                  >
+                    Tip: set validate in DeepResearch, then click rerun.
+                  </div>
+                ) : null}
+                <div className="flex items-center justify-start gap-0.5">
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="icon"
+                    className="h-6 w-6 text-muted-foreground hover:text-foreground"
+                    onClick={() => {
+                      onRequestValidate(tabId);
+                      setValidationActionsOpen(false);
+                    }}
+                    disabled={!url}
+                    title={validateRunButtonTitle}
+                    aria-label={validateRunButtonTitle}
+                  >
+                    {validationStatus === "running" ? (
+                      <Square className="h-3.5 w-3.5" />
+                    ) : (
+                      <RotateCw className="h-3.5 w-3.5" />
+                    )}
+                  </Button>
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="icon"
+                    className="h-6 w-6 text-muted-foreground hover:text-foreground"
+                    onClick={() => {
+                      onRequestOpenValidationChat?.(tabId);
+                      setValidationActionsOpen(false);
+                    }}
+                    disabled={!hasValidationChatButton}
+                    title={validationChatButtonTitle}
+                    aria-label={validationChatButtonTitle}
+                  >
+                    <MessageSquare className="h-3.5 w-3.5" />
+                  </Button>
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="icon"
+                    className="h-6 w-6 text-muted-foreground hover:text-foreground"
+                    onClick={() => {
+                      setValidationPanelOpen((previous) => !previous);
+                      setValidationActionsOpen(false);
+                    }}
+                    disabled={!hasValidationDetailsButton}
+                    title={
+                      validationPanelOpen
+                        ? "Hide validation details"
+                        : "Show validation details"
+                    }
+                    aria-label={
+                      validationPanelOpen
+                        ? "Hide validation details"
+                        : "Show validation details"
+                    }
+                    aria-expanded={validationPanelOpen}
+                  >
+                    <List className="h-3.5 w-3.5" />
+                  </Button>
+                </div>
               </div>
             </PopoverContent>
           </Popover>
@@ -534,9 +613,8 @@ export function BrowserTab({
                     const supportAccuracyLabel = formatAccuracyLabel(
                       support.accuracy,
                     );
-                    const supportSourceAuthorityLabel = formatSourceAuthorityLabel(
-                      support.sourceAuthority,
-                    );
+                    const supportSourceAuthorityLabel =
+                      formatSourceAuthorityLabel(support.sourceAuthority);
                     const refId =
                       typeof support.referenceRefId === "number" &&
                       support.referenceRefId > 0
@@ -631,9 +709,7 @@ export function BrowserTab({
                 <div
                   className={cn(
                     "text-[10px] uppercase tracking-[0.12em]",
-                    getSourceAuthorityTextClass(
-                      validation.sourceAuthority,
-                    ),
+                    getSourceAuthorityTextClass(validation.sourceAuthority),
                   )}
                 >
                   Source Authority {sourceAuthorityLabel}

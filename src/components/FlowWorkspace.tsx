@@ -1243,6 +1243,17 @@ function FlowWorkspaceInner({
     initialMessages: resolvedInitialChatMessages,
     onBeforeSendPrompt: persistDraftChatBeforeSend,
   });
+  const browserValidateConfig = useMemo(
+    () => ({
+      enabled: deepResearchConfig.validate.enabled,
+      strictness: deepResearchConfig.validate.strictness,
+      searchComplexity: deepResearchConfig.validate.subagent.searchComplexity,
+      tavilySearchDepth: deepResearchConfig.validate.subagent.tavilySearchDepth,
+      maxSearchCalls: deepResearchConfig.validate.subagent.maxSearchCalls,
+      maxExtractCalls: deepResearchConfig.validate.subagent.maxExtractCalls,
+    }),
+    [deepResearchConfig],
+  );
   const lastFailedMessageId = useMemo(() => {
     for (let index = chatMessages.length - 1; index >= 0; index -= 1) {
       const message = chatMessages[index];
@@ -3616,6 +3627,7 @@ function FlowWorkspaceInner({
           canGoBack={tab?.canGoBack}
           canGoForward={tab?.canGoForward}
           validation={validation}
+          validateConfig={browserValidateConfig}
           validationChatId={validationChatId}
           validationStatus={
             validationStatusRecord?.status ?? tab?.validationStatus
