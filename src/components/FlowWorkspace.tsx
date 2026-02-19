@@ -3630,6 +3630,19 @@ function FlowWorkspaceInner({
           onRequestReload={handleBrowserReload}
           onRequestValidate={handleBrowserValidate}
           onRequestOpenValidationChat={handleBrowserOpenValidationChat}
+          onRequestHighlightReference={(tabId, reference) => {
+            setBrowserTabs((prev) =>
+              prev.map((item) =>
+                item.id === tabId
+                  ? {
+                      ...item,
+                      referenceHighlight: reference,
+                    }
+                  : item,
+              ),
+            );
+            scheduleBrowserReferenceHighlight(tabId, reference);
+          }}
           onRequestOpenCdp={handleBrowserOpenCdp}
           onRequestOpenExternal={handleBrowserOpenExternal}
           onRequestNavigate={handleBrowserNavigate}

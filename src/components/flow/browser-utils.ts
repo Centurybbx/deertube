@@ -1,5 +1,6 @@
 import type { DeepSearchReferencePayload } from "@/types/chat";
 import type {
+  BrowserValidationClaimSupport,
   BrowserPageValidationRecord,
   BrowserViewReferenceHighlight,
 } from "@/types/browserview";
@@ -136,6 +137,84 @@ const getValidationSourceAuthorityPriority = (
   return 0;
 };
 
+const normalizeClaimViewpoint = (
+  reference: DeepSearchReferencePayload,
+): string | undefined => {
+  const normalizedViewpoint = reference.viewpoint?.replace(/\s+/g, " ").trim();
+  if (normalizedViewpoint && normalizedViewpoint.length > 0) {
+    return normalizedViewpoint;
+  }
+  const normalizedTitle = reference.title?.replace(/\s+/g, " ").trim();
+  if (normalizedTitle && normalizedTitle.length > 0) {
+    return normalizedTitle;
+  }
+  const excerpt = stripLineNumberPrefix(reference.text).replace(/\s+/g, " ").trim();
+  if (!excerpt) {
+    return undefined;
+  }
+  return excerpt.length > 180 ? `${excerpt.slice(0, 177)}...` : excerpt;
+};
+
+const toValidationClaimSupport = (
+  reference: DeepSearchReferencePayload,
+  viewpoint: string,
+): BrowserValidationClaimSupport | null => {
+  const referenceUrl = reference.url?.trim();
+  if (!referenceUrl) {
+    return null;
+  }
+  const text = stripLineNumberPrefix(
+    reference.validationRefContent?.trim() ?? reference.text,
+  ).trim();
+  if (!text) {
+    return null;
+  }
+  const startLine =
+    Number.isFinite(reference.startLine) && reference.startLine > 0
+      ? Math.floor(reference.startLine)
+      : 1;
+  const normalizedEndLine =
+    Number.isFinite(reference.endLine) && reference.endLine > 0
+      ? Math.floor(reference.endLine)
+      : startLine;
+  const endLine =
+    normalizedEndLine >= startLine ? normalizedEndLine : startLine;
+  const referenceRefId =
+    Number.isFinite(reference.refId) && reference.refId > 0
+      ? Math.floor(reference.refId)
+      : undefined;
+  return {
+    viewpoint,
+    referenceTitle: reference.title?.trim(),
+    referenceUrl,
+    referenceUri: reference.uri?.trim(),
+    referenceRefId,
+    text,
+    startLine,
+    endLine,
+    accuracy: reference.accuracy,
+    sourceAuthority: reference.sourceAuthority,
+  };
+};
+
+const buildValidationClaimSupports = (
+  references: DeepSearchReferencePayload[],
+): BrowserValidationClaimSupport[] => {
+  const claimSupports: BrowserValidationClaimSupport[] = [];
+  references.forEach((reference) => {
+    const viewpoint = normalizeClaimViewpoint(reference);
+    if (!viewpoint) {
+      return;
+    }
+    const support = toValidationClaimSupport(reference, viewpoint);
+    if (!support) {
+      return;
+    }
+    claimSupports.push(support);
+  });
+  return claimSupports;
+};
+
 const pickPrimaryValidationReference = (
   references: DeepSearchReferencePayload[],
 ): DeepSearchReferencePayload | null => {
@@ -192,6 +271,7 @@ export const buildBrowserValidationRecord = ({
   sourceCount: number;
 }): BrowserPageValidationRecord => {
   const checkedAt = new Date().toISOString();
+  const claimSupports = buildValidationClaimSupports(references);
   const selected = pickPrimaryValidationReference(references);
   if (!selected) {
     return {
@@ -204,6 +284,7 @@ export const buildBrowserValidationRecord = ({
       endLine: 1,
       accuracy: "insufficient",
       sourceAuthority: "unknown",
+      claimSupports: claimSupports.length > 0 ? claimSupports : undefined,
       sourceCount,
       referenceCount: 0,
     };
@@ -233,6 +314,7 @@ export const buildBrowserValidationRecord = ({
     validationRefContent: selected.validationRefContent,
     issueReason: selected.issueReason,
     correctFact: selected.correctFact,
+    claimSupports: claimSupports.length > 0 ? claimSupports : undefined,
     sourceCount,
     referenceCount: references.length,
   };

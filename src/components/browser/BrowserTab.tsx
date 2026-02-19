@@ -11,6 +11,7 @@ import {
   ArrowLeft,
   ArrowRight,
   ExternalLink,
+  List,
   Loader2,
   MessageSquare,
   RotateCw,
@@ -28,6 +29,7 @@ import type {
   BrowserPageValidationRecord,
   BrowserValidationStatus,
   BrowserViewBounds,
+  BrowserViewReferenceHighlight,
 } from "@/types/browserview";
 import { cn } from "@/lib/utils";
 
@@ -119,31 +121,34 @@ const getValidationButtonToneClass = ({
   hasError: boolean;
 }): string => {
   if (status === "running") {
-    return "border-sky-400/50 bg-sky-500/10 text-sky-700 hover:bg-sky-500/20 dark:text-sky-300";
+    return "text-sky-700 dark:text-sky-300";
   }
   if (status === "complete" && !hasError) {
-    return "border-emerald-400/50 bg-emerald-500/10 text-emerald-700 hover:bg-emerald-500/20 dark:text-emerald-300";
+    return "text-emerald-700 dark:text-emerald-300";
   }
   if (hasError || status === "failed") {
-    return "border-red-400/50 bg-red-500/10 text-red-700 hover:bg-red-500/20 dark:text-red-300";
+    return "text-red-700 dark:text-red-300";
   }
   if (accuracy === "high") {
-    return "border-emerald-400/50 bg-emerald-500/10 text-emerald-700 hover:bg-emerald-500/20 dark:text-emerald-300";
+    return "text-emerald-700 dark:text-emerald-300";
   }
   if (accuracy === "medium") {
-    return "border-amber-400/50 bg-amber-500/10 text-amber-700 hover:bg-amber-500/20 dark:text-amber-300";
+    return "text-amber-700 dark:text-amber-300";
   }
   if (accuracy === "low") {
-    return "border-orange-400/50 bg-orange-500/10 text-orange-700 hover:bg-orange-500/20 dark:text-orange-300";
+    return "text-orange-700 dark:text-orange-300";
   }
   if (accuracy === "conflicting") {
-    return "border-red-400/50 bg-red-500/10 text-red-700 hover:bg-red-500/20 dark:text-red-300";
+    return "text-red-700 dark:text-red-300";
   }
   if (accuracy === "insufficient") {
-    return "border-slate-400/50 bg-slate-500/10 text-slate-700 hover:bg-slate-500/20 dark:text-slate-300";
+    return "text-slate-700 dark:text-slate-300";
   }
-  return "border-border/70 bg-card/70 text-muted-foreground hover:bg-accent/50";
+  return "text-muted-foreground";
 };
+
+const truncateText = (value: string, maxLength: number): string =>
+  value.length > maxLength ? `${value.slice(0, maxLength - 3)}...` : value;
 
 interface BrowserTabProps {
   tabId: string;
@@ -161,6 +166,10 @@ interface BrowserTabProps {
   onRequestReload: (tabId: string) => void;
   onRequestValidate: (tabId: string) => void;
   onRequestOpenValidationChat?: (tabId: string) => void;
+  onRequestHighlightReference?: (
+    tabId: string,
+    reference: BrowserViewReferenceHighlight,
+  ) => void;
   onRequestOpenCdp: (tabId: string, url: string) => void;
   onRequestOpenExternal: (url: string) => void;
   onRequestNavigate: (tabId: string, url: string) => void;
@@ -182,21 +191,20 @@ export function BrowserTab({
   onRequestReload,
   onRequestValidate,
   onRequestOpenValidationChat,
+  onRequestHighlightReference,
   onRequestOpenCdp,
   onRequestOpenExternal,
   onRequestNavigate,
 }: BrowserTabProps) {
   const viewRef = useRef<HTMLDivElement | null>(null);
-  const validationPopoverTimerRef = useRef<number | null>(null);
   const [address, setAddress] = useState(url);
   const [isEditing, setIsEditing] = useState(false);
-  const [validationPopoverOpen, setValidationPopoverOpen] = useState(false);
+  const [validationPanelOpen, setValidationPanelOpen] = useState(false);
+  const [validationActionsOpen, setValidationActionsOpen] = useState(false);
   const validationFailed = validationStatus === "failed" || Boolean(validationError);
   const validationStopped =
     validationFailureReason === "stopped" ||
     /stopped by user|abort/i.test(validationError ?? "");
-  const validationSucceeded = validationStatus === "complete" && Boolean(validation);
-  const canRetryValidation = validationSucceeded;
   const hasValidationContext =
     validationStatus === "running" ||
     validationStatus === "complete" ||
@@ -209,8 +217,12 @@ export function BrowserTab({
   const validationChatButtonTitle = validationChatId
     ? "Focus validation chat"
     : "Create and open validation chat";
-  const mainHasTrailingButton = canRetryValidation || hasValidationChatButton;
-  const validationPopoverSide = validationFailed ? "top" : "bottom";
+  const hasValidationPanelContent =
+    validationStatus === "running" ||
+    validationFailed ||
+    Boolean(validation) ||
+    Boolean(validationChatId);
+  const hasValidationDetailsButton = hasValidationPanelContent;
   const failureTitle = validationStopped
     ? "Validation Stopped"
     : "Validation Failed";
@@ -219,15 +231,11 @@ export function BrowserTab({
     : validationStopped
       ? "Validation stopped by user."
       : "Validation failed. Check logs for details.";
-  const hasValidationPopoverContent =
-    validationStatus === "running" ||
-    validationFailed ||
-    Boolean(validation) ||
-    Boolean(validationChatId);
   const accuracyLabel = formatAccuracyLabel(validation?.accuracy);
   const sourceAuthorityLabel = formatSourceAuthorityLabel(
     validation?.sourceAuthority,
   );
+  const claimSupports = validation?.claimSupports ?? [];
   const checkedAtLabel = useMemo(() => {
     if (!validation?.checkedAt) {
       return null;
@@ -246,26 +254,6 @@ export function BrowserTab({
     accuracy: validation?.accuracy,
     hasError: validationFailed,
   });
-  const clearValidationPopoverTimer = useCallback(() => {
-    if (validationPopoverTimerRef.current !== null) {
-      window.clearTimeout(validationPopoverTimerRef.current);
-      validationPopoverTimerRef.current = null;
-    }
-  }, []);
-  const openValidationPopover = useCallback(() => {
-    if (!hasValidationPopoverContent) {
-      return;
-    }
-    clearValidationPopoverTimer();
-    setValidationPopoverOpen(true);
-  }, [clearValidationPopoverTimer, hasValidationPopoverContent]);
-  const scheduleCloseValidationPopover = useCallback(() => {
-    clearValidationPopoverTimer();
-    validationPopoverTimerRef.current = window.setTimeout(() => {
-      validationPopoverTimerRef.current = null;
-      setValidationPopoverOpen(false);
-    }, 140);
-  }, [clearValidationPopoverTimer]);
 
   const emitBounds = useCallback(() => {
     const node = viewRef.current;
@@ -296,21 +284,15 @@ export function BrowserTab({
   }, [isEditing, url]);
 
   useEffect(() => {
-    setValidationPopoverOpen(false);
-    clearValidationPopoverTimer();
-  }, [clearValidationPopoverTimer, url]);
+    setValidationPanelOpen(false);
+    setValidationActionsOpen(false);
+  }, [url]);
 
   useEffect(() => {
-    if (validationFailed && hasValidationPopoverContent) {
-      setValidationPopoverOpen(true);
+    if (validationFailed || validationStatus === "running") {
+      setValidationPanelOpen(true);
     }
-  }, [hasValidationPopoverContent, validationFailed]);
-
-  useEffect(() => {
-    return () => {
-      clearValidationPopoverTimer();
-    };
-  }, [clearValidationPopoverTimer]);
+  }, [validationFailed, validationStatus]);
 
   useEffect(() => {
     const handle = () => {
@@ -424,195 +406,265 @@ export function BrowserTab({
           >
             CDP
           </Button>
-          <div className="flex items-center">
-            <Popover
-              open={validationPopoverOpen && hasValidationPopoverContent}
-              onOpenChange={setValidationPopoverOpen}
+          <Popover
+            open={validationActionsOpen}
+            onOpenChange={setValidationActionsOpen}
+          >
+            <PopoverTrigger asChild>
+              <Button
+                type="button"
+                variant="ghost"
+                size="icon"
+                className={cn("h-7 w-7", validateButtonToneClass)}
+                disabled={!url}
+                title="Validation actions"
+                aria-label="Validation actions"
+              >
+                {validationStatus === "running" ? (
+                  <Square className="h-3.5 w-3.5" />
+                ) : validationFailed ? (
+                  <AlertCircle className="h-3.5 w-3.5" />
+                ) : (
+                  <ShieldCheck className="h-3.5 w-3.5" />
+                )}
+              </Button>
+            </PopoverTrigger>
+            <PopoverContent
+              side="top"
+              align="end"
+              className="w-auto p-1"
             >
-              <PopoverTrigger asChild>
+              <div className="flex items-center gap-1">
                 <Button
                   type="button"
-                  variant="outline"
-                  size="sm"
-                  className={cn(
-                    "h-7 gap-1.5 px-2 text-[11px] font-medium",
-                    mainHasTrailingButton
-                      ? "rounded-r-none border-r-0"
-                      : "",
-                    validateButtonToneClass,
-                  )}
+                  variant="ghost"
+                  size="icon"
+                  className="h-7 w-7 text-muted-foreground hover:text-foreground"
                   onClick={() => {
-                    if (validationStatus === "running") {
-                      onRequestValidate(tabId);
-                      return;
-                    }
-                    if (validationSucceeded) {
-                      return;
-                    }
                     onRequestValidate(tabId);
+                    setValidationActionsOpen(false);
                   }}
                   disabled={!url}
                   title={
                     validationStatus === "running"
                       ? "Stop page validation"
-                      : validationSucceeded
-                        ? "Validation succeeded"
-                        : "Validate page content"
+                      : "Validate page content"
                   }
-                  onMouseEnter={() => {
-                    openValidationPopover();
-                  }}
-                  onMouseLeave={() => {
-                    scheduleCloseValidationPopover();
-                  }}
+                  aria-label={
+                    validationStatus === "running"
+                      ? "Stop page validation"
+                      : "Validate page content"
+                  }
                 >
                   {validationStatus === "running" ? (
                     <Square className="h-3.5 w-3.5" />
-                  ) : validationFailed ? (
-                    <AlertCircle className="h-3.5 w-3.5" />
                   ) : (
-                    <ShieldCheck className="h-3.5 w-3.5" />
+                    <RotateCw className="h-3.5 w-3.5" />
                   )}
-                  {validationStatus === "running"
-                    ? "Stop"
-                    : validationSucceeded
-                      ? "Validated"
-                      : "Validate"}
                 </Button>
-              </PopoverTrigger>
-            {hasValidationPopoverContent ? (
-              <PopoverContent
-                align="end"
-                side={validationPopoverSide}
-                className="w-[360px] p-3"
-                onMouseEnter={() => {
-                  openValidationPopover();
-                }}
-                onMouseLeave={() => {
-                  scheduleCloseValidationPopover();
-                }}
-              >
-                {validationStatus === "running" ? (
-                  <div className="space-y-2">
-                    <div className="flex items-center gap-2 text-xs text-muted-foreground">
-                      <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                      Validating current page...
-                    </div>
-                    <div className="text-[11px] text-muted-foreground">
-                      Click Validate again to stop.
-                    </div>
-                  </div>
-                ) : validationFailed ? (
-                  <div className="rounded border border-red-400/45 bg-red-500/10 px-2 py-1 text-xs text-red-700 dark:text-red-300">
-                    <div className="font-semibold">{failureTitle}</div>
-                    <div className="mt-1 leading-relaxed">{failureDescription}</div>
-                  </div>
-                ) : validation ? (
-                  <div className="max-h-[260px] space-y-2 overflow-y-auto pr-1">
-                    <div className="truncate text-xs font-semibold text-foreground">
-                      {validation.referenceTitle ??
-                        validation.title ??
-                        "Validation Result"}
-                    </div>
-                    <div className="truncate text-[11px] text-muted-foreground">
-                      {validation.referenceUrl ?? validation.url}
-                    </div>
-                    <div className="text-[10px] uppercase tracking-[0.12em] text-muted-foreground">
-                      Lines {validation.startLine}-{validation.endLine}
-                    </div>
-                    {checkedAtLabel ? (
-                      <div className="text-[10px] uppercase tracking-[0.12em] text-muted-foreground">
-                        Checked {checkedAtLabel}
-                      </div>
-                    ) : null}
-                    {accuracyLabel ? (
-                      <div
-                        className={cn(
-                          "text-[10px] uppercase tracking-[0.12em]",
-                          getAccuracyTextClass(validation.accuracy),
-                        )}
-                      >
-                        Accuracy {accuracyLabel}
-                      </div>
-                    ) : null}
-                    {sourceAuthorityLabel ? (
-                      <div
-                        className={cn(
-                          "text-[10px] uppercase tracking-[0.12em]",
-                          getSourceAuthorityTextClass(
-                            validation.sourceAuthority,
-                          ),
-                        )}
-                      >
-                        Source Authority {sourceAuthorityLabel}
-                      </div>
-                    ) : null}
-                    {validation.issueReason ? (
-                      <div className="rounded border border-red-400/40 bg-red-500/10 px-2 py-1 text-[11px] leading-relaxed text-red-700 dark:text-red-300">
-                        Why wrong: {validation.issueReason}
-                      </div>
-                    ) : null}
-                    {validation.correctFact ? (
-                      <div className="rounded border border-emerald-400/40 bg-emerald-500/10 px-2 py-1 text-[11px] leading-relaxed text-emerald-700 dark:text-emerald-300">
-                        Correct fact: {validation.correctFact}
-                      </div>
-                    ) : null}
-                    {validation.validationRefContent ? (
-                      <div className="rounded border border-border/60 bg-card/40 px-2 py-1 text-[11px] leading-relaxed text-foreground/90">
-                        {validation.validationRefContent}
-                      </div>
-                    ) : null}
-                    <div className="whitespace-pre-wrap text-xs leading-relaxed text-foreground/90">
-                      {validation.text}
-                    </div>
-                  </div>
-                ) : (
-                  <div className="text-xs text-muted-foreground">
-                    No validation result yet.
-                  </div>
-                )}
-              </PopoverContent>
-            ) : null}
-            </Popover>
-            {canRetryValidation ? (
-              <Button
-                type="button"
-                variant="outline"
-                size="icon"
-                className={cn(
-                  "h-7 w-7 rounded-none border-r-0",
-                  validateButtonToneClass,
-                )}
-                onClick={() => {
-                  onRequestValidate(tabId);
-                }}
-                title="Validate again"
-                aria-label="Validate again"
-              >
-                <RotateCw className="h-3.5 w-3.5" />
-              </Button>
-            ) : null}
-            {hasValidationChatButton ? (
-              <Button
-                type="button"
-                variant="outline"
-                size="icon"
-                className={cn(
-                  "h-7 w-7 rounded-l-none",
-                  validateButtonToneClass,
-                )}
-                onClick={() => {
-                  onRequestOpenValidationChat?.(tabId);
-                }}
-                title={validationChatButtonTitle}
-                aria-label={validationChatButtonTitle}
-              >
-                <MessageSquare className="h-3.5 w-3.5" />
-              </Button>
-            ) : null}
-          </div>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="icon"
+                  className="h-7 w-7 text-muted-foreground hover:text-foreground"
+                  onClick={() => {
+                    onRequestOpenValidationChat?.(tabId);
+                    setValidationActionsOpen(false);
+                  }}
+                  disabled={!hasValidationChatButton}
+                  title={validationChatButtonTitle}
+                  aria-label={validationChatButtonTitle}
+                >
+                  <MessageSquare className="h-3.5 w-3.5" />
+                </Button>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="icon"
+                  className="h-7 w-7 text-muted-foreground hover:text-foreground"
+                  onClick={() => {
+                    setValidationPanelOpen((previous) => !previous);
+                    setValidationActionsOpen(false);
+                  }}
+                  disabled={!hasValidationDetailsButton}
+                  title={
+                    validationPanelOpen
+                      ? "Hide validation details"
+                      : "Show validation details"
+                  }
+                  aria-label={
+                    validationPanelOpen
+                      ? "Hide validation details"
+                      : "Show validation details"
+                  }
+                  aria-expanded={validationPanelOpen}
+                >
+                  <List className="h-3.5 w-3.5" />
+                </Button>
+              </div>
+            </PopoverContent>
+          </Popover>
         </div>
       </div>
+      {validationPanelOpen && hasValidationPanelContent ? (
+        <div className="border-b border-border/60 bg-card/50 px-3 py-2">
+          {validationStatus === "running" ? (
+            <div className="space-y-2">
+              <div className="flex items-center gap-2 text-xs text-muted-foreground">
+                <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                Validating current page...
+              </div>
+              <div className="text-[11px] text-muted-foreground">
+                Click Validate again to stop.
+              </div>
+            </div>
+          ) : validationFailed ? (
+            <div className="rounded border border-red-400/45 bg-red-500/10 px-2 py-1 text-xs text-red-700 dark:text-red-300">
+              <div className="font-semibold">{failureTitle}</div>
+              <div className="mt-1 leading-relaxed">{failureDescription}</div>
+            </div>
+          ) : validation ? (
+            <div className="max-h-[260px] space-y-2 overflow-y-auto pr-1">
+              {claimSupports.length > 0 ? (
+                <div className="space-y-1.5 rounded border border-border/60 bg-card/40 p-2">
+                  <div className="text-[10px] uppercase tracking-[0.12em] text-muted-foreground">
+                    Claims & refs
+                  </div>
+                  {claimSupports.map((support, index) => {
+                    const supportAccuracyLabel = formatAccuracyLabel(
+                      support.accuracy,
+                    );
+                    const supportSourceAuthorityLabel = formatSourceAuthorityLabel(
+                      support.sourceAuthority,
+                    );
+                    const refId =
+                      typeof support.referenceRefId === "number" &&
+                      support.referenceRefId > 0
+                        ? support.referenceRefId
+                        : index + 1;
+                    return (
+                      <button
+                        type="button"
+                        key={`${support.viewpoint}:${support.referenceRefId ?? index}`}
+                        className="w-full space-y-0.5 rounded border border-border/50 bg-background/60 px-2 py-1 text-left transition-colors hover:bg-accent/40"
+                        onClick={() => {
+                          onRequestHighlightReference?.(tabId, {
+                            refId,
+                            text: support.text,
+                            startLine: support.startLine,
+                            endLine: support.endLine,
+                            uri: support.referenceUri,
+                            url: support.referenceUrl,
+                            title: support.referenceTitle,
+                            accuracy: support.accuracy,
+                            sourceAuthority: support.sourceAuthority,
+                          });
+                        }}
+                        title="Scroll to this cited segment"
+                      >
+                        <div className="text-[11px] font-medium leading-relaxed text-foreground">
+                          {truncateText(support.viewpoint, 180)}
+                        </div>
+                        <div className="truncate text-[10px] text-muted-foreground">
+                          {support.referenceUrl}
+                        </div>
+                        <div className="text-[10px] uppercase tracking-[0.12em] text-muted-foreground">
+                          Lines {support.startLine}-{support.endLine}
+                        </div>
+                        {supportAccuracyLabel ? (
+                          <div
+                            className={cn(
+                              "text-[10px] uppercase tracking-[0.12em]",
+                              getAccuracyTextClass(support.accuracy),
+                            )}
+                          >
+                            Accuracy {supportAccuracyLabel}
+                          </div>
+                        ) : null}
+                        {supportSourceAuthorityLabel ? (
+                          <div
+                            className={cn(
+                              "text-[10px] uppercase tracking-[0.12em]",
+                              getSourceAuthorityTextClass(
+                                support.sourceAuthority,
+                              ),
+                            )}
+                          >
+                            Source Authority {supportSourceAuthorityLabel}
+                          </div>
+                        ) : null}
+                        <div className="text-[11px] leading-relaxed text-foreground/85">
+                          {truncateText(support.text, 240)}
+                        </div>
+                      </button>
+                    );
+                  })}
+                </div>
+              ) : null}
+              <div className="truncate text-xs font-semibold text-foreground">
+                {validation.referenceTitle ??
+                  validation.title ??
+                  "Validation Result"}
+              </div>
+              <div className="truncate text-[11px] text-muted-foreground">
+                {validation.referenceUrl ?? validation.url}
+              </div>
+              <div className="text-[10px] uppercase tracking-[0.12em] text-muted-foreground">
+                Lines {validation.startLine}-{validation.endLine}
+              </div>
+              {checkedAtLabel ? (
+                <div className="text-[10px] uppercase tracking-[0.12em] text-muted-foreground">
+                  Checked {checkedAtLabel}
+                </div>
+              ) : null}
+              {accuracyLabel ? (
+                <div
+                  className={cn(
+                    "text-[10px] uppercase tracking-[0.12em]",
+                    getAccuracyTextClass(validation.accuracy),
+                  )}
+                >
+                  Accuracy {accuracyLabel}
+                </div>
+              ) : null}
+              {sourceAuthorityLabel ? (
+                <div
+                  className={cn(
+                    "text-[10px] uppercase tracking-[0.12em]",
+                    getSourceAuthorityTextClass(
+                      validation.sourceAuthority,
+                    ),
+                  )}
+                >
+                  Source Authority {sourceAuthorityLabel}
+                </div>
+              ) : null}
+              {validation.issueReason ? (
+                <div className="rounded border border-red-400/40 bg-red-500/10 px-2 py-1 text-[11px] leading-relaxed text-red-700 dark:text-red-300">
+                  Why wrong: {validation.issueReason}
+                </div>
+              ) : null}
+              {validation.correctFact ? (
+                <div className="rounded border border-emerald-400/40 bg-emerald-500/10 px-2 py-1 text-[11px] leading-relaxed text-emerald-700 dark:text-emerald-300">
+                  Correct fact: {validation.correctFact}
+                </div>
+              ) : null}
+              {validation.validationRefContent ? (
+                <div className="rounded border border-border/60 bg-card/40 px-2 py-1 text-[11px] leading-relaxed text-foreground/90">
+                  {validation.validationRefContent}
+                </div>
+              ) : null}
+              <div className="whitespace-pre-wrap text-xs leading-relaxed text-foreground/90">
+                {validation.text}
+              </div>
+            </div>
+          ) : (
+            <div className="text-xs text-muted-foreground">
+              No validation result yet.
+            </div>
+          )}
+        </div>
+      ) : null}
       <div ref={viewRef} className="relative flex-1 bg-muted/20">
         <div className="pointer-events-none absolute inset-0 flex items-center justify-center text-xs text-muted-foreground">
           {url ? "Loading page..." : "Enter a URL to start"}

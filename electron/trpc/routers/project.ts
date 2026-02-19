@@ -9,6 +9,7 @@ import { baseProcedure, createTRPCRouter } from '../init'
 import type { FlowEdge, FlowNode } from '../../../src/types/flow'
 import type { ChatMessage } from '../../../src/types/chat'
 import type {
+  BrowserValidationClaimSupport,
   BrowserPageValidationRecord,
   BrowserPageValidationStatusRecord,
   BrowserValidationFailureReason,
@@ -345,6 +346,47 @@ const normalizeNonNegativeInteger = (value: unknown): number => {
   return floored > 0 ? floored : 0
 }
 
+const normalizeBrowserValidationClaimSupport = (
+  value: unknown,
+): BrowserValidationClaimSupport | null => {
+  if (!isObject(value)) {
+    return null
+  }
+  const viewpoint = normalizeOptionalText(value.viewpoint)
+  const referenceUrl = normalizeOptionalText(value.referenceUrl)
+  const text = normalizeOptionalText(value.text)
+  if (!viewpoint || !referenceUrl || !text) {
+    return null
+  }
+  const startLine = normalizePositiveInteger(value.startLine, 1)
+  const endLine = Math.max(startLine, normalizePositiveInteger(value.endLine, startLine))
+  const referenceRefIdRaw = value.referenceRefId
+  const referenceRefId =
+    typeof referenceRefIdRaw === 'number'
+      && Number.isInteger(referenceRefIdRaw)
+      && referenceRefIdRaw > 0
+      ? referenceRefIdRaw
+      : undefined
+  const accuracy = isReferenceAccuracy(value.accuracy)
+    ? value.accuracy
+    : undefined
+  const sourceAuthority = isReferenceSourceAuthority(value.sourceAuthority)
+    ? value.sourceAuthority
+    : undefined
+  return {
+    viewpoint,
+    referenceTitle: normalizeOptionalText(value.referenceTitle),
+    referenceUrl,
+    referenceUri: normalizeOptionalText(value.referenceUri),
+    referenceRefId,
+    text,
+    startLine,
+    endLine,
+    accuracy,
+    sourceAuthority,
+  }
+}
+
 const normalizeBrowserValidationRecord = (
   key: string,
   value: unknown,
@@ -375,6 +417,11 @@ const normalizeBrowserValidationRecord = (
   const sourceAuthority = isReferenceSourceAuthority(value.sourceAuthority)
     ? value.sourceAuthority
     : undefined
+  const claimSupports = Array.isArray(value.claimSupports)
+    ? value.claimSupports
+      .map((item) => normalizeBrowserValidationClaimSupport(item))
+      .filter((item): item is BrowserValidationClaimSupport => item !== null)
+    : []
   return {
     url,
     title: normalizeOptionalText(value.title),
@@ -392,6 +439,7 @@ const normalizeBrowserValidationRecord = (
     validationRefContent: normalizeOptionalText(value.validationRefContent),
     issueReason: normalizeOptionalText(value.issueReason),
     correctFact: normalizeOptionalText(value.correctFact),
+    claimSupports: claimSupports.length > 0 ? claimSupports : undefined,
     sourceCount: normalizeNonNegativeInteger(value.sourceCount),
     referenceCount: normalizeNonNegativeInteger(value.referenceCount),
   }

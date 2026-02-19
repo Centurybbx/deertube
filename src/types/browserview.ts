@@ -34,6 +34,19 @@ export interface CdpBrowserValidateStopRequestPayload {
   sessionId: string;
 }
 
+export interface BrowserValidationClaimSupport {
+  viewpoint: string;
+  referenceTitle?: string;
+  referenceUrl: string;
+  referenceUri?: string;
+  referenceRefId?: number;
+  text: string;
+  startLine: number;
+  endLine: number;
+  accuracy?: ReferenceAccuracy;
+  sourceAuthority?: ReferenceSourceAuthority;
+}
+
 export interface BrowserPageValidationRecord {
   url: string;
   title?: string;
@@ -51,6 +64,7 @@ export interface BrowserPageValidationRecord {
   validationRefContent?: string;
   issueReason?: string;
   correctFact?: string;
+  claimSupports?: BrowserValidationClaimSupport[];
   sourceCount: number;
   referenceCount: number;
 }
