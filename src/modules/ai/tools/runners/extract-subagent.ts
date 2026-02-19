@@ -336,11 +336,14 @@ export async function runExtractSubagent({
   const previewLines = tooLarge ? lines.slice(0, 200) : lines;
   const preview = formatLineNumbered(previewLines, 0, lineCount);
   const sizeNote = tooLarge
-    ? `Markdown is large (${lineCount} lines). Only the first 200 lines are shown. Use grep/readLines to inspect more.`
+    ? `Markdown is large (${lineCount} lines). Only the first 200 lines are shown, and they may mostly be navigation/ads/boilerplate. Use grep/readLines to inspect meaningful sections before concluding.`
     : `Total markdown lines: ${lineCount}.`;
+  const READ_LINES_MAX_CONSECUTIVE_CALLS = 2;
   let grepCallCount = 0;
   let readLinesCallCount = 0;
+  let readLinesConsecutiveCount = 0;
   let writeExtractResultCallCount = 0;
+  const seenReadLinesRanges = new Set<string>();
   let collectedExtractResult: z.infer<typeof ExtractSubagentFinalSchema> | undefined;
 
   const grepTool = tool({
@@ -404,6 +407,7 @@ export async function runExtractSubagent({
       .describe("Grep output payload for extract subagent exploration."),
     execute: ({ pattern, flags, before = 10, after = 10, maxMatches = 8 }) => {
       grepCallCount += 1;
+      readLinesConsecutiveCount = 0;
       const shouldLogGrepDetail = grepCallCount <= 5 || grepCallCount % 10 === 0;
       if (shouldLogGrepDetail) {
         console.log("[subagent.extract.agent.grep]", {
@@ -497,15 +501,42 @@ export async function runExtractSubagent({
       })
       .describe("Read-lines output with normalized bounds and text."),
     execute: ({ start, end }) => {
-      readLinesCallCount += 1;
-      const shouldLogReadLinesDetail =
-        readLinesCallCount <= 5 || readLinesCallCount % 10 === 0;
       const safeStart = Math.max(1, Math.min(lineCount, Math.floor(start)));
       const safeEnd = Math.max(safeStart, Math.min(lineCount, Math.floor(end)));
+      const rangeKey = `${safeStart}:${safeEnd}`;
+      if (readLinesConsecutiveCount >= READ_LINES_MAX_CONSECUTIVE_CALLS) {
+        const message =
+          "readLines blocked: at most 2 consecutive readLines calls are allowed; call grep before readLines again.";
+        console.warn("[subagent.extract.agent.readLines.blocked.consecutive]", {
+          requestedStart: start,
+          requestedEnd: end,
+          start: safeStart,
+          end: safeEnd,
+          consecutiveReadLinesCalls: readLinesConsecutiveCount,
+        });
+        throw new Error(message);
+      }
+      if (seenReadLinesRanges.has(rangeKey)) {
+        const message = `readLines blocked: repeated range ${rangeKey}; choose a new span (use grep first).`;
+        console.warn("[subagent.extract.agent.readLines.blocked.duplicateRange]", {
+          requestedStart: start,
+          requestedEnd: end,
+          start: safeStart,
+          end: safeEnd,
+          rangeKey,
+        });
+        throw new Error(message);
+      }
+      readLinesCallCount += 1;
+      readLinesConsecutiveCount += 1;
+      seenReadLinesRanges.add(rangeKey);
+      const shouldLogReadLinesDetail =
+        readLinesCallCount <= 5 || readLinesCallCount % 10 === 0;
       const slice = lines.slice(safeStart - 1, safeEnd);
       if (shouldLogReadLinesDetail) {
         console.log("[subagent.extract.agent.readLines]", {
           call: readLinesCallCount,
+          consecutiveReadLinesCalls: readLinesConsecutiveCount,
           requestedStart: start,
           requestedEnd: end,
           start: safeStart,
@@ -572,10 +603,15 @@ export async function runExtractSubagent({
     `Query: ${query}`,
     sizeNote,
     "Task:",
-    "- Use grep/readLines as needed to locate evidence.",
+    "- Prefer grep over readLines to locate evidence.",
+    "- Hard limit: readLines may be called at most 2 times consecutively; you must call grep before calling readLines again.",
+    "- Hard limit: do not call readLines with a repeated line range (same start/end). Repeated ranges will be rejected.",
     "- For grep, prefer returning around 5-10 matches per call unless you need broader coverage.",
+    "- Important: the first visible preview lines may be ads, navigation, or login boilerplate; do not conclude from the preview alone.",
+    "- If the first lines are low-signal, continue exploring with grep/readLines to locate the real evidence-bearing sections.",
     "- Efficiency: if multiple checks are independent, prefer issuing multiple tool calls in the same round.",
     "- You must provide one concise viewpoint.",
+    "- Do not call `writeExtractResult` too early. Collect sufficient evidence first.",
     "- No matter what, you must call `writeExtractResult`, even when selections is empty.",
     "- When done, call `writeExtractResult` exactly once with { viewpoint, broken, inrelavate, selections, error? }.",
     "- Do not return final JSON in plain text.",

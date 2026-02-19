@@ -350,6 +350,7 @@ export async function fetchJinaReaderMarkdown(
   const response = await fetch(readerUrl, {
     headers: {
       Accept: "application/json",
+      "X-Retain-Links": "gpt-oss",
       ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}),
     },
     signal: abortSignal,
