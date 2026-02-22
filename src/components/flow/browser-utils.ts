@@ -229,7 +229,7 @@ const toValidationClaimSupport = ({
     return null;
   }
   const text = stripLineNumberPrefix(
-    reference.validationRefContent?.trim() ?? reference.text,
+    reference.text?.trim() ?? reference.validationRefContent ?? "",
   ).trim();
   if (!text) {
     return null;

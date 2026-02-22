@@ -289,6 +289,25 @@ const sanitizeReferenceHighlight = (
   payload: BrowserViewReferenceHighlight,
 ): BrowserViewReferenceHighlight => {
   const text = payload.text.trim();
+  const alternateTexts = Array.isArray(payload.alternateTexts)
+    ? Array.from(
+        new Set(
+          payload.alternateTexts
+            .filter((candidate): candidate is string => typeof candidate === "string")
+            .map((candidate) => candidate.trim())
+            .filter(
+              (candidate) =>
+                candidate.length > 0 &&
+                candidate !== text,
+            )
+            .map((candidate) =>
+              candidate.length > MAX_HIGHLIGHT_TEXT_LENGTH
+                ? `${candidate.slice(0, MAX_HIGHLIGHT_TEXT_LENGTH)}...`
+                : candidate,
+            ),
+        ),
+      ).slice(0, 6)
+    : undefined;
   const title =
     typeof payload.title === "string" && payload.title.trim().length > 0
       ? payload.title.trim()
@@ -320,6 +339,8 @@ const sanitizeReferenceHighlight = (
       text.length > MAX_HIGHLIGHT_TEXT_LENGTH
         ? `${text.slice(0, MAX_HIGHLIGHT_TEXT_LENGTH)}...`
         : text,
+    alternateTexts:
+      alternateTexts && alternateTexts.length > 0 ? alternateTexts : undefined,
     append: payload.append === true,
     showMarker: payload.showMarker !== false,
     startLine: payload.startLine,

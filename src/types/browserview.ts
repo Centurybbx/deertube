@@ -130,6 +130,7 @@ export interface BrowserViewStatePayload {
 export interface BrowserViewReferenceHighlight {
   refId: number;
   text: string;
+  alternateTexts?: string[];
   append?: boolean;
   showMarker?: boolean;
   startLine?: number;

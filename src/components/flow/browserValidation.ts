@@ -48,6 +48,10 @@ interface ExecuteBrowserValidationOptions {
     query: string;
     answer: string;
     force?: boolean;
+    validationTarget?: {
+      url?: string;
+      title?: string;
+    };
     settings: RuntimeSettingsPayload | undefined;
     deepResearch: DeepResearchConfig;
   }, signal?: AbortSignal) => Promise<ChatValidateResult>;
@@ -151,6 +155,10 @@ export const executeBrowserValidation = async ({
     query,
     answer: pageText,
     force: true,
+    validationTarget: {
+      url: resolvedPageUrl,
+      title: snapshotTitle ?? tabTitle,
+    },
     settings: runtimeSettings,
     deepResearch: deepResearchConfig,
   }, signal);

@@ -182,6 +182,18 @@ const formatTavilyDepthLabel = (depth: TavilySearchDepth): string =>
 const truncateText = (value: string, maxLength: number): string =>
   value.length > maxLength ? `${value.slice(0, maxLength - 3)}...` : value;
 
+const normalizeComparableHttpUrl = (value?: string): string | null => {
+  if (!value || !URL.canParse(value)) {
+    return null;
+  }
+  const parsed = new URL(value);
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+    return null;
+  }
+  parsed.hash = "";
+  return parsed.toString();
+};
+
 interface BrowserValidateConfigSummary {
   enabled: boolean;
   strictness: DeepResearchStrictness;
@@ -189,6 +201,11 @@ interface BrowserValidateConfigSummary {
   tavilySearchDepth: TavilySearchDepth;
   maxSearchCalls: number;
   maxExtractCalls: number;
+}
+
+interface BrowserValidationRunningDetails {
+  query?: string;
+  lines: string[];
 }
 
 interface BrowserTabProps {
@@ -200,6 +217,7 @@ interface BrowserTabProps {
   validateConfig?: BrowserValidateConfigSummary;
   validationChatId?: string;
   validationStatus?: BrowserValidationStatus;
+  validationRunningDetails?: BrowserValidationRunningDetails;
   validationError?: string;
   validationFailureReason?: BrowserValidationFailureReason;
   onBoundsChange: (tabId: string, bounds: BrowserViewBounds) => void;
@@ -227,6 +245,7 @@ export function BrowserTab({
   validateConfig,
   validationChatId,
   validationStatus,
+  validationRunningDetails,
   validationError,
   validationFailureReason,
   onBoundsChange,
@@ -290,6 +309,7 @@ export function BrowserTab({
     validationClaims.length > 0
       ? validationClaims.flatMap((claim) => claim.supports)
       : claimSupports;
+  const normalizedCurrentUrl = normalizeComparableHttpUrl(url);
   const checkedAtLabel = useMemo(() => {
     if (!validation?.checkedAt) {
       return null;
@@ -619,9 +639,40 @@ export function BrowserTab({
                 <Loader2 className="h-3.5 w-3.5 animate-spin" />
                 Validating current page...
               </div>
+              {validationRunningDetails?.query ? (
+                <div className="text-[11px] leading-relaxed text-muted-foreground">
+                  Query: {truncateText(validationRunningDetails.query, 220)}
+                </div>
+              ) : null}
+              {validationRunningDetails &&
+              validationRunningDetails.lines.length > 0 ? (
+                <div className="space-y-1 rounded border border-border/60 bg-card/40 px-2 py-1">
+                  {validationRunningDetails.lines.map((line, index) => (
+                    <div
+                      key={`${tabId}-validate-running-${index}`}
+                      className="text-[11px] leading-relaxed text-foreground/85"
+                    >
+                      {line}
+                    </div>
+                  ))}
+                </div>
+              ) : null}
               <div className="text-[11px] text-muted-foreground">
                 Click Validate again to stop.
               </div>
+              {hasValidationChatButton ? (
+                <div>
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="sm"
+                    className="h-6 px-2 text-[11px] text-muted-foreground hover:text-foreground"
+                    onClick={() => onRequestOpenValidationChat?.(tabId)}
+                  >
+                    Open validation chat
+                  </Button>
+                </div>
+              ) : null}
             </div>
           ) : validationFailed ? (
             <div className="rounded border border-red-400/45 bg-red-500/10 px-2 py-1 text-xs text-red-700 dark:text-red-300">
@@ -650,19 +701,50 @@ export function BrowserTab({
                           type="button"
                           className="w-full space-y-0.5 text-left transition-colors hover:bg-accent/40"
                           onClick={() => {
-                            if (!claimText) {
+                            const preferredSupport =
+                              claim.supports.find((support) => {
+                                const normalizedSupportUrl =
+                                  normalizeComparableHttpUrl(
+                                    support.referenceUrl,
+                                  );
+                                return (
+                                  Boolean(normalizedCurrentUrl) &&
+                                  Boolean(normalizedSupportUrl) &&
+                                  normalizedCurrentUrl === normalizedSupportUrl
+                                );
+                              }) ?? claim.supports[0];
+                            const highlightText =
+                              claimText ||
+                              preferredSupport?.text?.trim() ||
+                              claim.summary.trim();
+                            if (!highlightText) {
                               return;
                             }
+                            const alternateTexts = claim.supports
+                              .map((support) => support.text?.trim() ?? "")
+                              .filter(
+                                (text) =>
+                                  text.length > 0 && text !== highlightText,
+                              )
+                              .slice(0, 5);
                             onRequestHighlightReference?.(tabId, {
                               refId: claimIndex + 1,
-                              text: claimText,
-                              url: claim.origin.url ?? validation.url,
+                              text: highlightText,
+                              alternateTexts,
+                              url:
+                                claim.origin.url ??
+                                preferredSupport?.referenceUrl ??
+                                validation.url,
                               title: claim.summary || claimText,
+                              startLine: preferredSupport?.startLine,
+                              endLine: preferredSupport?.endLine,
+                              validationRefContent:
+                                preferredSupport?.validationRefContent,
                               accuracy: claim.accuracy,
                               sourceAuthority: claim.sourceAuthority,
                               issueReason: claim.issueReason,
                               correctFact: claim.correctFact,
-                              showMarker: false,
+                              showMarker: true,
                             });
                           }}
                           title="Highlight claim original text"
@@ -724,7 +806,57 @@ export function BrowserTab({
                                   className="rounded border border-border/50 bg-background/50 px-2 py-1"
                                 >
                                   <div className="flex items-start gap-1">
-                                    <div className="min-w-0 flex-1 space-y-0.5">
+                                    <button
+                                      type="button"
+                                      className="min-w-0 flex-1 space-y-0.5 text-left transition-colors hover:bg-accent/40"
+                                      onClick={() => {
+                                        const normalizedSupportUrl =
+                                          normalizeComparableHttpUrl(
+                                            support.referenceUrl,
+                                          );
+                                        const supportRefId =
+                                          typeof support.referenceRefId ===
+                                            "number" &&
+                                          support.referenceRefId > 0
+                                            ? support.referenceRefId
+                                            : supportIndex + 1;
+                                        const referencePayload: BrowserViewReferenceHighlight =
+                                          {
+                                            refId: supportRefId,
+                                            text: support.text,
+                                            startLine: support.startLine,
+                                            endLine: support.endLine,
+                                            uri: support.referenceUri,
+                                            url: support.referenceUrl,
+                                            title: support.referenceTitle,
+                                            validationRefContent:
+                                              support.validationRefContent,
+                                            accuracy: support.accuracy,
+                                            sourceAuthority:
+                                              support.sourceAuthority,
+                                            issueReason: support.issueReason,
+                                            correctFact: support.correctFact,
+                                          };
+                                        if (
+                                          normalizedCurrentUrl &&
+                                          normalizedSupportUrl &&
+                                          normalizedCurrentUrl ===
+                                            normalizedSupportUrl
+                                        ) {
+                                          onRequestHighlightReference?.(
+                                            tabId,
+                                            referencePayload,
+                                          );
+                                          return;
+                                        }
+                                        onRequestOpenReference?.(
+                                          referenceOpenTarget,
+                                          support.referenceTitle ??
+                                            claim.summary,
+                                        );
+                                      }}
+                                      title="Highlight this supporting reference"
+                                    >
                                       <div className="truncate text-[10px] text-muted-foreground">
                                         [{supportRefId}] {support.referenceUrl}
                                       </div>
@@ -756,7 +888,7 @@ export function BrowserTab({
                                       <div className="text-[11px] leading-relaxed text-foreground/85">
                                         {truncateText(support.text, 240)}
                                       </div>
-                                    </div>
+                                    </button>
                                     <Button
                                       type="button"
                                       variant="ghost"
@@ -821,7 +953,11 @@ export function BrowserTab({
                             type="button"
                             className="min-w-0 flex-1 space-y-0.5 text-left transition-colors hover:bg-accent/40"
                             onClick={() => {
-                              onRequestHighlightReference?.(tabId, {
+                              const normalizedSupportUrl =
+                                normalizeComparableHttpUrl(
+                                  support.referenceUrl,
+                                );
+                              const referencePayload: BrowserViewReferenceHighlight = {
                                 refId,
                                 text: support.text,
                                 startLine: support.startLine,
@@ -829,9 +965,28 @@ export function BrowserTab({
                                 uri: support.referenceUri,
                                 url: support.referenceUrl,
                                 title: support.referenceTitle,
+                                validationRefContent:
+                                  support.validationRefContent,
                                 accuracy: support.accuracy,
                                 sourceAuthority: support.sourceAuthority,
-                              });
+                                issueReason: support.issueReason,
+                                correctFact: support.correctFact,
+                              };
+                              if (
+                                normalizedCurrentUrl &&
+                                normalizedSupportUrl &&
+                                normalizedCurrentUrl === normalizedSupportUrl
+                              ) {
+                                onRequestHighlightReference?.(
+                                  tabId,
+                                  referencePayload,
+                                );
+                                return;
+                              }
+                              onRequestOpenReference?.(
+                                referenceOpenTarget,
+                                support.referenceTitle ?? support.viewpoint,
+                              );
                             }}
                             title="Scroll to this cited segment"
                           >

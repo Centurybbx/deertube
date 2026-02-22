@@ -68,7 +68,17 @@ import {
   executeBrowserValidation,
   updateBrowserTabValidationState,
 } from "./flow/browserValidation";
-import { buildValidationGraphInsertion } from "./flow/validate-graph";
+import {
+  applyDeepSearchStreamToValidationGraphRun,
+  applySubagentStreamToValidationGraphRun,
+  applyValidationRecordToValidationGraphRun,
+  buildValidationGraphPatch,
+  createValidationGraphRunContext,
+  markValidationGraphRunFailed,
+  upsertFlowEdgesById,
+  upsertFlowNodesById,
+  type ValidationGraphRunContext,
+} from "./flow/validate-graph";
 import {
   buildCompletedValidationEvent,
   buildFailedValidationEvent,
@@ -179,6 +189,95 @@ type ValidateStreamEvent =
       payload: ValidateExecutionResult;
     };
 
+const truncateValidationDetail = (value: string, maxLength = 180): string =>
+  value.length > maxLength ? `${value.slice(0, maxLength - 3)}...` : value;
+
+const isObjectRecord = (
+  value: unknown,
+): value is Record<string, unknown> =>
+  typeof value === "object" && value !== null;
+
+const buildValidationRunningDetails = (
+  messages: ChatMessage[] | undefined,
+  tick?: number,
+): { query?: string; lines: string[] } | undefined => {
+  void tick;
+  if (!messages || messages.length === 0) {
+    return undefined;
+  }
+  const lines: string[] = [];
+  let query: string | undefined;
+  const eventMessages = [...messages]
+    .filter(
+      (message) =>
+        message.kind === "subagent-event" ||
+        message.kind === "deepsearch-event",
+    )
+    .slice(-12);
+  eventMessages.forEach((message) => {
+    if (message.kind === "deepsearch-event") {
+      const payload = isObjectRecord(message.toolOutput)
+        ? message.toolOutput
+        : undefined;
+      const status =
+        (payload?.status as string | undefined) ?? message.toolStatus ?? "running";
+      const toolName =
+        (payload?.toolName as string | undefined) ??
+        message.toolName ??
+        "validate.run";
+      const sourceCount = Array.isArray(payload?.sources)
+        ? payload.sources.length
+        : undefined;
+      const referenceCount = Array.isArray(payload?.references)
+        ? payload.references.length
+        : undefined;
+      const payloadQuery =
+        typeof payload?.query === "string" ? payload.query.trim() : "";
+      if (!query && payloadQuery.length > 0) {
+        query = payloadQuery;
+      }
+      lines.push(
+        truncateValidationDetail(
+          `${toolName} · ${status}${sourceCount !== undefined || referenceCount !== undefined
+            ? ` · Sources ${sourceCount ?? 0} · Refs ${referenceCount ?? 0}`
+            : ""}`,
+        ),
+      );
+      const payloadError =
+        typeof payload?.error === "string" ? payload.error.trim() : "";
+      if (payloadError.length > 0) {
+        lines.push(truncateValidationDetail(`Error: ${payloadError}`));
+      }
+      return;
+    }
+    if (message.kind === "subagent-event") {
+      const payload = isObjectRecord(message.toolOutput)
+        ? message.toolOutput
+        : undefined;
+      const toolName =
+        (payload?.toolName as string | undefined) ??
+        message.toolName ??
+        "subagent";
+      const streamCount = Array.isArray(payload?.messages)
+        ? payload.messages.length
+        : 0;
+      lines.push(
+        truncateValidationDetail(
+          `${toolName} · running${streamCount > 0 ? ` · updates ${streamCount}` : ""}`,
+        ),
+      );
+    }
+  });
+  const dedupedLines = Array.from(new Set(lines)).slice(-6);
+  if (!query && dedupedLines.length === 0) {
+    return undefined;
+  }
+  return {
+    query: query && query.length > 0 ? truncateValidationDetail(query, 220) : undefined,
+    lines: dedupedLines,
+  };
+};
+
 interface BrowserValidationRunSession {
   runId: string;
   tabRuntimeId: string;
@@ -246,6 +345,20 @@ const buildBrowserValidationStatusRecord = ({
   updatedAt: new Date().toISOString(),
 });
 
+const resolveValidationGraphHeadline = (
+  title: string | undefined,
+  fallbackUrl: string,
+): string => {
+  const normalizedTitle = normalizeBrowserLabel(title);
+  if (normalizedTitle) {
+    return normalizedTitle;
+  }
+  if (!URL.canParse(fallbackUrl)) {
+    return fallbackUrl;
+  }
+  return new URL(fallbackUrl).host;
+};
+
 const mergeBrowserValidationStatusByUrls = ({
   previous,
   urls,
@@ -308,6 +421,10 @@ const runValidateStream = (
     answer: string;
     toolCallId?: string;
     force?: boolean;
+    validationTarget?: {
+      url?: string;
+      title?: string;
+    };
     settings: RuntimeSettingsPayload | undefined;
     deepResearch: import("@/shared/deepresearch-config").DeepResearchConfig;
   },
@@ -950,6 +1067,7 @@ function FlowWorkspaceInner({
   const [showSupportRelations, setShowSupportRelations] = useState(true);
   const [chatScrollSignal, setChatScrollSignal] = useState(0);
   const [chatFocusSignal, setChatFocusSignal] = useState(0);
+  const [validationStreamTick, setValidationStreamTick] = useState(0);
   const [layoutModel, setLayoutModel] = useState<IJsonModel>(
     () => createDefaultLayoutModel(),
   );
@@ -983,6 +1101,9 @@ function FlowWorkspaceInner({
   >(new Map());
   const browserValidationRunsRef = useRef<
     Map<string, BrowserValidationRunSession>
+  >(new Map());
+  const validationGraphByRunIdRef = useRef<
+    Map<string, ValidationGraphRunContext>
   >(new Map());
   const browserValidationByUrlRef = useRef<
     Record<string, BrowserPageValidationRecord>
@@ -1832,10 +1953,12 @@ function FlowWorkspaceInner({
       tabRuntimeId,
       normalizedTabUrl,
       pageTitle,
+      allowCreateWithoutContext = false,
     }: {
       tabRuntimeId: string;
       normalizedTabUrl: string;
       pageTitle?: string;
+      allowCreateWithoutContext?: boolean;
     }): Promise<string | null> => {
       const existingChatId = browserValidationChatByUrlRef.current[normalizedTabUrl];
       if (existingChatId) {
@@ -1852,7 +1975,7 @@ function FlowWorkspaceInner({
           Boolean(browserValidationByUrlRef.current[normalizedTabUrl]) ||
           Boolean(browserValidationStatusByUrlRef.current[normalizedTabUrl]) ||
           Boolean(validationMessagesByUrlRef.current[normalizedTabUrl]);
-        if (!hasValidationContext) {
+        if (!hasValidationContext && !allowCreateWithoutContext) {
           return null;
         }
         const seed = createPageValidationChatSeed({
@@ -1943,6 +2066,73 @@ function FlowWorkspaceInner({
     return true;
   }, []);
 
+  const upsertValidationGraphForRun = useCallback(
+    ({
+      runId,
+      headline,
+      initialQuery,
+      subagentPayload,
+      deepSearchPayload,
+      validationRecord,
+      references,
+      failedMessage,
+    }: {
+      runId: string;
+      headline: string;
+      initialQuery?: string;
+      subagentPayload?: SubagentStreamPayload;
+      deepSearchPayload?: DeepSearchStreamPayload;
+      validationRecord?: BrowserPageValidationRecord;
+      references?: DeepSearchReferencePayload[];
+      failedMessage?: string;
+    }) => {
+      const existingContext = validationGraphByRunIdRef.current.get(runId);
+      let nextContext =
+        existingContext ??
+        createValidationGraphRunContext({
+          runId,
+          baseNodes: nodesRef.current,
+          headline,
+          initialQuery,
+        });
+
+      if (subagentPayload) {
+        nextContext = applySubagentStreamToValidationGraphRun({
+          context: nextContext,
+          payload: subagentPayload,
+        });
+      }
+
+      if (deepSearchPayload) {
+        nextContext = applyDeepSearchStreamToValidationGraphRun({
+          context: nextContext,
+          payload: deepSearchPayload,
+        });
+      }
+
+      if (validationRecord) {
+        nextContext = applyValidationRecordToValidationGraphRun({
+          context: nextContext,
+          validation: validationRecord,
+          references: references ?? [],
+        });
+      }
+
+      if (failedMessage && failedMessage.trim().length > 0) {
+        nextContext = markValidationGraphRunFailed({
+          context: nextContext,
+          message: failedMessage,
+        });
+      }
+
+      validationGraphByRunIdRef.current.set(runId, nextContext);
+      const graphPatch = buildValidationGraphPatch(nextContext);
+      setNodes((prev) => upsertFlowNodesById(prev, graphPatch.nodes));
+      setEdges((prev) => upsertFlowEdgesById(prev, graphPatch.edges));
+    },
+    [setEdges, setNodes],
+  );
+
   const startPageValidation = useCallback(
     async ({
       tabRuntimeId,
@@ -2015,6 +2205,10 @@ function FlowWorkspaceInner({
       ];
       const abortController = new AbortController();
       const runId = `validate-run-${crypto.randomUUID()}`;
+      const validationGraphHeadline = resolveValidationGraphHeadline(
+        tab.title,
+        normalizedTabUrl,
+      );
       const runSession: BrowserValidationRunSession = {
         runId,
         tabRuntimeId,
@@ -2100,6 +2294,11 @@ function FlowWorkspaceInner({
         chatId: runSession.chatId,
         querySeed: seed.firstQuestion,
       });
+      upsertValidationGraphForRun({
+        runId,
+        headline: validationGraphHeadline,
+        initialQuery: seed.firstQuestion,
+      });
       try {
         const {
           resolvedPageUrl,
@@ -2164,6 +2363,12 @@ function FlowWorkspaceInner({
                   void queueRunningValidationChatPersist(
                     upsertChatMessage(runningMessages, subagentEvent),
                   );
+                  upsertValidationGraphForRun({
+                    runId,
+                    headline: validationGraphHeadline,
+                    subagentPayload: event.payload,
+                  });
+                  setValidationStreamTick((previous) => previous + 1);
                   return;
                 }
                 const toolCallId = event.payload.toolCallId;
@@ -2204,6 +2409,12 @@ function FlowWorkspaceInner({
                 void queueRunningValidationChatPersist(
                   upsertChatMessage(runningMessages, deepSearchEvent),
                 );
+                upsertValidationGraphForRun({
+                  runId,
+                  headline: validationGraphHeadline,
+                  deepSearchPayload: event.payload,
+                });
+                setValidationStreamTick((previous) => previous + 1);
               },
             ),
           signal: abortController.signal,
@@ -2260,17 +2471,12 @@ function FlowWorkspaceInner({
         };
         browserValidationByUrlRef.current = nextValidationByUrl;
         setBrowserValidationByUrl(nextValidationByUrl);
-        const graphInsertion = buildValidationGraphInsertion({
-          baseNodes: nodesRef.current,
-          validation: record,
+        upsertValidationGraphForRun({
+          runId,
+          headline: validationGraphHeadline,
+          validationRecord: record,
           references: normalizedReferences,
         });
-        if (graphInsertion.nodes.length > 0) {
-          setNodes((prev) => [...prev, ...graphInsertion.nodes]);
-        }
-        if (graphInsertion.edges.length > 0) {
-          setEdges((prev) => [...prev, ...graphInsertion.edges]);
-        }
         await settleComplete({
           record,
           references: normalizedReferences,
@@ -2288,6 +2494,11 @@ function FlowWorkspaceInner({
           : error instanceof Error
             ? error.message
             : "Page validation failed";
+        upsertValidationGraphForRun({
+          runId,
+          headline: validationGraphHeadline,
+          failedMessage: message,
+        });
         const activeRun = browserValidationRunsRef.current.get(tabRuntimeId);
         if (!activeRun) {
           await settleFailed(message);
@@ -2362,6 +2573,7 @@ function FlowWorkspaceInner({
         if (activeRun?.runId === runId) {
           browserValidationRunsRef.current.delete(tabRuntimeId);
         }
+        validationGraphByRunIdRef.current.delete(runId);
         logBrowserValidate("run-finished", {
           tabRuntimeId,
           runId,
@@ -2375,8 +2587,7 @@ function FlowWorkspaceInner({
       project.path,
       queueValidationChatPersist,
       runtimeSettings,
-      setEdges,
-      setNodes,
+      upsertValidationGraphForRun,
       upsertBrowserValidationChatMapping,
       upsertValidationMessagesForUrls,
     ],
@@ -2495,73 +2706,6 @@ function FlowWorkspaceInner({
     [stopPageValidationRun],
   );
 
-  const handleCdpOpenValidationChatRequest = useCallback(
-    async (payload: CdpBrowserValidateRequestPayload) => {
-      const sessionId =
-        typeof payload.sessionId === "string" ? payload.sessionId.trim() : "";
-      const normalizedTabUrl = normalizeHttpUrl(payload.url);
-      if (!sessionId || !normalizedTabUrl) {
-        return;
-      }
-      const chatId = await ensureValidationChatForUrl({
-        tabRuntimeId: `cdp:${sessionId}`,
-        normalizedTabUrl,
-        pageTitle: payload.title,
-      });
-      if (!chatId) {
-        return;
-      }
-      await switchChatWithOptionalBrowserTransfer(chatId, {
-        url: normalizedTabUrl,
-        title: payload.title,
-      });
-    },
-    [ensureValidationChatForUrl, switchChatWithOptionalBrowserTransfer],
-  );
-
-  useEffect(() => {
-    const ipc = window.ipcRenderer;
-    if (!ipc) {
-      return;
-    }
-    const handleValidateRequest = (
-      _event: IpcRendererEvent,
-      payload: CdpBrowserValidateRequestPayload,
-    ) => {
-      void handleCdpValidateRequest(payload);
-    };
-    const handleValidateStopRequest = (
-      _event: IpcRendererEvent,
-      payload: CdpBrowserValidateStopRequestPayload,
-    ) => {
-      void handleCdpValidateStopRequest(payload);
-    };
-    const handleOpenValidationChatRequest = (
-      _event: IpcRendererEvent,
-      payload: CdpBrowserValidateRequestPayload,
-    ) => {
-      void handleCdpOpenValidationChatRequest(payload);
-    };
-    ipc.on("cdp-browser-validate-request", handleValidateRequest);
-    ipc.on("cdp-browser-validate-stop-request", handleValidateStopRequest);
-    ipc.on(
-      "cdp-browser-open-validation-chat-request",
-      handleOpenValidationChatRequest,
-    );
-    return () => {
-      ipc.off("cdp-browser-validate-request", handleValidateRequest);
-      ipc.off("cdp-browser-validate-stop-request", handleValidateStopRequest);
-      ipc.off(
-        "cdp-browser-open-validation-chat-request",
-        handleOpenValidationChatRequest,
-      );
-    };
-  }, [
-    handleCdpOpenValidationChatRequest,
-    handleCdpValidateRequest,
-    handleCdpValidateStopRequest,
-  ]);
-
   const openOrFocusTab = useCallback(
     (tabKind: "chat" | "graph") => {
       const tabId = tabKind === "chat" ? CHAT_TAB_ID : GRAPH_TAB_ID;
@@ -2606,6 +2750,79 @@ function FlowWorkspaceInner({
     },
     [handleLayoutChange, layoutModel],
   );
+
+  const handleCdpOpenValidationChatRequest = useCallback(
+    async (payload: CdpBrowserValidateRequestPayload) => {
+      const sessionId =
+        typeof payload.sessionId === "string" ? payload.sessionId.trim() : "";
+      const normalizedTabUrl = normalizeHttpUrl(payload.url);
+      if (!sessionId || !normalizedTabUrl) {
+        return;
+      }
+      const chatId = await ensureValidationChatForUrl({
+        tabRuntimeId: `cdp:${sessionId}`,
+        normalizedTabUrl,
+        pageTitle: payload.title,
+        allowCreateWithoutContext: true,
+      });
+      if (!chatId) {
+        return;
+      }
+      await switchChatWithOptionalBrowserTransfer(chatId, {
+        url: normalizedTabUrl,
+        title: payload.title,
+      });
+      openOrFocusTab("chat");
+    },
+    [
+      ensureValidationChatForUrl,
+      openOrFocusTab,
+      switchChatWithOptionalBrowserTransfer,
+    ],
+  );
+
+  useEffect(() => {
+    const ipc = window.ipcRenderer;
+    if (!ipc) {
+      return;
+    }
+    const handleValidateRequest = (
+      _event: IpcRendererEvent,
+      payload: CdpBrowserValidateRequestPayload,
+    ) => {
+      void handleCdpValidateRequest(payload);
+    };
+    const handleValidateStopRequest = (
+      _event: IpcRendererEvent,
+      payload: CdpBrowserValidateStopRequestPayload,
+    ) => {
+      void handleCdpValidateStopRequest(payload);
+    };
+    const handleOpenValidationChatRequest = (
+      _event: IpcRendererEvent,
+      payload: CdpBrowserValidateRequestPayload,
+    ) => {
+      void handleCdpOpenValidationChatRequest(payload);
+    };
+    ipc.on("cdp-browser-validate-request", handleValidateRequest);
+    ipc.on("cdp-browser-validate-stop-request", handleValidateStopRequest);
+    ipc.on(
+      "cdp-browser-open-validation-chat-request",
+      handleOpenValidationChatRequest,
+    );
+    return () => {
+      ipc.off("cdp-browser-validate-request", handleValidateRequest);
+      ipc.off("cdp-browser-validate-stop-request", handleValidateStopRequest);
+      ipc.off(
+        "cdp-browser-open-validation-chat-request",
+        handleOpenValidationChatRequest,
+      );
+    };
+  }, [
+    handleCdpOpenValidationChatRequest,
+    handleCdpValidateRequest,
+    handleCdpValidateStopRequest,
+  ]);
 
   const selectBrowserTab = useCallback(
     (tabId: string) => {
@@ -2843,7 +3060,7 @@ function FlowWorkspaceInner({
           }
           openCdpUrl(reference.url, {
             ...toReferenceHighlightPayload(reference),
-            showMarker: false,
+            showMarker: true,
           });
         });
         return;
@@ -2858,7 +3075,7 @@ function FlowWorkspaceInner({
         }
         const chatReferenceHighlight: BrowserViewReferenceHighlight = {
           ...toReferenceHighlightPayload(reference),
-          showMarker: false,
+          showMarker: true,
         };
         const tabId = openBrowserUrl(
           reference.url,
@@ -3051,20 +3268,57 @@ function FlowWorkspaceInner({
       if (!normalizedTabUrl) {
         return;
       }
-      const chatId = await ensureValidationChatForUrl({
-        tabRuntimeId: tabId,
-        normalizedTabUrl,
-        pageTitle: tab.title,
-      });
+      const normalizedValidationUrl = normalizeHttpUrl(
+        browserValidationByUrlRef.current[normalizedTabUrl]?.url ?? "",
+      );
+      const existingChatId =
+        browserValidationChatByUrlRef.current[normalizedTabUrl] ??
+        (normalizedValidationUrl
+          ? browserValidationChatByUrlRef.current[normalizedValidationUrl]
+          : undefined);
+      let chatId: string | null = existingChatId ?? null;
       if (!chatId) {
+        chatId = await ensureValidationChatForUrl({
+          tabRuntimeId: tabId,
+          normalizedTabUrl,
+          pageTitle: tab.title,
+          allowCreateWithoutContext: true,
+        });
+      }
+      if (
+        !chatId &&
+        normalizedValidationUrl &&
+        normalizedValidationUrl !== normalizedTabUrl
+      ) {
+        chatId = await ensureValidationChatForUrl({
+          tabRuntimeId: tabId,
+          normalizedTabUrl: normalizedValidationUrl,
+          pageTitle: tab.title,
+          allowCreateWithoutContext: true,
+        });
+      }
+      if (!chatId) {
+        console.warn("[browser.validate.openChat.miss]", {
+          tabId,
+          normalizedTabUrl,
+          normalizedValidationUrl,
+        });
         return;
       }
-      await switchChatWithOptionalBrowserTransfer(chatId, {
-        url: normalizedTabUrl,
-        title: tab.title,
-        referenceHighlight: tab.referenceHighlight,
-      });
-      openOrFocusTab("chat");
+      try {
+        await switchChatWithOptionalBrowserTransfer(chatId, {
+          url: normalizedTabUrl,
+          title: tab.title,
+          referenceHighlight: tab.referenceHighlight,
+        });
+        openOrFocusTab("chat");
+      } catch (error) {
+        console.warn("[browser.validate.openChat.failed]", {
+          tabId,
+          chatId,
+          message: error instanceof Error ? error.message : String(error),
+        });
+      }
     },
     [
       browserTabMap,
@@ -3590,6 +3844,19 @@ function FlowWorkspaceInner({
         normalizedTabUrl !== null
           ? browserValidationStatusByUrl[normalizedTabUrl]
           : undefined;
+      const validationMessages =
+        normalizedTabUrl !== null
+          ? validationMessagesByUrlRef.current[normalizedTabUrl]
+          : undefined;
+      const effectiveValidationStatus =
+        validationStatusRecord?.status ?? tab?.validationStatus;
+      const validationRunningDetails =
+        effectiveValidationStatus === "running"
+          ? buildValidationRunningDetails(
+              validationMessages,
+              validationStreamTick,
+            )
+          : undefined;
       return (
         <BrowserTab
           tabId={browserTabId}
@@ -3599,9 +3866,8 @@ function FlowWorkspaceInner({
           validation={validation}
           validateConfig={browserValidateConfig}
           validationChatId={validationChatId}
-          validationStatus={
-            validationStatusRecord?.status ?? tab?.validationStatus
-          }
+          validationStatus={effectiveValidationStatus}
+          validationRunningDetails={validationRunningDetails}
           validationError={validationStatusRecord?.error ?? tab?.validationError}
           validationFailureReason={
             validationStatusRecord?.failureReason ?? tab?.validationFailureReason

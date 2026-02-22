@@ -34,6 +34,7 @@ export async function runDeepSearchTool({
   externalSkills,
   mode = "search",
   validateTargetAnswer = "",
+  validationTarget,
   onSubagentStream,
   onDeepSearchStream,
 }: {
@@ -52,6 +53,10 @@ export async function runDeepSearchTool({
   externalSkills?: RuntimeAgentSkill[];
   mode?: "search" | "validate";
   validateTargetAnswer?: string;
+  validationTarget?: {
+    url?: string;
+    title?: string;
+  };
   onSubagentStream?: (payload: SubagentStreamPayload) => void;
   onDeepSearchStream?: (
     payload: DeepSearchStreamPayload,
@@ -136,6 +141,7 @@ export async function runDeepSearchTool({
       strictness,
       mode,
       answerToValidate: validateTargetAnswer,
+      validationTarget,
       onSubagentStream,
     });
     const references = buildDeepSearchReferences(results, projectId, searchId, {

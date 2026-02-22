@@ -79,6 +79,173 @@ const DEERTUBE_REF_PREFIX = "deertube://";
 const isDeertubeReferenceUrl = (url: string): boolean =>
   url.trim().toLowerCase().startsWith(DEERTUBE_REF_PREFIX);
 
+interface ComparableHttpUrl {
+  host: string;
+  path: string;
+}
+
+const normalizeComparableHttpUrl = (value: string): ComparableHttpUrl | null => {
+  if (!URL.canParse(value)) {
+    return null;
+  }
+  const parsed = new URL(value);
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+    return null;
+  }
+  const host = parsed.hostname.trim().toLowerCase().replace(/^www\./, "");
+  const compactPath = parsed.pathname.replace(/\/+/g, "/");
+  const path =
+    compactPath.length > 1 && compactPath.endsWith("/")
+      ? compactPath.slice(0, -1).toLowerCase()
+      : (compactPath || "/").toLowerCase();
+  return {
+    host,
+    path,
+  };
+};
+
+const isSameComparableHttpUrl = (
+  left: ComparableHttpUrl,
+  right: ComparableHttpUrl,
+): boolean => left.host === right.host && left.path === right.path;
+
+const normalizeComparableText = (value: string): string =>
+  value
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}\s]/gu, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+const buildComparableTokenSet = (value: string): Set<string> => {
+  const normalized = normalizeComparableText(value);
+  if (!normalized) {
+    return new Set<string>();
+  }
+  const latinTokens = normalized
+    .split(/\s+/)
+    .map((token) => token.trim())
+    .filter((token) => token.length >= 4);
+  const cjkTokens = normalized.match(/[\u4e00-\u9fff]{2,}/g) ?? [];
+  return new Set<string>([...latinTokens, ...cjkTokens]);
+};
+
+const countTokenIntersection = (
+  left: Set<string>,
+  right: Set<string>,
+): number => {
+  if (left.size === 0 || right.size === 0) {
+    return 0;
+  }
+  let overlap = 0;
+  left.forEach((token) => {
+    if (right.has(token)) {
+      overlap += 1;
+    }
+  });
+  return overlap;
+};
+
+const computeContainmentScore = (
+  candidateTokens: Set<string>,
+  targetTokens: Set<string>,
+): number => {
+  if (candidateTokens.size === 0 || targetTokens.size === 0) {
+    return 0;
+  }
+  const overlap = countTokenIntersection(candidateTokens, targetTokens);
+  return overlap / candidateTokens.size;
+};
+
+const computeTitleSimilarity = (
+  left: string,
+  right: string,
+): number => {
+  const leftNormalized = normalizeComparableText(left);
+  const rightNormalized = normalizeComparableText(right);
+  if (!leftNormalized || !rightNormalized) {
+    return 0;
+  }
+  if (leftNormalized === rightNormalized) {
+    return 1;
+  }
+  const leftTokens = buildComparableTokenSet(leftNormalized);
+  const rightTokens = buildComparableTokenSet(rightNormalized);
+  if (leftTokens.size === 0 || rightTokens.size === 0) {
+    if (
+      leftNormalized.includes(rightNormalized) ||
+      rightNormalized.includes(leftNormalized)
+    ) {
+      return 0.9;
+    }
+    return 0;
+  }
+  const overlap = countTokenIntersection(leftTokens, rightTokens);
+  const overlapRatio = overlap / Math.min(leftTokens.size, rightTokens.size);
+  const jaccard =
+    overlap / (leftTokens.size + rightTokens.size - overlap);
+  return Math.max(jaccard, overlapRatio * 0.94);
+};
+
+const resolveValidateCitationExclusionReason = ({
+  item,
+  validationTargetUrl,
+  validationTargetTitle,
+  validationTargetTextTokens,
+}: {
+  item: SearchResult;
+  validationTargetUrl: ComparableHttpUrl | null;
+  validationTargetTitle: string;
+  validationTargetTextTokens: Set<string>;
+}): string | null => {
+  if (!validationTargetUrl) {
+    return null;
+  }
+  const candidateUrl = normalizeComparableHttpUrl(item.url);
+  if (candidateUrl && isSameComparableHttpUrl(candidateUrl, validationTargetUrl)) {
+    return "target-self-url";
+  }
+  const candidateTitle = item.title?.trim() ?? "";
+  const candidateTitleNormalized = normalizeComparableText(candidateTitle);
+  const targetTitleNormalized = normalizeComparableText(validationTargetTitle);
+  const candidateTitleTokens = buildComparableTokenSet(candidateTitleNormalized);
+  const targetTitleTokens = buildComparableTokenSet(targetTitleNormalized);
+  const hasStrongTitleSignal =
+    (candidateTitleTokens.size >= 3 || candidateTitleNormalized.length >= 24) &&
+    (targetTitleTokens.size >= 3 || targetTitleNormalized.length >= 24);
+  const titleSimilarity =
+    candidateTitle.length > 0 && validationTargetTitle.length > 0
+      ? computeTitleSimilarity(candidateTitle, validationTargetTitle)
+      : 0;
+  const evidenceText = [
+    item.validationRefContent,
+    item.content,
+    ...item.selections.map((selection) => selection.text),
+  ]
+    .map((value) => value?.trim() ?? "")
+    .filter((value) => value.length > 0)
+    .join("\n");
+  const candidateEvidenceTokens = buildComparableTokenSet(evidenceText);
+  const contentContainment = computeContainmentScore(
+    candidateEvidenceTokens,
+    validationTargetTextTokens,
+  );
+  if (hasStrongTitleSignal && titleSimilarity >= 0.93) {
+    return "target-repost-title-overlap";
+  }
+  if (candidateEvidenceTokens.size >= 28 && contentContainment >= 0.9) {
+    return "target-repost-content-overlap";
+  }
+  if (
+    hasStrongTitleSignal &&
+    titleSimilarity >= 0.78 &&
+    candidateEvidenceTokens.size >= 18 &&
+    contentContainment >= 0.72
+  ) {
+    return "target-repost-title-content-overlap";
+  }
+  return null;
+};
+
 const normalizeLineSelections = (selections: LineSelection[]): LineSelection[] =>
   selections
     .flatMap((selection) => {
@@ -159,6 +326,7 @@ export async function runSearchSubagent({
   strictness = "all-claims",
   mode = "search",
   answerToValidate = "",
+  validationTarget,
   onSubagentStream,
 }: {
   query: string;
@@ -181,14 +349,12 @@ export async function runSearchSubagent({
   strictness?: DeepResearchStrictness;
   mode?: "search" | "validate";
   answerToValidate?: string;
+  validationTarget?: {
+    url?: string;
+    title?: string;
+  };
   onSubagentStream?: (payload: SubagentStreamPayload) => void;
 }): Promise<SearchResult[]> {
-  console.log("[subagent.runSearch]", {
-    query,
-    toolCallId,
-    mode,
-    strictness,
-  });
   const resolvedSubagentConfig =
     resolveDeepResearchSubagentConfig(subagentConfig);
   const availableSkills = listAgentSkills({ externalSkills });
@@ -206,6 +372,27 @@ export async function runSearchSubagent({
   const extractedEvidenceByUrl = new Map<string, ExtractedEvidence>();
   const extractedMetaByUrl = new Map<string, ExtractedUrlMeta>();
   const searchLookup = new Map<string, { title?: string; snippet?: string }>();
+  const validationTargetUrlRaw =
+    mode === "validate" ? validationTarget?.url?.trim() ?? "" : "";
+  const validationTargetTitleRaw =
+    mode === "validate" ? validationTarget?.title?.trim() ?? "" : "";
+  const normalizedValidationTargetUrl = validationTargetUrlRaw
+    ? normalizeComparableHttpUrl(validationTargetUrlRaw)
+    : null;
+  const validationTargetTextTokens =
+    mode === "validate" && normalizedValidationTargetUrl
+      ? buildComparableTokenSet(
+          clampText(answerToValidate, MAX_VALIDATE_ANSWER_CHARS),
+        )
+      : new Set<string>();
+  console.log("[subagent.runSearch]", {
+    query,
+    toolCallId,
+    mode,
+    strictness,
+    validationTargetUrl:
+      mode === "validate" ? validationTargetUrlRaw : undefined,
+  });
 
   const searchTool = tool({
     description:
@@ -264,7 +451,26 @@ export async function runSearchSubagent({
           requestAbortSignal,
         );
         throwIfAborted(requestAbortSignal);
-        results.forEach((item) => {
+        const filteredResults = results.filter((item) => {
+          if (!normalizedValidationTargetUrl) {
+            return true;
+          }
+          const rawUrl =
+            typeof item.url === "string" ? item.url.trim() : "";
+          if (!rawUrl) {
+            return true;
+          }
+          const candidateUrl = normalizeComparableHttpUrl(rawUrl);
+          if (!candidateUrl) {
+            return true;
+          }
+          return !isSameComparableHttpUrl(
+            candidateUrl,
+            normalizedValidationTargetUrl,
+          );
+        });
+        const droppedTargetSelfCount = results.length - filteredResults.length;
+        filteredResults.forEach((item) => {
           const url = item.url?.trim();
           if (!url) {
             return;
@@ -275,12 +481,13 @@ export async function runSearchSubagent({
           });
         });
         console.log("[subagent.search.results]", {
-          count: results.length,
-          top: results
+          count: filteredResults.length,
+          droppedTargetSelfCount,
+          top: filteredResults
             .slice(0, 3)
             .map((item) => item.url ?? item.title ?? "unknown"),
         });
-        return { results };
+        return { results: filteredResults };
       } catch (error) {
         if (isAbortError(error)) {
           throw error;
@@ -385,9 +592,34 @@ export async function runSearchSubagent({
         extractToolErrors.push(errorMessage);
         throw new Error(errorMessage);
       }
+      const lookup = searchLookup.get(url);
+      const comparableExtractUrl = normalizeComparableHttpUrl(url);
+      if (
+        normalizedValidationTargetUrl &&
+        comparableExtractUrl &&
+        isSameComparableHttpUrl(
+          comparableExtractUrl,
+          normalizedValidationTargetUrl,
+        )
+      ) {
+        return {
+          url,
+          title: lookup?.title,
+          pageId: undefined,
+          lineCount: 0,
+          broken: false,
+          inrelavate: true,
+          viewpoint: normalizeSearchViewpoint(
+            "Excluded target page URL: self-citation is not valid validation evidence.",
+          ),
+          selections: [],
+          error:
+            "Validation citation exclusion: target page URL is not allowed as evidence source.",
+          rawModelOutput: "blocked-by-validation-target-policy",
+        };
+      }
       const extractStartedAt = Date.now();
       let stage = "init";
-      const lookup = searchLookup.get(url);
       let pageTitle = lookup?.title;
       let pageId: string | undefined;
       let lineCount = 0;
@@ -761,6 +993,8 @@ export async function runSearchSubagent({
     fullPromptOverrideEnabled,
     mode,
     answerToValidate: clampText(answerToValidate, MAX_VALIDATE_ANSWER_CHARS),
+    validationTargetUrl: validationTargetUrlRaw,
+    validationTargetTitle: validationTargetTitleRaw,
   });
   const searchSubagentSystemPrompt = buildSearchSubagentSystemPrompt({
     subagentConfig: resolvedSubagentConfig,
@@ -772,6 +1006,8 @@ export async function runSearchSubagent({
     fullPromptOverrideEnabled,
     mode,
     answerToValidate: clampText(answerToValidate, MAX_VALIDATE_ANSWER_CHARS),
+    validationTargetUrl: validationTargetUrlRaw,
+    validationTargetTitle: validationTargetTitleRaw,
   });
 
   throwIfAborted(abortSignal);
@@ -927,6 +1163,24 @@ export async function runSearchSubagent({
     const hasExtractedUrl = (url: string): boolean =>
       extractedEvidenceByUrl.has(url) || extractedMetaByUrl.has(url);
     const normalized = candidate.flatMap((item) => {
+      const extractedMeta = extractedMetaByUrl.get(item.url);
+      const exclusionReason = resolveValidateCitationExclusionReason({
+        item: {
+          ...item,
+          title: item.title ?? extractedMeta?.title,
+          validationRefContent:
+            item.validationRefContent ?? extractedMeta?.validationRefContent,
+        },
+        validationTargetUrl: normalizedValidationTargetUrl,
+        validationTargetTitle: validationTargetTitleRaw,
+        validationTargetTextTokens,
+      });
+      if (exclusionReason) {
+        errors.push(
+          `validate writeResults dropped forbidden target/self/repost citation (${exclusionReason}): ${item.url}`,
+        );
+        return [];
+      }
       if (!hasExtractedUrl(item.url)) {
         const allowValidateRefWithoutExtract =
           mode === "validate" && isDeertubeReferenceUrl(item.url);

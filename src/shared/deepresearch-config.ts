@@ -121,6 +121,14 @@ export const DEEP_RESEARCH_PROMPT_PLACEHOLDERS = [
     key: "answerToValidate",
     description: "Assistant answer text to validate in validate mode.",
   },
+  {
+    key: "validationTargetUrl",
+    description: "Validation target page URL in validate mode.",
+  },
+  {
+    key: "validationTargetTitle",
+    description: "Validation target page title in validate mode.",
+  },
 ] as const;
 
 export const DEFAULT_SUBAGENT_SOURCE_SELECTION_POLICY =
@@ -463,11 +471,15 @@ const buildSubagentPromptTemplateVariables = (
     selectedSkillNames?: string[];
     mode?: "search" | "validate";
     answerToValidate?: string;
+    validationTargetUrl?: string;
+    validationTargetTitle?: string;
   },
 ): Record<string, string> => ({
   query: options?.query ?? "",
   mode: options?.mode ?? "search",
   answerToValidate: options?.answerToValidate ?? "",
+  validationTargetUrl: options?.validationTargetUrl ?? "",
+  validationTargetTitle: options?.validationTargetTitle ?? "",
   strictness: options?.strictness ?? "",
   validateStrictness: options?.validateStrictness ?? "",
   skillProfile: options?.skillProfile ?? "",
@@ -538,11 +550,15 @@ export const buildSearchSubagentSystemPrompt = (
     fullPromptOverrideEnabled?: boolean;
     mode?: "search" | "validate";
     answerToValidate?: string;
+    validationTargetUrl?: string;
+    validationTargetTitle?: string;
   },
 ): string => {
   const config = resolveDeepResearchSubagentConfig(options?.subagentConfig);
   const mode = options?.mode ?? "search";
   const answerToValidate = options?.answerToValidate ?? "";
+  const validationTargetUrl = options?.validationTargetUrl?.trim() ?? "";
+  const validationTargetTitle = options?.validationTargetTitle?.trim() ?? "";
   const strictness = options?.strictness ?? "all-claims";
   const isValidateMode = mode === "validate";
   const skillRegistryPrompt = buildSkillRegistryPromptBlock({
@@ -568,6 +584,8 @@ export const buildSearchSubagentSystemPrompt = (
         selectedSkillNames: options?.selectedSkillNames,
         mode,
         answerToValidate,
+        validationTargetUrl,
+        validationTargetTitle,
       }),
     );
     return [renderedOverride, skillRegistryPrompt]
@@ -580,6 +598,12 @@ export const buildSearchSubagentSystemPrompt = (
         answerToValidate.trim().length > 0
           ? answerToValidate
           : "(No answer text provided; validate against the user query only.)",
+        validationTargetUrl.length > 0
+          ? `Validation target page URL: ${validationTargetUrl}`
+          : "Validation target page URL: (not provided)",
+        validationTargetTitle.length > 0
+          ? `Validation target page title: ${validationTargetTitle}`
+          : "Validation target page title: (not provided)",
         ...buildValidateStrictnessLines(strictness),
       ]
     : [];
@@ -603,6 +627,15 @@ export const buildSearchSubagentSystemPrompt = (
     "- Avoid low-credibility or rumor-heavy sources unless they are necessary for contrast and clearly labeled.",
     "- For duplicated/equivalent claims across sources, prefer high-authority and high-confidence sources first.",
     "- Do not extract every duplicate source. Start with a minimal high-confidence set, and only expand to lower-confidence sources when extracted evidence is still insufficient or conflicting.",
+    isValidateMode
+      ? "- Validation citation exclusion rule: do not use the page being validated itself as evidence (including canonical/tracking URL variants)."
+      : "",
+    isValidateMode
+      ? "- Also exclude repost/mirror/syndicated copies of the validated page. If title/body strongly overlaps the target page, treat it as repost and reject it."
+      : "",
+    isValidateMode
+      ? "- Keep only independent corroborating evidence. If uncertain whether a source is a repost of the target page, exclude it and find another source."
+      : "",
     "Search strategy:",
     "- Start search in the original user-question language.",
     "- Only try English or other languages when single-language results are missing, weak, off-topic, or otherwise insufficient.",
@@ -658,6 +691,8 @@ export const buildSearchSubagentRuntimePrompt = ({
   fullPromptOverrideEnabled = false,
   mode = "search",
   answerToValidate = "",
+  validationTargetUrl = "",
+  validationTargetTitle = "",
 }: {
   query: string;
   subagentConfig?: DeepResearchSubagentConfigInput | null;
@@ -665,15 +700,21 @@ export const buildSearchSubagentRuntimePrompt = ({
   fullPromptOverrideEnabled?: boolean;
   mode?: "search" | "validate";
   answerToValidate?: string;
+  validationTargetUrl?: string;
+  validationTargetTitle?: string;
 }): string => {
   const config = resolveDeepResearchSubagentConfig(subagentConfig);
   const isValidateMode = mode === "validate";
+  const normalizedValidationTargetUrl = validationTargetUrl.trim();
+  const normalizedValidationTargetTitle = validationTargetTitle.trim();
   const promptTemplateVariables = buildSubagentPromptTemplateVariables(config, {
     query,
     strictness,
     validateStrictness: isValidateMode ? strictness : undefined,
     mode,
     answerToValidate,
+    validationTargetUrl: normalizedValidationTargetUrl,
+    validationTargetTitle: normalizedValidationTargetTitle,
   });
   if (fullPromptOverrideEnabled && config.promptOverride) {
     return applyPromptTemplate(config.promptOverride, promptTemplateVariables, {
@@ -692,9 +733,25 @@ export const buildSearchSubagentRuntimePrompt = ({
             : "(empty; validate against question only)"
         }`
       : "",
+    isValidateMode
+      ? `Validation target page URL: ${
+          normalizedValidationTargetUrl || "(not provided)"
+        }`
+      : "",
+    isValidateMode
+      ? `Validation target page title: ${
+          normalizedValidationTargetTitle || "(not provided)"
+        }`
+      : "",
     ...(isValidateMode ? buildValidateStrictnessLines(strictness) : []),
     isValidateMode
       ? "Claim scope rule: split claims only from the Answer to validate. Do not re-scope claims from the original user question."
+      : "",
+    isValidateMode
+      ? "Validation citation exclusion rule: exclude the target page itself (including canonical/tracking URL variants) and its repost/mirror/syndicated copies."
+      : "",
+    isValidateMode
+      ? "If title/body strongly overlaps the target page, treat it as repost and reject it. Keep only independent corroborating evidence."
       : "",
     `${config.splitStrategy}`,
     "Prefer serial search: run one search call, inspect its results, then decide the next query.",

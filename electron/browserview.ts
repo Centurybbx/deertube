@@ -87,6 +87,25 @@ const sanitizeReferenceHighlight = (
   payload: BrowserViewReferenceHighlight,
 ): BrowserViewReferenceHighlight => {
   const text = payload.text.trim();
+  const alternateTexts = Array.isArray(payload.alternateTexts)
+    ? Array.from(
+        new Set(
+          payload.alternateTexts
+            .filter((candidate): candidate is string => typeof candidate === "string")
+            .map((candidate) => candidate.trim())
+            .filter(
+              (candidate) =>
+                candidate.length > 0 &&
+                candidate !== text,
+            )
+            .map((candidate) =>
+              candidate.length > MAX_HIGHLIGHT_TEXT_LENGTH
+                ? `${candidate.slice(0, MAX_HIGHLIGHT_TEXT_LENGTH)}...`
+                : candidate,
+            ),
+        ),
+      ).slice(0, 6)
+    : undefined;
   const title =
     typeof payload.title === "string" && payload.title.trim().length > 0
       ? payload.title.trim()
@@ -118,6 +137,8 @@ const sanitizeReferenceHighlight = (
       text.length > MAX_HIGHLIGHT_TEXT_LENGTH
         ? `${text.slice(0, MAX_HIGHLIGHT_TEXT_LENGTH)}...`
         : text,
+    alternateTexts:
+      alternateTexts && alternateTexts.length > 0 ? alternateTexts : undefined,
     append: payload.append === true,
     showMarker: payload.showMarker !== false,
     startLine: payload.startLine,
@@ -131,6 +152,19 @@ const sanitizeReferenceHighlight = (
     issueReason,
     correctFact,
   };
+};
+
+const normalizeComparableHighlightUrl = (value: string | undefined): string | null => {
+  if (!value || !isAllowedUrl(value)) {
+    return null;
+  }
+  try {
+    const parsed = new URL(value);
+    parsed.hash = "";
+    return parsed.toString();
+  } catch {
+    return null;
+  }
 };
 
 const sanitizeValidationSnapshot = (
@@ -786,10 +820,64 @@ export function runReferenceHighlightScript(payload: BrowserViewReferenceHighlig
     tooltip.style.top = `${Math.round(top)}px`;
   };
 
-  const excerpt = typeof payload.text === "string" ? payload.text : "";
-  const sanitizedExcerpt = sanitizeExcerptForMatch(excerpt);
-  const targetText = normalize(sanitizedExcerpt || excerpt);
-  if (!targetText || !document.body) {
+  const excerptCandidates = Array.from(
+    new Set(
+      [
+        typeof payload.text === "string" ? payload.text : "",
+        ...(Array.isArray(payload.alternateTexts)
+          ? payload.alternateTexts.filter(
+              (candidate): candidate is string => typeof candidate === "string",
+            )
+          : []),
+      ]
+        .map((candidate) => candidate.trim())
+        .filter((candidate) => candidate.length > 0),
+    ),
+  );
+  const rootElement = document.body;
+  if (excerptCandidates.length === 0 || !rootElement) {
+    return { ok: false, reason: "empty-target" };
+  }
+
+  interface HighlightMatchProfile {
+    excerpt: string;
+    sanitizedExcerpt: string;
+    targetText: string;
+    tokens: string[];
+    phraseCandidates: string[];
+    normalizedPhraseCandidates: string[];
+    tokenCandidates: string[];
+  }
+
+  const matchProfiles = excerptCandidates
+    .map((excerpt) => {
+      const sanitizedExcerpt = sanitizeExcerptForMatch(excerpt);
+      const normalizedExcerpt = sanitizedExcerpt || excerpt;
+      const targetText = normalize(normalizedExcerpt);
+      if (!targetText) {
+        return null;
+      }
+      const tokens = tokenized(normalizedExcerpt);
+      const phraseCandidates = extractPhrases(normalizedExcerpt);
+      const normalizedPhraseCandidates = phraseCandidates
+        .map((candidate) => normalize(candidate))
+        .filter((candidate) => candidate.length >= 8);
+      const shortExcerpt = collapseWhitespace(normalizedExcerpt).length <= 64;
+      const tokenCandidates = shortExcerpt
+        ? [...tokens].sort((left, right) => right.length - left.length)
+        : [];
+      return {
+        excerpt,
+        sanitizedExcerpt,
+        targetText,
+        tokens,
+        phraseCandidates,
+        normalizedPhraseCandidates,
+        tokenCandidates,
+      };
+    })
+    .filter((profile): profile is HighlightMatchProfile => profile !== null);
+  if (matchProfiles.length === 0) {
     return { ok: false, reason: "empty-target" };
   }
 
@@ -798,94 +886,170 @@ export function runReferenceHighlightScript(payload: BrowserViewReferenceHighlig
     clearExistingHighlights();
   }
 
-  const tokens = tokenized(sanitizedExcerpt || excerpt);
   const primarySelector = "p,li,blockquote,pre,code,h1,h2,h3,h4,h5,h6,td,th";
   const fallbackSelector = "article,section,main,div";
 
-  let bestMatch:
+  const findBestMatchForProfile = ({
+    profile,
+    allowTokenFallback,
+  }: {
+    profile: HighlightMatchProfile;
+    allowTokenFallback: boolean;
+  }):
+    | {
+        selectedMatch: {
+          element: HTMLElement;
+          score: number;
+          exact: boolean;
+        };
+        selectedRange: { start: number; end: number; phrase: string };
+      }
+    | null => {
+    const candidateMatches: {
+      element: HTMLElement;
+      score: number;
+      exact: boolean;
+    }[] = [];
+    const seenElements = new Set<HTMLElement>();
+    const walker = document.createTreeWalker(rootElement, NodeFilter.SHOW_TEXT);
+    let currentNode: Node | null = walker.nextNode();
+
+    while (currentNode) {
+      const parent = currentNode.parentElement;
+      if (!parent) {
+        currentNode = walker.nextNode();
+        continue;
+      }
+      const tag = parent.tagName.toLowerCase();
+      if (tag === "script" || tag === "style" || tag === "noscript" || tag === "textarea") {
+        currentNode = walker.nextNode();
+        continue;
+      }
+      const container =
+        parent.closest<HTMLElement>(primarySelector) ??
+        parent.closest<HTMLElement>(fallbackSelector) ??
+        parent;
+      if (seenElements.has(container)) {
+        currentNode = walker.nextNode();
+        continue;
+      }
+      seenElements.add(container);
+
+      const content = normalize(container.innerText || container.textContent || "");
+      if (!content) {
+        currentNode = walker.nextNode();
+        continue;
+      }
+
+      const exact = content.includes(profile.targetText);
+      let score = exact ? 1400 + Math.min(500, profile.targetText.length) : 0;
+      for (const phraseCandidate of profile.normalizedPhraseCandidates) {
+        if (content.includes(phraseCandidate)) {
+          score += 760 + Math.min(240, phraseCandidate.length * 2);
+          break;
+        }
+      }
+      for (const token of profile.tokens) {
+        if (content.includes(token)) {
+          score += 14;
+        }
+      }
+      score -= Math.min(
+        Math.abs(content.length - profile.targetText.length) / 30,
+        130,
+      );
+      score -= Math.min(content.length / 240, 50);
+      if (score <= 0) {
+        currentNode = walker.nextNode();
+        continue;
+      }
+
+      candidateMatches.push({
+        element: container,
+        score,
+        exact,
+      });
+
+      currentNode = walker.nextNode();
+    }
+
+    if (candidateMatches.length === 0) {
+      return null;
+    }
+
+    const sortedCandidateMatches = [...candidateMatches]
+      .sort((left, right) => right.score - left.score)
+      .slice(0, 16);
+    for (const candidate of sortedCandidateMatches) {
+      const textNodes = collectTextNodes(candidate.element);
+      const combinedText = textNodes
+        .map((node) => node.textContent ?? "")
+        .join("");
+      if (!combinedText.trim()) {
+        continue;
+      }
+      const phraseRange = findRangeInText(combinedText, profile.phraseCandidates);
+      const tokenRange =
+        allowTokenFallback &&
+        phraseRange === null &&
+        profile.tokenCandidates.length > 0
+          ? findRangeInText(combinedText, profile.tokenCandidates)
+          : null;
+      const range = phraseRange ?? tokenRange;
+      if (!range) {
+        continue;
+      }
+      return {
+        selectedMatch: candidate,
+        selectedRange: range,
+      };
+    }
+    return null;
+  };
+
+  let selectedMatch:
     | {
         element: HTMLElement;
         score: number;
         exact: boolean;
       }
-    | null = null;
-  const seenElements = new Set<HTMLElement>();
-  const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
-  let currentNode: Node | null = walker.nextNode();
-
-  while (currentNode) {
-    const parent = currentNode.parentElement;
-    if (!parent) {
-      currentNode = walker.nextNode();
+    | undefined;
+  let selectedRange: { start: number; end: number; phrase: string } | null =
+    null;
+  let selectedProfile: HighlightMatchProfile | null = null;
+  for (const profile of matchProfiles) {
+    const selected = findBestMatchForProfile({
+      profile,
+      allowTokenFallback: false,
+    });
+    if (!selected) {
       continue;
     }
-    const tag = parent.tagName.toLowerCase();
-    if (tag === "script" || tag === "style" || tag === "noscript" || tag === "textarea") {
-      currentNode = walker.nextNode();
-      continue;
-    }
-    const container =
-      parent.closest<HTMLElement>(primarySelector) ??
-      parent.closest<HTMLElement>(fallbackSelector) ??
-      parent;
-    if (seenElements.has(container)) {
-      currentNode = walker.nextNode();
-      continue;
-    }
-    seenElements.add(container);
-
-    const content = normalize(container.innerText || container.textContent || "");
-    if (!content) {
-      currentNode = walker.nextNode();
-      continue;
-    }
-
-    const exact = content.includes(targetText);
-    let score = exact ? 1400 + Math.min(500, targetText.length) : 0;
-    for (const token of tokens) {
-      if (content.includes(token)) {
-        score += 24;
+    selectedMatch = selected.selectedMatch;
+    selectedRange = selected.selectedRange;
+    selectedProfile = profile;
+    break;
+  }
+  if (!selectedMatch || !selectedRange || !selectedProfile) {
+    for (const profile of matchProfiles) {
+      const selected = findBestMatchForProfile({
+        profile,
+        allowTokenFallback: true,
+      });
+      if (!selected) {
+        continue;
       }
+      selectedMatch = selected.selectedMatch;
+      selectedRange = selected.selectedRange;
+      selectedProfile = profile;
+      break;
     }
-    score -= Math.min(Math.abs(content.length - targetText.length) / 30, 130);
-    score -= Math.min(content.length / 240, 50);
-    if (score <= 0) {
-      currentNode = walker.nextNode();
-      continue;
-    }
-
-    if (!bestMatch || score > bestMatch.score) {
-      bestMatch = {
-        element: container,
-        score,
-        exact,
-      };
-    }
-
-    currentNode = walker.nextNode();
   }
-
-  if (!bestMatch) {
-    return { ok: false, reason: "not-found" };
+  if (!selectedMatch || !selectedRange || !selectedProfile) {
+    return { ok: false, reason: "range-not-found" };
   }
-
-  const target = bestMatch.element;
-  const textNodes = collectTextNodes(target);
-  const combinedText = textNodes.map((node) => node.textContent ?? "").join("");
-  if (!combinedText.trim()) {
-    return { ok: false, reason: "empty-element-text" };
-  }
-
-  const phraseCandidates = extractPhrases(sanitizedExcerpt || excerpt);
-  const tokenCandidates = tokens.sort((a, b) => b.length - a.length);
-  const range =
-    findRangeInText(combinedText, phraseCandidates) ??
-    findRangeInText(combinedText, tokenCandidates) ??
-    {
-      start: 0,
-      end: Math.min(combinedText.length, Math.max(16, Math.min(120, excerpt.trim().length))),
-      phrase: excerpt.trim().slice(0, 120),
-    };
+  const target = selectedMatch.element;
+  const range = selectedRange;
 
   const highlightedSegments = applyInlineHighlight(target, range.start, range.end);
   const firstInlineMark = target.querySelector<HTMLElement>(`mark[${inlineMarkerAttribute}="true"]`);
@@ -911,8 +1075,8 @@ export function runReferenceHighlightScript(payload: BrowserViewReferenceHighlig
     const correctFact = normalizeOptionalText(payload.correctFact);
     const tooltipUrl = normalizeOptionalText(payload.url);
     const excerptText =
-      normalizeOptionalText(sanitizedExcerpt) ??
-      normalizeOptionalText(excerpt) ??
+      normalizeOptionalText(selectedProfile.sanitizedExcerpt) ??
+      normalizeOptionalText(selectedProfile.excerpt) ??
       "No excerpt available.";
 
     let hideTimer: number | null = null;
@@ -968,8 +1132,8 @@ export function runReferenceHighlightScript(payload: BrowserViewReferenceHighlig
   return {
     ok: highlightedSegments > 0,
     refId: payload.refId,
-    score: bestMatch.score,
-    exact: bestMatch.exact,
+    score: selectedMatch.score,
+    exact: selectedMatch.exact,
     highlightedSegments,
     markerAttached,
   };
@@ -1303,6 +1467,11 @@ class BrowserViewController {
     }
     const payload = sanitizeReferenceHighlight(reference);
     if (!payload.text) {
+      return false;
+    }
+    const expectedUrl = normalizeComparableHighlightUrl(payload.url);
+    const currentUrl = normalizeComparableHighlightUrl(view.webContents.getURL());
+    if (expectedUrl && currentUrl && expectedUrl !== currentUrl) {
       return false;
     }
     this.pendingHighlights.set(tabId, payload);

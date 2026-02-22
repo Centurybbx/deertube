@@ -5,6 +5,7 @@ import { getCdpBrowserController } from "../../cdp-browser";
 const referenceSchema = z.object({
   refId: z.number().int().positive(),
   text: z.string().min(1),
+  alternateTexts: z.array(z.string().min(1)).optional(),
   append: z.boolean().optional(),
   showMarker: z.boolean().optional(),
   startLine: z.number().int().positive().optional(),

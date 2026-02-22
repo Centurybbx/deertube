@@ -262,6 +262,19 @@ const trimOrUndefined = (value?: string): string | undefined => {
   return trimmed && trimmed.length > 0 ? trimmed : undefined;
 };
 
+const normalizeHttpUrl = (value?: string): string | undefined => {
+  const trimmed = trimOrUndefined(value);
+  if (!trimmed || !URL.canParse(trimmed)) {
+    return undefined;
+  }
+  const parsed = new URL(trimmed);
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+    return undefined;
+  }
+  parsed.hash = "";
+  return parsed.toString();
+};
+
 const clampText = (value: string, maxLength: number): string =>
   value.length > maxLength ? `${value.slice(0, maxLength - 3)}...` : value;
 
@@ -326,6 +339,43 @@ const parseClaimLines = (rawText: string): string[] => {
   return Array.from(dedupe.values()).slice(0, VALIDATE_CLAIM_MAX_COUNT);
 };
 
+const CLAIM_METADATA_PATTERNS: RegExp[] = [
+  /\bdoi\b/i,
+  /\bpmid\b/i,
+  /\bissn\b/i,
+  /\bjournal\b/i,
+  /\bvolume\b/i,
+  /\bissue\b/i,
+  /\bpages?\b/i,
+  /\bpublished\b/i,
+  /\bpublication\b/i,
+  /\bauthor(s)?\b/i,
+  /\bet al\.?\b/i,
+  /\bcopyright\b/i,
+  /\blicense\b/i,
+  /\bopen access\b/i,
+];
+
+const looksLikeMetadataClaim = (claim: string): boolean => {
+  const normalized = normalizeInlineText(claim).toLowerCase();
+  if (!normalized) {
+    return true;
+  }
+  const digitCount = (normalized.match(/\d/g) ?? []).length;
+  if (digitCount >= 8) {
+    return true;
+  }
+  return CLAIM_METADATA_PATTERNS.some((pattern) => pattern.test(normalized));
+};
+
+const preferSubstantiveClaims = (claims: string[]): string[] => {
+  if (claims.length <= 1) {
+    return claims;
+  }
+  const substantive = claims.filter((claim) => !looksLikeMetadataClaim(claim));
+  return substantive.length > 0 ? substantive : claims;
+};
+
 const buildValidationClaimScopePrompt = ({
   answer,
   strictness,
@@ -347,6 +397,8 @@ const buildValidationClaimScopePrompt = ({
     "You are a validation claim splitter.",
     "Use only the provided answer text as claim scope.",
     "Do not use or infer from the original user question.",
+    "Prioritize substantive factual assertions that carry the core meaning.",
+    "Ignore bibliographic metadata (authors, dates, journal/DOI/PMID, citation boilerplate) unless it is the main factual point.",
     ...strictnessLines,
     `Output one claim per line. If no fact-checkable claim exists, output exactly ${VALIDATE_NO_CLAIM_SENTINEL}.`,
     "No markdown. No JSON. No explanation.",
@@ -390,7 +442,7 @@ const deriveValidationClaimsFromAnswer = async ({
     if (hasNoClaimSentinel(result.text)) {
       return { claims: [], method: "llm-no-claim" };
     }
-    const claims = parseClaimLines(result.text);
+    const claims = preferSubstantiveClaims(parseClaimLines(result.text));
     if (claims.length > 0) {
       return { claims, method: "llm" };
     }
@@ -408,9 +460,11 @@ const deriveValidationClaimsFromAnswer = async ({
       },
     });
   }
-  const fallbackClaims = splitAnswerIntoSentenceLikeClaims(scopedAnswer)
+  const fallbackClaims = preferSubstantiveClaims(
+    splitAnswerIntoSentenceLikeClaims(scopedAnswer)
     .map((line) => clampText(line, VALIDATE_CLAIM_ITEM_MAX))
-    .slice(0, VALIDATE_CLAIM_MAX_COUNT);
+    .slice(0, VALIDATE_CLAIM_MAX_COUNT),
+  );
   if (fallbackClaims.length > 0) {
     return { claims: fallbackClaims, method: "fallback" };
   }
@@ -624,6 +678,12 @@ const ValidateInputSchema = z.object({
   answer: z.string().min(1),
   toolCallId: z.string().optional(),
   force: z.boolean().optional(),
+  validationTarget: z
+    .object({
+      url: z.string().optional(),
+      title: z.string().optional(),
+    })
+    .optional(),
   settings: SettingsSchema.optional(),
   deepResearch: DeepResearchConfigSchema.optional(),
 });
@@ -700,6 +760,8 @@ const runValidateForInput = async (
     : deepResearchConfig;
   const incomingQuery = input.query.trim();
   const answer = input.answer.trim();
+  const validationTargetUrl = normalizeHttpUrl(input.validationTarget?.url);
+  const validationTargetTitle = trimOrUndefined(input.validationTarget?.title);
   const existingRefContext = await resolveReferencedContextForValidation(
     input.projectPath,
     answer,
@@ -718,6 +780,10 @@ const runValidateForInput = async (
     forced: forceValidate,
     aborted: Boolean(abortSignal?.aborted),
     answerRefsResolved: existingRefContext.resolvedCount,
+    validationTargetUrl,
+    validationTargetTitle: validationTargetTitle
+      ? clampText(validationTargetTitle, 120)
+      : undefined,
     },
   });
   if (
@@ -826,6 +892,13 @@ const runValidateForInput = async (
     externalSkills,
     mode: "validate",
     validateTargetAnswer,
+    validationTarget:
+      validationTargetUrl ?? validationTargetTitle
+        ? {
+            url: validationTargetUrl,
+            title: validationTargetTitle,
+          }
+        : undefined,
     onSubagentStream: (payload) => {
       onStreamEvent?.({
         type: "subagent-stream",
